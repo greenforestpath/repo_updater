@@ -1547,8 +1547,85 @@ cmd_list() {
 }
 
 cmd_doctor() {
-    log_info "doctor command not yet implemented"
-    exit 0
+    local issues=0
+
+    log_info "System Check"
+    echo "────────────────────────────────────────" >&2
+
+    # Check git
+    if command -v git &>/dev/null; then
+        local git_version
+        git_version=$(git --version | sed 's/git version //')
+        echo -e "${GREEN}[OK]${RESET} git: $git_version" >&2
+    else
+        echo -e "${RED}[!!]${RESET} git: not installed" >&2
+        ((issues++))
+    fi
+
+    # Check gh CLI
+    if command -v gh &>/dev/null; then
+        local gh_version gh_user
+        gh_version=$(gh --version | head -1 | awk '{print $3}')
+        if gh auth status &>/dev/null; then
+            gh_user=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
+            echo -e "${GREEN}[OK]${RESET} gh: $gh_version (authenticated as $gh_user)" >&2
+        else
+            echo -e "${YELLOW}[??]${RESET} gh: $gh_version (not authenticated)" >&2
+            ((issues++))
+        fi
+    else
+        echo -e "${YELLOW}[??]${RESET} gh: not installed (needed for private repos)" >&2
+    fi
+
+    # Check config directory
+    if [[ -d "$RU_CONFIG_DIR" ]]; then
+        echo -e "${GREEN}[OK]${RESET} Config: $RU_CONFIG_DIR" >&2
+    else
+        echo -e "${YELLOW}[??]${RESET} Config: not initialized (run: ru init)" >&2
+    fi
+
+    # Check repos configured
+    local repo_count=0
+    if [[ -d "$RU_CONFIG_DIR/repos.d" ]]; then
+        while IFS= read -r _; do
+            ((repo_count++))
+        done < <(get_all_repos 2>/dev/null)
+    fi
+    if [[ $repo_count -gt 0 ]]; then
+        echo -e "${GREEN}[OK]${RESET} Repos: $repo_count configured" >&2
+    else
+        echo -e "${YELLOW}[??]${RESET} Repos: none configured" >&2
+    fi
+
+    # Check projects directory
+    if [[ -d "$PROJECTS_DIR" ]]; then
+        if [[ -w "$PROJECTS_DIR" ]]; then
+            echo -e "${GREEN}[OK]${RESET} Projects: $PROJECTS_DIR (writable)" >&2
+        else
+            echo -e "${RED}[!!]${RESET} Projects: $PROJECTS_DIR (not writable)" >&2
+            ((issues++))
+        fi
+    else
+        echo -e "${YELLOW}[??]${RESET} Projects: $PROJECTS_DIR (will be created)" >&2
+    fi
+
+    # Check gum (optional)
+    if command -v gum &>/dev/null; then
+        local gum_version
+        gum_version=$(gum --version 2>/dev/null | head -1 || echo "unknown")
+        echo -e "${GREEN}[OK]${RESET} gum: $gum_version" >&2
+    else
+        echo -e "${DIM}[  ]${RESET} gum: not installed (optional, for prettier UI)" >&2
+    fi
+
+    echo "" >&2
+
+    if [[ $issues -eq 0 ]]; then
+        log_success "All checks passed!"
+    else
+        log_warn "$issues issue(s) found"
+        exit 3
+    fi
 }
 
 cmd_self_update() {
