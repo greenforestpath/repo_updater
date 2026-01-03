@@ -1115,147 +1115,7 @@ do_fetch() {
 }
 
 #==============================================================================
-# SECTION 11: REPO LIST MANAGEMENT
-#==============================================================================
-
-# Parse a repo spec line: owner/repo, owner/repo@branch, owner/repo as custom-name
-# Returns: URL BRANCH CUSTOM_NAME (space-separated, BRANCH/CUSTOM_NAME may be empty)
-parse_repo_spec() {
-    local spec="$1"
-    local url="" branch="" custom_name=""
-
-    # Strip leading/trailing whitespace
-    spec=$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-    # Check for "as custom-name" syntax
-    if [[ "$spec" =~ ^(.+)[[:space:]]+as[[:space:]]+(.+)$ ]]; then
-        spec="${BASH_REMATCH[1]}"
-        custom_name="${BASH_REMATCH[2]}"
-    fi
-
-    # Check for @branch syntax
-    if [[ "$spec" =~ ^(.+)@([^@/]+)$ ]]; then
-        url="${BASH_REMATCH[1]}"
-        branch="${BASH_REMATCH[2]}"
-    else
-        url="$spec"
-    fi
-
-    echo "$url" "$branch" "$custom_name"
-}
-
-# Load repos from a list file, skipping comments and blank lines
-# Returns array of "url|branch|custom_name|local_path" entries
-load_repo_list() {
-    local list_file="$1"
-    local repos=()
-
-    if [[ ! -f "$list_file" ]]; then
-        return 0
-    fi
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip comments and empty lines
-        [[ -z "$line" ]] && continue
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-
-        # Parse the spec
-        local url branch custom_name
-        read -r url branch custom_name < <(parse_repo_spec "$line")
-
-        # Skip invalid URLs
-        if [[ -z "$url" ]]; then
-            continue
-        fi
-
-        # Determine local path
-        local local_path
-        if [[ -n "$custom_name" ]]; then
-            local_path="${PROJECTS_DIR}/${custom_name}"
-        else
-            local_path=$(url_to_local_path "$url")
-        fi
-
-        # Skip if path resolution failed
-        if [[ -z "$local_path" ]]; then
-            log_warn "Skipping invalid repo spec: $line"
-            continue
-        fi
-
-        repos+=("${url}|${branch}|${custom_name}|${local_path}")
-    done < "$list_file"
-
-    # Return repos as newline-separated output
-    printf '%s\n' "${repos[@]}"
-}
-
-# Get all repos from all list files, deduplicated by local path
-get_all_repos() {
-    local repos_dir="$RU_CONFIG_DIR/repos.d"
-    local -A seen_paths
-    local all_repos=()
-
-    # Find all .txt files in repos.d
-    if [[ -d "$repos_dir" ]]; then
-        for list_file in "$repos_dir"/*.txt; do
-            [[ -f "$list_file" ]] || continue
-
-            while IFS= read -r repo_entry; do
-                [[ -z "$repo_entry" ]] && continue
-
-                # Extract local path (4th field)
-                local local_path
-                local_path=$(echo "$repo_entry" | cut -d'|' -f4)
-
-                # Deduplicate by path
-                if [[ -z "${seen_paths[$local_path]:-}" ]]; then
-                    seen_paths[$local_path]=1
-                    all_repos+=("$repo_entry")
-                else
-                    log_verbose "Skipping duplicate: $local_path"
-                fi
-            done < <(load_repo_list "$list_file")
-        done
-    fi
-
-    printf '%s\n' "${all_repos[@]}"
-}
-
-# Detect path collisions (different repos mapping to same path)
-detect_collisions() {
-    local -A path_to_repo
-    local collisions=()
-
-    while IFS= read -r repo_entry; do
-        [[ -z "$repo_entry" ]] && continue
-
-        local url local_path
-        url=$(echo "$repo_entry" | cut -d'|' -f1)
-        local_path=$(echo "$repo_entry" | cut -d'|' -f4)
-
-        if [[ -n "${path_to_repo[$local_path]:-}" ]]; then
-            local existing="${path_to_repo[$local_path]}"
-            if [[ "$existing" != "$url" ]]; then
-                collisions+=("$local_path: $existing vs $url")
-            fi
-        else
-            path_to_repo[$local_path]="$url"
-        fi
-    done < <(get_all_repos)
-
-    if [[ ${#collisions[@]} -gt 0 ]]; then
-        log_warn "Path collisions detected:"
-        for collision in "${collisions[@]}"; do
-            log_warn "  $collision"
-        done
-        return 1
-    fi
-
-    return 0
-}
-
-#==============================================================================
-# SECTION 12: EXIT TRAP AND CLEANUP
+# SECTION 11: EXIT TRAP AND CLEANUP
 #==============================================================================
 
 cleanup() {
@@ -1269,7 +1129,7 @@ cleanup() {
 trap cleanup EXIT
 
 #==============================================================================
-# SECTION 13: ARGUMENT PARSING
+# SECTION 12: ARGUMENT PARSING
 #==============================================================================
 
 parse_args() {
@@ -1355,7 +1215,7 @@ parse_args() {
 }
 
 #==============================================================================
-# SECTION 14: COMMAND STUBS (to be implemented)
+# SECTION 13: COMMAND STUBS (to be implemented)
 #==============================================================================
 
 cmd_sync() {
@@ -1612,7 +1472,7 @@ cmd_config() {
 }
 
 #==============================================================================
-# SECTION 15: MAIN DISPATCH
+# SECTION 14: MAIN DISPATCH
 #==============================================================================
 
 main() {
@@ -1643,5 +1503,131 @@ main() {
     esac
 }
 
-# Run main
-main "$@"
+
+#==============================================================================
+# SECTION 11c: SYNC PROCESSING
+#==============================================================================
+
+# Process a single repository: check status, decide action, execute
+# Entry format: "url|branch|custom_name|local_path"
+process_single_repo() {
+    local entry="$1"
+    local action="${2:-sync}"  # sync|status
+
+    # Parse entry
+    local url branch custom_name local_path
+    IFS='|' read -r url branch custom_name local_path <<< "$entry"
+
+    local repo_name
+    repo_name=$(basename "$local_path")
+
+    log_step "Processing: $repo_name"
+    log_verbose "  URL: $url"
+    log_verbose "  Path: $local_path"
+    [[ -n "$branch" ]] && log_verbose "  Branch: $branch"
+
+    # Initialize repo log
+    local repo_log
+    repo_log=$(get_repo_log_path "$repo_name")
+    echo "=== Processing $repo_name at $(date) ===" >> "$repo_log"
+
+    if [[ -d "$local_path" ]]; then
+        if ! is_git_repo "$local_path"; then
+            log_warn "Not a git repository: $local_path"
+            write_result "$repo_name" "skip" "not_git" "0" ""
+            return 0
+        fi
+
+        if check_remote_mismatch "$local_path" "$url"; then
+            log_warn "Remote mismatch, skipping: $repo_name"
+            write_result "$repo_name" "skip" "remote_mismatch" "0" ""
+            return 0
+        fi
+
+        if [[ "$action" == "sync" ]]; then
+            local status_line
+            status_line=$(get_repo_status "$local_path" "$FETCH_REMOTES")
+            local status ahead behind dirty
+            eval "$status_line"
+            status="$STATUS"; ahead="$AHEAD"; behind="$BEHIND"; dirty="$DIRTY"
+
+            if [[ "$dirty" == "true" ]]; then
+                if [[ "$AUTOSTASH" == "true" ]]; then
+                    log_info "Stashing changes: $repo_name"
+                    git -C "$local_path" stash push -q -m "ru-autostash-$(date +%s)" 2>/dev/null
+                else
+                    log_warn "Dirty working tree: $repo_name"
+                    write_result "$repo_name" "skip" "dirty" "0" ""
+                    return 0
+                fi
+            fi
+
+            if [[ "$behind" -gt 0 ]]; then
+                do_pull "$local_path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH"
+            elif [[ "$status" == "diverged" ]]; then
+                log_warn "Diverged: $repo_name"
+                write_result "$repo_name" "skip" "diverged" "0" ""
+            elif [[ "$ahead" -gt 0 ]]; then
+                log_info "Ahead: $repo_name ($ahead unpushed)"
+                write_result "$repo_name" "status" "ahead" "0" ""
+            else
+                log_info "Current: $repo_name"
+                write_result "$repo_name" "status" "current" "0" ""
+            fi
+
+            if [[ "$dirty" == "true" ]] && [[ "$AUTOSTASH" == "true" ]]; then
+                git -C "$local_path" stash pop -q 2>/dev/null || true
+            fi
+        else
+            local status_line
+            status_line=$(get_repo_status "$local_path" "$FETCH_REMOTES")
+            local status ahead behind dirty
+            eval "$status_line"
+            status="$STATUS"; ahead="$AHEAD"; behind="$BEHIND"; dirty="$DIRTY"
+            log_info "Status: $repo_name ($status)"
+            write_result "$repo_name" "status" "$status" "0" ""
+        fi
+    else
+        if [[ "$action" == "sync" ]] && [[ "$PULL_ONLY" != "true" ]]; then
+            do_clone "$url" "$local_path" "$repo_name"
+            if [[ -n "$branch" ]] && [[ -d "$local_path" ]]; then
+                git -C "$local_path" checkout "$branch" 2>/dev/null || true
+            fi
+        else
+            log_info "Not cloned: $repo_name"
+            write_result "$repo_name" "status" "missing" "0" ""
+        fi
+    fi
+    return 0
+}
+
+# Process all repositories
+process_all_repos() {
+    local action="${1:-sync}"
+
+    if ! detect_collisions; then
+        log_error "Fix path collisions before syncing"
+        return 1
+    fi
+
+    local repos
+    repos=$(get_all_repos)
+
+    if [[ -z "$repos" ]]; then
+        log_warn "No repositories configured."
+        return 0
+    fi
+
+    local total
+    total=$(echo "$repos" | wc -l | tr -d ' ')
+    log_info "Processing $total repositories..."
+
+    update_latest_symlink
+
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        process_single_repo "$entry" "$action"
+    done <<< "$repos"
+
+    return 0
+}
