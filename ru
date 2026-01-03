@@ -1283,12 +1283,19 @@ cmd_sync() {
     log_info "Syncing $total repositories..."
     echo "" >&2
 
-    for repo_entry in "${repos[@]}"; do
+    for repo_spec in "${repos[@]}"; do
         ((current++))
 
-        # Parse entry: url|branch|custom_name|local_path
+        # Parse the repo spec
         local url branch custom_name local_path repo_name
-        IFS='|' read -r url branch custom_name local_path <<< "$repo_entry"
+        parse_repo_spec "$repo_spec" url branch custom_name
+
+        # Calculate local path based on custom name or URL
+        if [[ -n "$custom_name" ]]; then
+            local_path="${PROJECTS_DIR}/${custom_name}"
+        else
+            local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        fi
         repo_name=$(basename "$local_path")
 
         log_step "[$current/$total] $repo_name"
@@ -1405,13 +1412,82 @@ cmd_init() {
 }
 
 cmd_add() {
-    log_info "add command not yet implemented"
-    exit 0
+    if [[ ${#ARGS[@]} -eq 0 ]]; then
+        log_error "Usage: ru add <repo> [repo2] ..."
+        log_info "Examples:"
+        log_info "  ru add owner/repo"
+        log_info "  ru add https://github.com/owner/repo"
+        exit 4
+    fi
+
+    # Ensure config exists
+    ensure_config_exists >/dev/null
+
+    local repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
+
+    for repo in "${ARGS[@]}"; do
+        # Validate the repo URL can be parsed
+        local host owner repo_name
+        if ! parse_repo_url "$repo" host owner repo_name; then
+            log_error "Invalid repo format: $repo"
+            continue
+        fi
+
+        # Check if already in file
+        if grep -qF "$repo" "$repos_file" 2>/dev/null; then
+            log_warn "Already configured: $repo"
+            continue
+        fi
+
+        # Add to file
+        echo "$repo" >> "$repos_file"
+        log_success "Added: $repo"
+    done
 }
 
 cmd_list() {
-    log_info "list command not yet implemented"
-    exit 0
+    # Ensure config exists
+    if [[ ! -d "$RU_CONFIG_DIR" ]]; then
+        log_info "No configuration found. Run: ru init"
+        exit 0
+    fi
+
+    local show_paths="false"
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --paths) show_paths="true" ;;
+        esac
+    done
+
+    local repos=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && repos+=("$line")
+    done < <(get_all_repos)
+
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        log_info "No repositories configured."
+        log_info "Add repos with: ru add owner/repo"
+        exit 0
+    fi
+
+    log_info "Configured repositories (${#repos[@]}):"
+    echo "" >&2
+
+    for repo_spec in "${repos[@]}"; do
+        local url branch custom_name local_path
+        parse_repo_spec "$repo_spec" url branch custom_name
+
+        if [[ "$show_paths" == "true" ]]; then
+            if [[ -n "$custom_name" ]]; then
+                local_path="${PROJECTS_DIR}/${custom_name}"
+            else
+                local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+            fi
+            echo "$local_path"
+        else
+            echo "$url"
+        fi
+    done
 }
 
 cmd_doctor() {
