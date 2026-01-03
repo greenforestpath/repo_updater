@@ -554,9 +554,9 @@ print_banner() {
         gum style --border rounded --padding "0 2" \
             "🔄 ru v$VERSION" "Repo Updater" >&2
     else
-        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
-        echo -e "  ${BOLD}ru${NC} v$VERSION - Repo Updater" >&2
-        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
+        echo -e "  ${BOLD}ru${RESET} v$VERSION - Repo Updater" >&2
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
     fi
 }
 
@@ -568,7 +568,7 @@ gum_spin() {
     if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" != "true" ]]; then
         gum spin --spinner dot --title "$title" -- "$@"
     else
-        [[ "$QUIET" != "true" ]] && echo -e "${CYAN}→${NC} $title" >&2
+        [[ "$QUIET" != "true" ]] && echo -e "${CYAN}→${RESET} $title" >&2
         "$@"
     fi
 }
@@ -1261,19 +1261,23 @@ save_sync_state() {
     local config_hash
     config_hash=$(get_config_hash)
 
-    # Build completed array JSON
+    # Build completed array JSON (handle empty array with set -u)
     local completed_json=""
-    for item in "${completed_ref[@]}"; do
-        [[ -n "$completed_json" ]] && completed_json+=","
-        completed_json+="\"$item\""
-    done
+    if [[ ${#completed_ref[@]} -gt 0 ]]; then
+        for item in "${completed_ref[@]}"; do
+            [[ -n "$completed_json" ]] && completed_json+=","
+            completed_json+="\"$item\""
+        done
+    fi
 
-    # Build pending array JSON
+    # Build pending array JSON (handle empty array with set -u)
     local pending_json=""
-    for item in "${pending_ref[@]}"; do
-        [[ -n "$pending_json" ]] && pending_json+=","
-        pending_json+="\"$item\""
-    done
+    if [[ ${#pending_ref[@]} -gt 0 ]]; then
+        for item in "${pending_ref[@]}"; do
+            [[ -n "$pending_json" ]] && pending_json+=","
+            pending_json+="\"$item\""
+        done
+    fi
 
     cat > "$tmp_file" <<EOF
 {
@@ -1301,6 +1305,8 @@ cleanup_sync_state() {
 # Check if a repo name is in the completed list
 is_repo_completed() {
     local repo_name="$1"
+    # Handle empty array with set -u
+    [[ ${#SYNC_COMPLETED[@]} -eq 0 ]] && return 1
     local item
     for item in "${SYNC_COMPLETED[@]}"; do
         [[ "$item" == "$repo_name" ]] && return 0
@@ -1565,20 +1571,20 @@ cmd_sync() {
 
     # Initialize pending repos array for state tracking
     local pending_names=()
-    for repo_spec in "${pending_repos[@]}"; do
-        local url branch custom_name local_path repo_name
-        parse_repo_spec "$repo_spec" url branch custom_name
-        if [[ -n "$custom_name" ]]; then
-            local_path="${PROJECTS_DIR}/${custom_name}"
-        else
-            local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
-        fi
-        repo_name=$(basename "$local_path")
-        pending_names+=("$repo_name")
-    done
-
-    # Save initial state
     if [[ ${#pending_repos[@]} -gt 0 ]]; then
+        for repo_spec in "${pending_repos[@]}"; do
+            local url branch custom_name local_path repo_name
+            parse_repo_spec "$repo_spec" url branch custom_name
+            if [[ -n "$custom_name" ]]; then
+                local_path="${PROJECTS_DIR}/${custom_name}"
+            else
+                local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+            fi
+            repo_name=$(basename "$local_path")
+            pending_names+=("$repo_name")
+        done
+
+        # Save initial state
         save_sync_state "in_progress" SYNC_COMPLETED pending_names
     fi
 
@@ -1590,7 +1596,13 @@ cmd_sync() {
     fi
     echo "" >&2
 
-    for repo_spec in "${pending_repos[@]}"; do
+    # Only iterate if there are pending repos
+    if [[ ${#pending_repos[@]} -eq 0 ]]; then
+        log_info "No repositories to sync."
+    fi
+
+    for repo_spec in "${pending_repos[@]+"${pending_repos[@]}"}"; do
+        [[ -z "$repo_spec" ]] && continue
         ((current++))
 
         # Parse the repo spec
@@ -1676,12 +1688,17 @@ cmd_sync() {
 
         # Update state: mark this repo as completed
         SYNC_COMPLETED+=("$repo_name")
-        # Remove from pending_names
+        # Remove from pending_names (handle empty array with set -u)
         local new_pending=()
-        for p in "${pending_names[@]}"; do
-            [[ "$p" != "$repo_name" ]] && new_pending+=("$p")
-        done
-        pending_names=("${new_pending[@]}")
+        if [[ ${#pending_names[@]} -gt 0 ]]; then
+            for p in "${pending_names[@]}"; do
+                [[ "$p" != "$repo_name" ]] && new_pending+=("$p")
+            done
+        fi
+        pending_names=()
+        if [[ ${#new_pending[@]} -gt 0 ]]; then
+            pending_names=("${new_pending[@]}")
+        fi
         # Save state after each repo (enables resume on interrupt)
         save_sync_state "in_progress" SYNC_COMPLETED pending_names
     done
