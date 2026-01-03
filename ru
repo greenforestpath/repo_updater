@@ -1413,6 +1413,11 @@ parse_args() {
                 COMMAND="$1"
                 shift
                 ;;
+            --paths|--print|--set=*)
+                # Subcommand-specific options - pass through to ARGS
+                ARGS+=("$1")
+                shift
+                ;;
             -*)
                 log_error "Unknown option: $1"
                 show_help
@@ -2167,144 +2172,6 @@ main() {
             exit 4
             ;;
     esac
-}
-
-
-#==============================================================================
-# SECTION 11c: SYNC PROCESSING
-#==============================================================================
-
-# Process a single repository: check status, decide action, execute
-# Entry format: "url|branch|custom_name|local_path"
-process_single_repo() {
-    local entry="$1"
-    local action="${2:-sync}"  # sync|status
-
-    # Parse entry
-    local url branch custom_name local_path
-    IFS='|' read -r url branch custom_name local_path <<< "$entry"
-
-    local repo_name
-    repo_name=$(basename "$local_path")
-
-    log_step "Processing: $repo_name"
-    log_verbose "  URL: $url"
-    log_verbose "  Path: $local_path"
-    [[ -n "$branch" ]] && log_verbose "  Branch: $branch"
-
-    # Initialize repo log
-    local repo_log
-    repo_log=$(get_repo_log_path "$repo_name")
-    echo "=== Processing $repo_name at $(date) ===" >> "$repo_log"
-
-    if [[ -d "$local_path" ]]; then
-        if ! is_git_repo "$local_path"; then
-            log_warn "Not a git repository: $local_path"
-            write_result "$repo_name" "skip" "not_git" "0" ""
-            return 0
-        fi
-
-        if check_remote_mismatch "$local_path" "$url"; then
-            log_warn "Remote mismatch, skipping: $repo_name"
-            write_result "$repo_name" "skip" "remote_mismatch" "0" ""
-            return 0
-        fi
-
-        if [[ "$action" == "sync" ]]; then
-            local status_line
-            status_line=$(get_repo_status "$local_path" "$FETCH_REMOTES")
-            local status ahead behind dirty
-            eval "$status_line"
-            status="$STATUS"; ahead="$AHEAD"; behind="$BEHIND"; dirty="$DIRTY"
-
-            if [[ "$dirty" == "true" ]]; then
-                if [[ "$AUTOSTASH" == "true" ]]; then
-                    log_info "Stashing changes: $repo_name"
-                    git -C "$local_path" stash push -q -m "ru-autostash-$(date +%s)" 2>/dev/null
-                else
-                    log_warn "Dirty working tree: $repo_name"
-                    write_result "$repo_name" "skip" "dirty" "0" ""
-                    return 0
-                fi
-            fi
-
-            # Check diverged FIRST (diverged has both ahead>0 AND behind>0)
-            if [[ "$status" == "diverged" ]]; then
-                log_warn "Diverged: $repo_name (ahead=$ahead, behind=$behind)"
-                write_result "$repo_name" "skip" "diverged" "0" ""
-            elif [[ "$behind" -gt 0 ]]; then
-                do_pull "$local_path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH"
-            elif [[ "$ahead" -gt 0 ]]; then
-                log_info "Ahead: $repo_name ($ahead unpushed)"
-                write_result "$repo_name" "status" "ahead" "0" ""
-            else
-                log_info "Current: $repo_name"
-                write_result "$repo_name" "status" "current" "0" ""
-            fi
-
-            if [[ "$dirty" == "true" ]] && [[ "$AUTOSTASH" == "true" ]]; then
-                git -C "$local_path" stash pop -q 2>/dev/null || true
-            fi
-        else
-            local status_line
-            status_line=$(get_repo_status "$local_path" "$FETCH_REMOTES")
-            local status ahead behind dirty
-            eval "$status_line"
-            status="$STATUS"; ahead="$AHEAD"; behind="$BEHIND"; dirty="$DIRTY"
-            log_info "Status: $repo_name ($status)"
-            write_result "$repo_name" "status" "$status" "0" ""
-        fi
-    else
-        if [[ "$action" == "sync" ]] && [[ "$PULL_ONLY" != "true" ]]; then
-            do_clone "$url" "$local_path" "$repo_name"
-            if [[ -n "$branch" ]] && [[ -d "$local_path" ]]; then
-                # Check if branch exists on remote
-                if git -C "$local_path" rev-parse --verify "origin/$branch" &>/dev/null; then
-                    if ! git -C "$local_path" checkout "$branch" --quiet 2>/dev/null; then
-                        log_warn "Failed to checkout branch '$branch' for $repo_name"
-                    fi
-                else
-                    log_warn "Branch '$branch' not found for $repo_name, using default branch"
-                    write_result "$repo_name" "clone" "branch_not_found" "0" "Branch: $branch"
-                fi
-            fi
-        else
-            log_info "Not cloned: $repo_name"
-            write_result "$repo_name" "status" "missing" "0" ""
-        fi
-    fi
-    return 0
-}
-
-# Process all repositories
-process_all_repos() {
-    local action="${1:-sync}"
-
-    if ! detect_collisions; then
-        log_error "Fix path collisions before syncing"
-        return 1
-    fi
-
-    local repos
-    repos=$(get_all_repos)
-
-    if [[ -z "$repos" ]]; then
-        log_warn "No repositories configured."
-        return 0
-    fi
-
-    local total
-    total=$(echo "$repos" | wc -l | tr -d ' ')
-    log_info "Processing $total repositories..."
-
-    update_latest_symlink
-
-    while IFS= read -r entry; do
-        [[ -z "$entry" ]] && continue
-        process_single_repo "$entry" "$action"
-    done <<< "$repos"
-
-    return 0
 }
 
 #==============================================================================

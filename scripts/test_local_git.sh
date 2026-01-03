@@ -28,6 +28,8 @@ DRY_RUN="false"
 VERBOSE="false"
 QUIET="false"
 RESULTS_FILE=""
+GIT_TIMEOUT="${GIT_TIMEOUT:-30}"
+GIT_LOW_SPEED_LIMIT="${GIT_LOW_SPEED_LIMIT:-1000}"
 
 # Define minimal log functions
 log_info() { echo "INFO: $*"; }
@@ -43,6 +45,8 @@ source <(sed -n '/^write_result()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^get_repo_log_path()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^is_git_repo()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^get_repo_status()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^setup_git_timeout()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^is_timeout_error()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^do_pull()/,/^}/p' "$PROJECT_DIR/ru")
 
 #==============================================================================
