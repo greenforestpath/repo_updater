@@ -412,6 +412,8 @@ EOF
     assert_contains "$output" "my-repo" "Hyphenated repo name works"
     assert_contains "$output" "repo456" "Numeric repo name works"
     assert_contains "$output" "my_custom_name" "Underscored custom name works"
+    # Verify SSH URL is parsed (extracts 'sshrepo' from git@github.com:owner/sshrepo.git)
+    assert_contains "$output" "sshrepo" "SSH URL format is parsed correctly"
 
     cleanup_test_env
     trap - EXIT
