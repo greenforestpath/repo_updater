@@ -44,11 +44,24 @@ jobs:
           done
 
   tests:
-    name: Test Suite
+    name: Test Suite (${{ matrix.os }})
     needs: [shellcheck, syntax]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install bash 5 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+
+      - name: Show bash version
+        run: bash --version | head -1
 
       - name: Create test output directory
         run: mkdir -p test-results
@@ -65,7 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results
+          name: test-results-${{ matrix.os }}
           path: test-results/
           retention-days: 14
 
