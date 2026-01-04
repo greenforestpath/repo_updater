@@ -4810,6 +4810,268 @@ format_wait_info() {
     fi
 }
 
+#------------------------------------------------------------------------------
+# COMMAND VALIDATION AND BLOCKING (bd-hmw8)
+# Security: Validate commands before execution in agent sessions
+#------------------------------------------------------------------------------
+
+# Command categories for agent execution validation
+# shellcheck disable=SC2034  # These arrays are used by validate_agent_command
+SAFE_BASH_COMMANDS=(
+    # Version control
+    git
+    # Search and find
+    grep rg find fd
+    # File viewing
+    ls cat head tail less more bat
+    # Build tools
+    make cmake ninja
+    # Package managers (read operations)
+    npm yarn pnpm cargo go pip python python3 pytest
+    # Linting
+    shellcheck eslint prettier tsc mypy ruff
+    # Data processing
+    jq yq sed awk sort uniq wc diff
+    # System info
+    pwd which whereis whoami date
+    # Text processing
+    tr cut paste
+    # Archive (read)
+    tar
+)
+
+APPROVAL_REQUIRED_COMMANDS=(
+    # File operations
+    rm mv cp mkdir rmdir touch
+    # Network
+    curl wget http
+    # Containers
+    docker podman kubectl helm
+    # Process management
+    kill pkill killall
+    # Git operations that modify remote
+    "git push" "git push --force"
+    # NPM publish
+    "npm publish" "yarn publish"
+)
+
+BLOCKED_COMMANDS=(
+    # Privilege escalation
+    sudo su doas
+    # Dangerous execution
+    eval exec source
+    # Permission changes
+    chmod chown chgrp
+    # Direct shell spawning
+    bash sh zsh fish dash
+    # System control
+    shutdown reboot halt poweroff
+    # Disk operations
+    dd mkfs fdisk
+    # Network dangerous
+    nc netcat ncat
+)
+
+# Special gh command patterns
+# Read operations - always allowed
+GH_READ_COMMANDS=(
+    "gh issue view"
+    "gh issue list"
+    "gh pr view"
+    "gh pr list"
+    "gh pr checks"
+    "gh pr diff"
+    "gh repo view"
+    "gh api"
+    "gh auth status"
+)
+
+# Write operations - blocked in Plan mode, need approval otherwise
+GH_WRITE_COMMANDS=(
+    "gh issue create"
+    "gh issue close"
+    "gh issue reopen"
+    "gh issue comment"
+    "gh issue edit"
+    "gh pr create"
+    "gh pr close"
+    "gh pr merge"
+    "gh pr review"
+    "gh pr comment"
+    "gh pr edit"
+)
+
+# Validate a command for agent execution
+# Args:
+#   $1 - Command string to validate
+#   $2 - Mode (optional): "plan" or "execute" (default: "execute")
+# Returns:
+#   0 = allowed
+#   1 = blocked
+#   2 = needs approval
+# Outputs:
+#   JSON with validation result
+validate_agent_command() {
+    local cmd="$1"
+    local mode="${2:-execute}"
+
+    # Extract the base command (first word)
+    local base_cmd
+    base_cmd=$(echo "$cmd" | awk '{print $1}')
+
+    # Check blocked commands first (highest priority)
+    local blocked
+    for blocked in "${BLOCKED_COMMANDS[@]}"; do
+        if [[ "$base_cmd" == "$blocked" ]]; then
+            jq -n \
+                --arg cmd "$cmd" \
+                --arg base "$base_cmd" \
+                --arg status "blocked" \
+                --arg reason "Command '$base_cmd' is blocked for security" \
+                '{command: $cmd, base_command: $base, status: $status, reason: $reason}'
+            return 1
+        fi
+    done
+
+    # Check for gh commands (special handling)
+    if [[ "$base_cmd" == "gh" ]]; then
+        # Check read commands - always allowed
+        local gh_pattern
+        for gh_pattern in "${GH_READ_COMMANDS[@]}"; do
+            if [[ "$cmd" == "$gh_pattern"* ]]; then
+                jq -n \
+                    --arg cmd "$cmd" \
+                    --arg status "allowed" \
+                    --arg reason "gh read operation" \
+                    '{command: $cmd, status: $status, reason: $reason}'
+                return 0
+            fi
+        done
+
+        # Check write commands - blocked in plan mode, approval in execute mode
+        for gh_pattern in "${GH_WRITE_COMMANDS[@]}"; do
+            if [[ "$cmd" == "$gh_pattern"* ]]; then
+                if [[ "$mode" == "plan" ]]; then
+                    jq -n \
+                        --arg cmd "$cmd" \
+                        --arg status "blocked" \
+                        --arg reason "gh write operations blocked in Plan mode" \
+                        '{command: $cmd, status: $status, reason: $reason}'
+                    return 1
+                else
+                    jq -n \
+                        --arg cmd "$cmd" \
+                        --arg status "needs_approval" \
+                        --arg reason "gh write operation requires confirmation" \
+                        '{command: $cmd, status: $status, reason: $reason}'
+                    return 2
+                fi
+            fi
+        done
+
+        # Unknown gh command - allow with warning
+        jq -n \
+            --arg cmd "$cmd" \
+            --arg status "allowed" \
+            --arg reason "gh command (unknown subcommand)" \
+            '{command: $cmd, status: $status, reason: $reason}'
+        return 0
+    fi
+
+    # Check approval-required commands
+    local approval_cmd
+    for approval_cmd in "${APPROVAL_REQUIRED_COMMANDS[@]}"; do
+        # Check if it's a multi-word pattern or single command
+        if [[ "$approval_cmd" == *" "* ]]; then
+            # Multi-word pattern - match prefix
+            if [[ "$cmd" == "$approval_cmd"* ]]; then
+                jq -n \
+                    --arg cmd "$cmd" \
+                    --arg status "needs_approval" \
+                    --arg reason "Operation '$approval_cmd' requires confirmation" \
+                    '{command: $cmd, status: $status, reason: $reason}'
+                return 2
+            fi
+        else
+            # Single command
+            if [[ "$base_cmd" == "$approval_cmd" ]]; then
+                jq -n \
+                    --arg cmd "$cmd" \
+                    --arg base "$base_cmd" \
+                    --arg status "needs_approval" \
+                    --arg reason "Command '$base_cmd' requires confirmation" \
+                    '{command: $cmd, base_command: $base, status: $status, reason: $reason}'
+                return 2
+            fi
+        fi
+    done
+
+    # Check safe commands
+    local safe_cmd
+    for safe_cmd in "${SAFE_BASH_COMMANDS[@]}"; do
+        if [[ "$base_cmd" == "$safe_cmd" ]]; then
+            jq -n \
+                --arg cmd "$cmd" \
+                --arg status "allowed" \
+                --arg reason "Safe command" \
+                '{command: $cmd, status: $status, reason: $reason}'
+            return 0
+        fi
+    done
+
+    # Unknown command - needs approval for safety
+    jq -n \
+        --arg cmd "$cmd" \
+        --arg base "$base_cmd" \
+        --arg status "needs_approval" \
+        --arg reason "Unknown command '$base_cmd' requires review" \
+        '{command: $cmd, base_command: $base, status: $status, reason: $reason}'
+    return 2
+}
+
+# Quick check if command is safe (no JSON output)
+# Args:
+#   $1 - Command string
+# Returns:
+#   0 if safe, 1 otherwise
+is_command_safe() {
+    local cmd="$1"
+    local base_cmd
+    base_cmd=$(echo "$cmd" | awk '{print $1}')
+
+    # Check blocked first
+    local blocked
+    for blocked in "${BLOCKED_COMMANDS[@]}"; do
+        [[ "$base_cmd" == "$blocked" ]] && return 1
+    done
+
+    # Check if in safe list
+    local safe_cmd
+    for safe_cmd in "${SAFE_BASH_COMMANDS[@]}"; do
+        [[ "$base_cmd" == "$safe_cmd" ]] && return 0
+    done
+
+    return 1
+}
+
+# Check if command is explicitly blocked
+# Args:
+#   $1 - Command string
+# Returns:
+#   0 if blocked, 1 if not blocked
+is_command_blocked() {
+    local cmd="$1"
+    local base_cmd
+    base_cmd=$(echo "$cmd" | awk '{print $1}')
+
+    local blocked
+    for blocked in "${BLOCKED_COMMANDS[@]}"; do
+        [[ "$base_cmd" == "$blocked" ]] && return 0
+    done
+
+    return 1
+}
+
 # Local driver: List all active sessions
 local_driver_list_sessions() {
     # List tmux sessions with ru- prefix
@@ -5656,30 +5918,6 @@ cleanup_old_review_state() {
 # using GraphQL alias batching (up to 25 repos per API call).
 #------------------------------------------------------------------------------
 
-# Split repo IDs into chunks for batched GraphQL queries
-# Args: chunk_size, repo_ids...
-# Output: Each chunk on a separate line (repos within chunk are newline-separated)
-chunk_repo_ids() {
-    local chunk_size="$1"
-    shift
-    local repos=("$@")
-    local count=0
-    local chunk=""
-
-    for repo in "${repos[@]}"; do
-        chunk+="${repo}"$'\n'
-        ((count++))
-        if [[ $count -ge $chunk_size ]]; then
-            printf '%s' "$chunk"
-            chunk=""
-            count=0
-        fi
-    done
-
-    # Output remaining repos
-    [[ -n "$chunk" ]] && printf '%s' "$chunk"
-}
-
 # Execute GraphQL query for a batch of repos
 # Args: chunk (newline-separated repo IDs like owner/repo)
 # Output: GraphQL JSON response
@@ -5744,6 +5982,200 @@ parse_graphql_work_items() {
              .createdAt, .updatedAt, (.isDraft | tostring)] | @tsv
         )
     ' 2>/dev/null
+}
+
+#------------------------------------------------------------------------------
+# WORK ITEM PRIORITY SCORING (bd-5jph)
+# Calculate priority scores for issues/PRs to enable intelligent work ordering
+#------------------------------------------------------------------------------
+
+# Calculate days since a timestamp
+# Works on both Linux and macOS
+# Args: ISO8601 timestamp
+# Output: integer days
+days_since_timestamp() {
+    local ts="$1"
+    local now
+    now=$(date +%s)
+
+    local then_ts
+    # Try GNU date first (Linux)
+    if then_ts=$(date -d "$ts" +%s 2>/dev/null); then
+        :
+    # Try BSD date (macOS)
+    elif then_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+        :
+    # Try with timezone offset format
+    elif then_ts=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "${ts/Z/+0000}" +%s 2>/dev/null); then
+        :
+    else
+        # Fallback: return 0 days if parsing fails
+        echo "0"
+        return
+    fi
+
+    echo $(( (now - then_ts) / 86400 ))
+}
+
+# Check if an item was recently reviewed
+# Args: item_key (format: owner/repo#type-number)
+# Returns: 0 if recently reviewed, 1 if not
+item_recently_reviewed() {
+    local item_key="$1"
+    local state_file="$RU_STATE_DIR/review-state.json"
+    local skip_days="${REVIEW_SKIP_DAYS:-7}"
+
+    [[ ! -f "$state_file" ]] && return 1
+
+    local last_review
+    last_review=$(jq -r --arg key "$item_key" '.items[$key].last_review // ""' "$state_file" 2>/dev/null)
+
+    [[ -z "$last_review" ]] && return 1
+
+    local days_since
+    days_since=$(days_since_timestamp "$last_review")
+
+    [[ $days_since -lt $skip_days ]]
+}
+
+# Calculate priority score for a work item (0-200+ scale)
+# Args: type labels created_at updated_at is_draft repo_id number
+# Output: integer score
+calculate_item_priority_score() {
+    local item_type="$1"
+    local labels="$2"
+    local created_at="$3"
+    local updated_at="$4"
+    local is_draft="$5"
+    local repo_id="$6"
+    local number="$7"
+
+    local score=0
+
+    # Component 1: Type Importance (0-20 points)
+    if [[ "$item_type" == "pr" ]]; then
+        score=$((score + 20))
+        # Draft PRs get penalized
+        [[ "$is_draft" == "true" ]] && score=$((score - 15))
+    else
+        # Issues get base score
+        score=$((score + 10))
+    fi
+
+    # Component 2: Label-Based Priority (0-50 points)
+    if echo "$labels" | grep -qiE 'security|critical'; then
+        score=$((score + 50))
+    elif echo "$labels" | grep -qiE 'bug|urgent'; then
+        score=$((score + 30))
+    elif echo "$labels" | grep -qiE 'enhancement|feature'; then
+        score=$((score + 10))
+    fi
+
+    # Component 3: Age Factor
+    local age_days
+    age_days=$(days_since_timestamp "$created_at")
+
+    # Bug/security items: older = more urgent
+    if echo "$labels" | grep -qiE 'bug|security|critical'; then
+        if [[ $age_days -gt 60 ]]; then
+            score=$((score + 50))
+        elif [[ $age_days -gt 30 ]]; then
+            score=$((score + 30))
+        elif [[ $age_days -gt 14 ]]; then
+            score=$((score + 15))
+        fi
+    else
+        # Feature requests: very old ones may be stale
+        if [[ $age_days -gt 180 ]]; then
+            score=$((score - 10))
+        fi
+    fi
+
+    # Component 4: Recency Bonus (0-15 points)
+    local updated_days
+    updated_days=$(days_since_timestamp "$updated_at")
+    if [[ $updated_days -lt 3 ]]; then
+        score=$((score + 15))
+    elif [[ $updated_days -lt 7 ]]; then
+        score=$((score + 10))
+    fi
+
+    # Component 5: Staleness Penalty (-20 points)
+    local item_key="${repo_id}#${item_type}-${number}"
+    if item_recently_reviewed "$item_key"; then
+        score=$((score - 20))
+    fi
+
+    # Ensure non-negative
+    [[ $score -lt 0 ]] && score=0
+
+    echo "$score"
+}
+
+# Map numeric score to priority level
+# Args: score
+# Output: CRITICAL, HIGH, NORMAL, or LOW
+get_priority_level() {
+    local score="$1"
+    if [[ $score -ge 150 ]]; then
+        echo "CRITICAL"
+    elif [[ $score -ge 100 ]]; then
+        echo "HIGH"
+    elif [[ $score -ge 50 ]]; then
+        echo "NORMAL"
+    else
+        echo "LOW"
+    fi
+}
+
+# Check if priority level passes threshold filter
+# Args: level threshold
+# Returns: 0 if passes, 1 if filtered out
+passes_priority_threshold() {
+    local level="$1"
+    local threshold="$2"
+
+    case "$threshold" in
+        all)
+            return 0
+            ;;
+        normal)
+            [[ "$level" != "LOW" ]]
+            ;;
+        high)
+            [[ "$level" == "HIGH" || "$level" == "CRITICAL" ]]
+            ;;
+        critical)
+            [[ "$level" == "CRITICAL" ]]
+            ;;
+        *)
+            return 0  # Default: pass through
+            ;;
+    esac
+}
+
+# Score and sort work items by priority
+# Args: TSV input (from parse_graphql_work_items)
+# Output: TSV with score prepended, sorted by score descending
+score_and_sort_work_items() {
+    local tsv_input="$1"
+    local threshold="${2:-all}"
+
+    while IFS=$'\t' read -r repo_id item_type number title labels created_at updated_at is_draft; do
+        [[ -z "$repo_id" ]] && continue
+
+        local score
+        score=$(calculate_item_priority_score "$item_type" "$labels" "$created_at" "$updated_at" "$is_draft" "$repo_id" "$number")
+
+        local level
+        level=$(get_priority_level "$score")
+
+        # Apply threshold filter
+        if passes_priority_threshold "$level" "$threshold"; then
+            printf '%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$score" "$level" "$repo_id" "$item_type" "$number" "$title" "$labels" "$created_at" "$updated_at" "$is_draft"
+        fi
+    done <<< "$tsv_input" | sort -t$'\t' -k1 -rn
 }
 
 # Convert repo spec to owner/repo format (GitHub only)
