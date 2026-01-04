@@ -761,22 +761,37 @@ run_test() {
     local failed_before=$TF_ASSERTIONS_FAILED
 
     TF_CURRENT_TEST="$test_name"
-    echo ""
-    echo "${TF_BOLD}Running: $test_name${TF_RESET}"
-    echo "----------------------------------------"
+
+    if ! is_tap_mode; then
+        echo ""
+        echo "${TF_BOLD}Running: $test_name${TF_RESET}"
+        echo "----------------------------------------"
+    fi
 
     # Run the test
     if "$test_name"; then
         if [[ $TF_ASSERTIONS_FAILED -eq $failed_before ]]; then
             ((TF_TESTS_PASSED++))
-            echo "${TF_GREEN}TEST PASSED${TF_RESET}: $test_name"
+            if is_tap_mode; then
+                _tap_ok "$test_name"
+            else
+                echo "${TF_GREEN}TEST PASSED${TF_RESET}: $test_name"
+            fi
         else
             ((TF_TESTS_FAILED++))
-            echo "${TF_RED}TEST FAILED${TF_RESET}: $test_name"
+            if is_tap_mode; then
+                _tap_not_ok "$test_name" "assertions failed"
+            else
+                echo "${TF_RED}TEST FAILED${TF_RESET}: $test_name"
+            fi
         fi
     else
         ((TF_TESTS_FAILED++))
-        echo "${TF_RED}TEST FAILED${TF_RESET}: $test_name (non-zero exit)"
+        if is_tap_mode; then
+            _tap_not_ok "$test_name" "non-zero exit"
+        else
+            echo "${TF_RED}TEST FAILED${TF_RESET}: $test_name (non-zero exit)"
+        fi
     fi
 
     TF_CURRENT_TEST=""
@@ -787,19 +802,27 @@ run_test() {
 skip_test() {
     local reason="${1:-}"
     ((TF_TESTS_SKIPPED++))
-    echo "${TF_YELLOW}SKIP${TF_RESET}: $TF_CURRENT_TEST${reason:+ ($reason)}"
+    if is_tap_mode; then
+        _tap_skip "$TF_CURRENT_TEST" "$reason"
+    else
+        echo "${TF_YELLOW}SKIP${TF_RESET}: $TF_CURRENT_TEST${reason:+ ($reason)}"
+    fi
     return 0
 }
 
 # Print test results summary
 print_results() {
-    echo ""
-    echo "============================================"
-    echo "${TF_BOLD}Test Results${TF_RESET}"
-    echo "============================================"
-    echo "Tests:      ${TF_GREEN}$TF_TESTS_PASSED passed${TF_RESET}, ${TF_RED}$TF_TESTS_FAILED failed${TF_RESET}, ${TF_YELLOW}$TF_TESTS_SKIPPED skipped${TF_RESET}"
-    echo "Assertions: ${TF_GREEN}$TF_ASSERTIONS_PASSED passed${TF_RESET}, ${TF_RED}$TF_ASSERTIONS_FAILED failed${TF_RESET}"
-    echo "============================================"
+    if is_tap_mode; then
+        _tap_summary
+    else
+        echo ""
+        echo "============================================"
+        echo "${TF_BOLD}Test Results${TF_RESET}"
+        echo "============================================"
+        echo "Tests:      ${TF_GREEN}$TF_TESTS_PASSED passed${TF_RESET}, ${TF_RED}$TF_TESTS_FAILED failed${TF_RESET}, ${TF_YELLOW}$TF_TESTS_SKIPPED skipped${TF_RESET}"
+        echo "Assertions: ${TF_GREEN}$TF_ASSERTIONS_PASSED passed${TF_RESET}, ${TF_RED}$TF_ASSERTIONS_FAILED failed${TF_RESET}"
+        echo "============================================"
+    fi
 
     if [[ $TF_TESTS_FAILED -gt 0 || $TF_ASSERTIONS_FAILED -gt 0 ]]; then
         return 1
@@ -890,5 +913,7 @@ export -f log_test_start log_test_pass log_test_fail log_test_skip
 export -f init_log_file set_log_level
 export -f create_temp_dir cleanup_temp_dirs reset_test_env create_test_env get_test_env_root setup_cleanup_trap
 export -f run_test skip_test print_results get_exit_code
+export -f enable_tap_output disable_tap_output is_tap_mode tap_plan tap_version tap_diag
+export -f _tap_ok _tap_not_ok _tap_skip _tap_todo _tap_summary
 export -f get_project_dir source_ru_function
 export -f create_mock_repo create_bare_repo
