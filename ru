@@ -1867,6 +1867,9 @@ trap cleanup EXIT
 #==============================================================================
 
 parse_args() {
+    local -a pending_review_args=()
+    local -a pending_global_args=()
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
@@ -1896,6 +1899,8 @@ parse_args() {
             --dry-run)
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("$1")
                 else
                     DRY_RUN="true"
                 fi
@@ -1936,6 +1941,8 @@ parse_args() {
             --resume)
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("$1")
                 else
                     RESUME="true"
                 fi
@@ -1961,6 +1968,13 @@ parse_args() {
                     fi
                     ARGS+=("--parallel=$2")
                     shift 2
+                elif [[ -z "$COMMAND" ]]; then
+                    if [[ $# -lt 2 ]]; then
+                        log_error "--parallel requires a number"
+                        exit 4
+                    fi
+                    pending_global_args+=("--parallel=$2")
+                    shift 2
                 else
                     if [[ $# -lt 2 ]]; then
                         log_error "--parallel requires a number of workers"
@@ -1977,6 +1991,13 @@ parse_args() {
                         exit 4
                     fi
                     ARGS+=("-j$2")
+                    shift 2
+                elif [[ -z "$COMMAND" ]]; then
+                    if [[ $# -lt 2 ]]; then
+                        log_error "-j requires a number"
+                        exit 4
+                    fi
+                    pending_global_args+=("-j$2")
                     shift 2
                 else
                     if [[ $# -lt 2 ]]; then
@@ -2004,6 +2025,9 @@ parse_args() {
                 if [[ "$COMMAND" == "review" ]]; then
                     ARGS+=("$1")
                     shift
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_review_args+=("$1")
+                    shift
                 else
                     log_error "Unknown option: $1"
                     show_help
@@ -2017,6 +2041,13 @@ parse_args() {
                         exit 4
                     fi
                     ARGS+=("$1=$2")
+                    shift 2
+                elif [[ -z "$COMMAND" ]]; then
+                    if [[ $# -lt 2 ]]; then
+                        log_error "$1 requires a value"
+                        exit 4
+                    fi
+                    pending_review_args+=("$1=$2")
                     shift 2
                 else
                     log_error "Unknown option: $1"
@@ -2040,6 +2071,29 @@ parse_args() {
     # Default command is sync
     if [[ -z "$COMMAND" ]]; then
         COMMAND="sync"
+    fi
+
+    # Apply any pending args that appeared before the command
+    if [[ "$COMMAND" == "review" ]]; then
+        [[ ${#pending_review_args[@]} -gt 0 ]] && ARGS+=("${pending_review_args[@]}")
+        [[ ${#pending_global_args[@]} -gt 0 ]] && ARGS+=("${pending_global_args[@]}")
+    else
+        if [[ ${#pending_review_args[@]} -gt 0 ]]; then
+            log_error "Unknown option: ${pending_review_args[0]}"
+            show_help
+            exit 4
+        fi
+        if [[ ${#pending_global_args[@]} -gt 0 ]]; then
+            local opt
+            for opt in "${pending_global_args[@]}"; do
+                case "$opt" in
+                    --dry-run) DRY_RUN="true" ;;
+                    --resume)  RESUME="true" ;;
+                    --parallel=*) PARALLEL="${opt#--parallel=}" ;;
+                    -j*) PARALLEL="${opt#-j}" ;;
+                esac
+            done
+        fi
     fi
 }
 
@@ -5563,7 +5617,10 @@ acquire_state_lock() {
     local lock_file="$state_dir/state.lock"
 
     # Open fd for locking
-    eval "exec $STATE_LOCK_FD>\"$lock_file\""
+    # Use printf %q to safely escape the path for eval
+    local safe_lock_file
+    printf -v safe_lock_file %q "$lock_file"
+    eval "exec $STATE_LOCK_FD>$safe_lock_file"
 
     # Get exclusive lock (blocking)
     if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
@@ -6254,9 +6311,12 @@ gh_api_graphql_repo_batch() {
         [[ -z "$repo_id" ]] && continue
         local owner="${repo_id%%/*}"
         local name="${repo_id#*/}"
+        local safe_owner safe_name
+        safe_owner=$(json_escape "$owner")
+        safe_name=$(json_escape "$name")
 
         # Build aliased query for this repo
-        q+=" repo${i}: repository(owner:\"${owner}\", name:\"${name}\") {"
+        q+=" repo${i}: repository(owner:\"${safe_owner}\", name:\"${safe_name}\") {"
         q+=" nameWithOwner isArchived isFork updatedAt"
         # Issues with metadata for scoring
         q+=" issues(states:OPEN, first:50, orderBy:{field:CREATED_AT, direction:DESC}) {"

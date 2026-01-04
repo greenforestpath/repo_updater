@@ -208,6 +208,20 @@ log_test_skip() {
     fi
 }
 
+# Log suite start - called at beginning of test suite
+# Usage: log_suite_start "Suite Name"
+log_suite_start() {
+    local suite_name="$1"
+    if ! is_tap_mode; then
+        echo ""
+        echo "${TF_BOLD}============================================${TF_RESET}"
+        echo "${TF_BOLD}Test Suite: $suite_name${TF_RESET}"
+        echo "${TF_BOLD}============================================${TF_RESET}"
+    else
+        tap_diag "Test Suite: $suite_name"
+    fi
+}
+
 # Initialize log file
 # Usage: init_log_file "/path/to/log"
 init_log_file() {
@@ -360,6 +374,18 @@ _tf_pass() {
     local msg="$1"
     ((TF_ASSERTIONS_PASSED++))
     echo "${TF_GREEN}PASS${TF_RESET}: $msg"
+}
+
+# Convenience alias for _tf_pass (used in simple if/else test patterns)
+# Usage: pass "message"
+pass() {
+    _tf_pass "$1"
+}
+
+# Convenience alias for _tf_fail (used in simple if/else test patterns)
+# Usage: fail "message"
+fail() {
+    _tf_fail "$1"
 }
 
 # Record a failing assertion
@@ -907,9 +933,9 @@ export -f assert_file_exists assert_file_not_exists
 export -f assert_dir_exists assert_dir_not_exists
 export -f assert_not_empty assert_empty
 export -f assert_true assert_false assert_matches assert_file_contains
-export -f _tf_pass _tf_fail _tf_log _tf_timestamp _tf_elapsed_ms
+export -f _tf_pass _tf_fail _tf_log _tf_timestamp _tf_elapsed_ms pass fail
 export -f log_debug log_info log_warn log_error
-export -f log_test_start log_test_pass log_test_fail log_test_skip
+export -f log_test_start log_test_pass log_test_fail log_test_skip log_suite_start
 export -f init_log_file set_log_level
 export -f create_temp_dir cleanup_temp_dirs reset_test_env create_test_env get_test_env_root setup_cleanup_trap
 export -f run_test skip_test print_results get_exit_code
