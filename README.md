@@ -293,6 +293,7 @@ ru [command] [options]
 | `doctor` | Run system diagnostics |
 | `self-update` | Update ru to the latest version |
 | `config` | Show or set configuration values |
+| `prune` | Find and manage orphan repositories |
 
 ### Global Options
 
@@ -316,6 +317,10 @@ ru [command] [options]
 | `--rebase` | Use `git pull --rebase` instead of merge |
 | `--dry-run` | Show what would happen without making changes |
 | `--dir PATH` | Override projects directory |
+| `--parallel N`, `-j N` | Sync N repos concurrently (default: 1) |
+| `--timeout SECONDS` | Network timeout for slow operations (default: 30) |
+| `--resume` | Resume an interrupted sync from where it left off |
+| `--restart` | Discard interrupted sync state and start fresh |
 
 **`ru status`**
 | Flag | Description |
@@ -346,6 +351,13 @@ ru [command] [options]
 |------|-------------|
 | `--print` | Print all configuration values |
 | `--set KEY=VALUE` | Set a configuration value |
+
+**`ru prune`**
+| Flag | Description |
+|------|-------------|
+| (none) | List orphan repos (dry run, default) |
+| `--archive` | Move orphan repos to archive directory |
+| `--delete` | Permanently delete orphan repos (requires confirmation) |
 
 ---
 
@@ -713,6 +725,7 @@ ru uses meaningful exit codes for automation:
 | `2` | Conflicts exist | Some repos have unresolved conflicts |
 | `3` | Dependency error | gh CLI missing, auth failed, etc. |
 | `4` | Invalid arguments | Bad CLI options, missing config files |
+| `5` | Interrupted | Sync interrupted by user (Ctrl+C); use `--resume` to continue |
 
 ### Using in Scripts
 
