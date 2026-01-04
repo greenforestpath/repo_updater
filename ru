@@ -1486,11 +1486,13 @@ process_single_repo_worker() {
         fi
 
         if [[ "$status" == "current" ]]; then
+            write_result "$repo_name" "pull" "current" "0" "" "$local_path"
             echo "OK:current:$repo_name"
             return 0
         fi
 
         if [[ "$status" == "diverged" ]]; then
+            write_result "$repo_name" "pull" "diverged" "0" "" "$local_path"
             echo "CONFLICT:diverged:$repo_name"
             return 0
         fi
