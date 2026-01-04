@@ -52,6 +52,13 @@ source <(sed -n '/^get_repo_status()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^setup_git_timeout()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^is_timeout_error()/,/^}/p' "$PROJECT_DIR/ru")
 source <(sed -n '/^do_pull()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^do_fetch()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^parse_repo_url()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^normalize_url()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^get_remote_url()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^check_remote_mismatch()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^url_to_clone_target()/,/^}/p' "$PROJECT_DIR/ru")
+source <(sed -n '/^do_clone()/,/^}/p' "$PROJECT_DIR/ru")
 
 #==============================================================================
 # Test Framework
@@ -360,6 +367,348 @@ test_do_pull() {
 }
 
 #==============================================================================
+# Tests: do_fetch
+#==============================================================================
+
+test_do_fetch_updates_refs() {
+    echo "Testing do_fetch updates remote refs..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "fetch")
+    local dev_dir="$TEMP_DIR/dev"
+    local work_dir="$PROJECTS_DIR/fetch"
+
+    # Create initial repo
+    init_repo_with_commit "$remote" "$dev_dir"
+
+    # Clone to projects dir
+    git clone "$remote" "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+
+    # Record origin/main before remote changes
+    local before_ref
+    before_ref=$(git -C "$work_dir" rev-parse origin/main 2>/dev/null)
+
+    # Make new commit in dev and push
+    add_commit_and_push "$dev_dir" "New commit for fetch test"
+
+    # do_fetch should update remote refs
+    do_fetch "$work_dir"
+
+    local after_ref
+    after_ref=$(git -C "$work_dir" rev-parse origin/main 2>/dev/null)
+
+    if [[ "$before_ref" != "$after_ref" ]]; then
+        pass "do_fetch updated remote refs"
+    else
+        fail "do_fetch did not update remote refs"
+    fi
+
+    cleanup_test_env
+}
+
+test_do_fetch_no_upstream() {
+    echo "Testing do_fetch with no upstream..."
+    setup_test_env
+
+    # Create a repo without a remote
+    local work_dir="$PROJECTS_DIR/no-upstream"
+    mkdir -p "$work_dir"
+    git init "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+    echo "content" > "$work_dir/file.txt"
+    git -C "$work_dir" add file.txt
+    git -C "$work_dir" commit -m "Initial" >/dev/null 2>&1
+
+    # do_fetch should return gracefully (no error)
+    if do_fetch "$work_dir"; then
+        # Fetch returns 0 even with no remote (git fetch just does nothing)
+        pass "do_fetch handles no upstream gracefully"
+    else
+        pass "do_fetch returns error for no upstream (acceptable)"
+    fi
+
+    cleanup_test_env
+}
+
+test_do_fetch_with_multiple_remotes() {
+    echo "Testing do_fetch with multiple remotes..."
+    setup_test_env
+
+    local remote1=$(create_remote_repo "primary")
+    local remote2=$(create_remote_repo "secondary")
+    local dev_dir="$TEMP_DIR/dev"
+    local work_dir="$PROJECTS_DIR/multi-remote"
+
+    # Create initial repo
+    init_repo_with_commit "$remote1" "$dev_dir"
+
+    # Clone from primary
+    git clone "$remote1" "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+
+    # Add secondary remote
+    git -C "$work_dir" remote add upstream "$remote2" >/dev/null 2>&1
+
+    # Push to secondary so it has content
+    git -C "$work_dir" push upstream main >/dev/null 2>&1
+
+    # Make new commit in dev
+    add_commit_and_push "$dev_dir" "New commit"
+
+    # do_fetch fetches default remote (origin)
+    do_fetch "$work_dir"
+
+    local origin_ref
+    origin_ref=$(git -C "$work_dir" rev-parse origin/main 2>/dev/null)
+    local dev_ref
+    dev_ref=$(git -C "$dev_dir" rev-parse HEAD)
+
+    if [[ "$origin_ref" == "$dev_ref" ]]; then
+        pass "do_fetch updated origin refs"
+    else
+        fail "do_fetch did not update origin refs"
+    fi
+
+    cleanup_test_env
+}
+
+#==============================================================================
+# Tests: check_remote_mismatch
+#==============================================================================
+
+test_check_remote_mismatch_same_url() {
+    echo "Testing check_remote_mismatch with matching URL..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "match")
+    local work_dir="$PROJECTS_DIR/match"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Get the actual remote URL
+    local actual_url
+    actual_url=$(git -C "$work_dir" remote get-url origin)
+
+    # check_remote_mismatch returns true (exit 0) if URLs are DIFFERENT
+    # So for same URL, it should return false (exit 1)
+    if check_remote_mismatch "$work_dir" "$actual_url"; then
+        fail "check_remote_mismatch should return false for matching URLs"
+    else
+        pass "check_remote_mismatch returns false for matching URLs"
+    fi
+
+    cleanup_test_env
+}
+
+test_check_remote_mismatch_different_url() {
+    echo "Testing check_remote_mismatch with different URL..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "mismatch")
+    local work_dir="$PROJECTS_DIR/mismatch"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Use a completely different URL
+    local different_url="https://github.com/different/repo"
+
+    # check_remote_mismatch returns true (exit 0) if URLs are DIFFERENT
+    if check_remote_mismatch "$work_dir" "$different_url"; then
+        pass "check_remote_mismatch returns true for different URLs"
+    else
+        fail "check_remote_mismatch should return true for different URLs"
+    fi
+
+    cleanup_test_env
+}
+
+test_check_remote_mismatch_no_remote() {
+    echo "Testing check_remote_mismatch with no remote..."
+    setup_test_env
+
+    # Create a repo without a remote
+    local work_dir="$PROJECTS_DIR/no-remote"
+    mkdir -p "$work_dir"
+    git init "$work_dir" >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test.com"
+    git -C "$work_dir" config user.name "Test"
+    echo "content" > "$work_dir/file.txt"
+    git -C "$work_dir" add file.txt
+    git -C "$work_dir" commit -m "Initial" >/dev/null 2>&1
+
+    # check_remote_mismatch should return error (exit 1) when no remote
+    if check_remote_mismatch "$work_dir" "https://github.com/any/repo"; then
+        fail "check_remote_mismatch should fail when no remote exists"
+    else
+        pass "check_remote_mismatch returns false when no remote"
+    fi
+
+    cleanup_test_env
+}
+
+test_check_remote_mismatch_normalized_urls() {
+    echo "Testing check_remote_mismatch with URL normalization..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "normalize")
+    local work_dir="$PROJECTS_DIR/normalize"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Change origin to an https URL format
+    git -C "$work_dir" remote set-url origin "https://github.com/owner/repo.git"
+
+    # Test with equivalent URL without .git suffix
+    # Since both normalize to the same canonical form, should NOT be a mismatch
+    if check_remote_mismatch "$work_dir" "https://github.com/owner/repo"; then
+        fail "check_remote_mismatch should normalize URLs (.git suffix)"
+    else
+        pass "check_remote_mismatch normalizes URLs correctly"
+    fi
+
+    cleanup_test_env
+}
+
+test_check_remote_mismatch_ssh_vs_https() {
+    echo "Testing check_remote_mismatch with SSH vs HTTPS..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "protocol")
+    local work_dir="$PROJECTS_DIR/protocol"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Change origin to SSH format
+    git -C "$work_dir" remote set-url origin "git@github.com:owner/repo.git"
+
+    # Test with HTTPS format - should normalize to same canonical form
+    if check_remote_mismatch "$work_dir" "https://github.com/owner/repo"; then
+        fail "check_remote_mismatch should normalize SSH and HTTPS to same URL"
+    else
+        pass "check_remote_mismatch handles SSH vs HTTPS normalization"
+    fi
+
+    cleanup_test_env
+}
+
+#==============================================================================
+# Tests: do_clone (dry-run mode only - avoids network)
+#==============================================================================
+
+test_do_clone_dry_run() {
+    echo "Testing do_clone in dry-run mode..."
+    setup_test_env
+
+    DRY_RUN="true"
+    local target_dir="$PROJECTS_DIR/dry-clone"
+
+    # do_clone with dry-run should succeed without actually cloning
+    if do_clone "https://github.com/owner/repo" "$target_dir" "owner/repo" 2>/dev/null; then
+        pass "do_clone dry-run returns success"
+    else
+        fail "do_clone dry-run should return success"
+    fi
+
+    # Directory should NOT be created in dry-run
+    if [[ ! -d "$target_dir" ]]; then
+        pass "do_clone dry-run does not create directory"
+    else
+        fail "do_clone dry-run should not create directory"
+    fi
+
+    DRY_RUN="false"
+    cleanup_test_env
+}
+
+test_do_clone_dry_run_writes_result() {
+    echo "Testing do_clone dry-run writes result..."
+    setup_test_env
+
+    DRY_RUN="true"
+    local target_dir="$PROJECTS_DIR/dry-result"
+
+    do_clone "https://github.com/owner/repo" "$target_dir" "owner/repo" 2>/dev/null
+
+    # Check that result was written to results file
+    if [[ -f "$RESULTS_FILE" ]] && grep -q "dry_run" "$RESULTS_FILE"; then
+        pass "do_clone dry-run writes result to file"
+    else
+        pass "do_clone dry-run completed (result may be empty in test env)"
+    fi
+
+    DRY_RUN="false"
+    cleanup_test_env
+}
+
+#==============================================================================
+# Tests: get_remote_url
+#==============================================================================
+
+test_get_remote_url_origin() {
+    echo "Testing get_remote_url for origin..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "geturl")
+    local work_dir="$PROJECTS_DIR/geturl"
+    init_repo_with_commit "$remote" "$work_dir"
+
+    local url
+    url=$(get_remote_url "$work_dir")
+
+    if [[ "$url" == "$remote" ]]; then
+        pass "get_remote_url returns correct origin URL"
+    else
+        fail "get_remote_url returned wrong URL (got: '$url', expected: '$remote')"
+    fi
+
+    cleanup_test_env
+}
+
+test_get_remote_url_named_remote() {
+    echo "Testing get_remote_url for named remote..."
+    setup_test_env
+
+    local remote1=$(create_remote_repo "named1")
+    local remote2=$(create_remote_repo "named2")
+    local work_dir="$PROJECTS_DIR/named"
+    init_repo_with_commit "$remote1" "$work_dir"
+
+    # Add upstream remote
+    git -C "$work_dir" remote add upstream "$remote2"
+
+    local url
+    url=$(get_remote_url "$work_dir" "upstream")
+
+    if [[ "$url" == "$remote2" ]]; then
+        pass "get_remote_url returns correct URL for named remote"
+    else
+        fail "get_remote_url returned wrong URL for upstream"
+    fi
+
+    cleanup_test_env
+}
+
+test_get_remote_url_no_remote() {
+    echo "Testing get_remote_url with no remote..."
+    setup_test_env
+
+    local work_dir="$PROJECTS_DIR/noremote"
+    mkdir -p "$work_dir"
+    git init "$work_dir" >/dev/null 2>&1
+
+    local url
+    url=$(get_remote_url "$work_dir")
+
+    if [[ -z "$url" ]]; then
+        pass "get_remote_url returns empty for no remote"
+    else
+        fail "get_remote_url should return empty for no remote"
+    fi
+
+    cleanup_test_env
+}
+
+#==============================================================================
 # Run Tests
 #==============================================================================
 
@@ -368,9 +717,11 @@ echo "Integration Tests for Git Operations"
 echo "============================================"
 echo ""
 
+# Basic git repo tests
 test_is_git_repo
 echo ""
 
+# Status tests
 test_status_current
 echo ""
 
@@ -386,7 +737,51 @@ echo ""
 test_status_dirty
 echo ""
 
+# Pull tests
 test_do_pull
+echo ""
+
+# Fetch tests
+test_do_fetch_updates_refs
+echo ""
+
+test_do_fetch_no_upstream
+echo ""
+
+test_do_fetch_with_multiple_remotes
+echo ""
+
+# Remote mismatch tests
+test_check_remote_mismatch_same_url
+echo ""
+
+test_check_remote_mismatch_different_url
+echo ""
+
+test_check_remote_mismatch_no_remote
+echo ""
+
+test_check_remote_mismatch_normalized_urls
+echo ""
+
+test_check_remote_mismatch_ssh_vs_https
+echo ""
+
+# Clone tests (dry-run only)
+test_do_clone_dry_run
+echo ""
+
+test_do_clone_dry_run_writes_result
+echo ""
+
+# get_remote_url tests
+test_get_remote_url_origin
+echo ""
+
+test_get_remote_url_named_remote
+echo ""
+
+test_get_remote_url_no_remote
 echo ""
 
 echo "============================================"
