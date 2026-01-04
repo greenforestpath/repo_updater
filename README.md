@@ -107,8 +107,10 @@ ru sync
 - [Commands](#-commands)
 - [Configuration](#-configuration)
 - [Repo List Format](#-repo-list-format)
+  - [Path Collision Detection](#path-collision-detection)
 - [Sync Workflow](#-sync-workflow)
   - [Parallel Sync](#parallel-sync)
+  - [Network Timeout Tuning](#network-timeout-tuning)
   - [Resuming Interrupted Syncs](#resuming-interrupted-syncs)
 - [Git Status Detection](#-git-status-detection)
 - [Conflict Resolution](#-conflict-resolution)
@@ -116,6 +118,7 @@ ru sync
 - [Output Modes](#-output-modes)
 - [Exit Codes](#-exit-codes)
 - [Architecture](#-architecture)
+  - [NDJSON Results Logging](#ndjson-results-logging)
 - [Design Principles](#-design-principles)
 - [Testing](#-testing)
 - [Troubleshooting](#-troubleshooting)
@@ -697,6 +700,44 @@ export RU_PARALLEL=4
 **Requirements:**
 - Parallel sync requires `flock` (available by default on Linux; install via Homebrew on macOS)
 - ru automatically falls back to serial execution if flock is unavailable
+
+### Network Timeout Tuning
+
+For slow or unreliable networks, ru provides timeout configuration to prevent hangs:
+
+```bash
+# Command-line override
+ru sync --timeout 60
+
+# Config file
+# ~/.config/ru/config
+TIMEOUT=60
+
+# Environment variable
+export RU_TIMEOUT=60
+```
+
+**Advanced tuning via git environment:**
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GIT_TIMEOUT` | 30 | Overall network timeout in seconds |
+| `GIT_LOW_SPEED_LIMIT` | 1000 | Abort if transfer falls below this bytes/second |
+
+```bash
+# For very slow connections
+GIT_TIMEOUT=120 GIT_LOW_SPEED_LIMIT=100 ru sync
+```
+
+**Timeout error detection:**
+
+ru automatically recognizes timeout-related errors:
+- "RPC failed"
+- "timed out"
+- "remote end hung up unexpectedly"
+- "transfer rate too slow"
+
+When a timeout is detected, the conflict resolution output provides retry suggestions.
 
 ### Resuming Interrupted Syncs
 

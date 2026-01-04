@@ -306,7 +306,7 @@ EOF
 
     # Should only see one "repo" entry due to deduplication
     local repo_count
-    repo_count=$(echo "$output" | grep -c "owner/repo" || true)
+    repo_count=$(printf '%s\n' "$output" | grep -c "owner/repo" || true)
     # We expect to see owner/repo once (the duplicate is skipped)
     if [[ "$repo_count" -le 2 ]]; then
         pass "Duplicate repos are deduplicated or processed correctly"
