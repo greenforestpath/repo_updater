@@ -187,14 +187,16 @@ write_result() {
     local status="$3"
     local duration="${4:-}"
     local message="${5:-}"
+    local local_path="${6:-}"  # Optional: full local path for accurate reporting
 
     if [[ -n "$RESULTS_FILE" ]]; then
         # Escape all string fields for JSON safety
-        local safe_repo safe_message
+        local safe_repo safe_message safe_path
         safe_repo=$(json_escape "$repo_name")
         safe_message=$(json_escape "$message")
-        printf '{"repo":"%s","action":"%s","status":"%s","duration":%s,"message":"%s","timestamp":"%s"}\n' \
-            "$safe_repo" "$action" "$status" "${duration:-0}" "$safe_message" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        safe_path=$(json_escape "$local_path")
+        printf '{"repo":"%s","path":"%s","action":"%s","status":"%s","duration":%s,"message":"%s","timestamp":"%s"}\n' \
+            "$safe_repo" "$safe_path" "$action" "$status" "${duration:-0}" "$safe_message" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             >> "$RESULTS_FILE"
     fi
 }
@@ -1085,7 +1087,7 @@ do_clone() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would clone: $url -> $target_dir"
-        write_result "$repo_name" "clone" "dry_run" "0" ""
+        write_result "$repo_name" "clone" "dry_run" "0" "" "$target_dir"
         return 0
     fi
 
@@ -1105,17 +1107,17 @@ do_clone() {
     if output=$(gh repo clone "$clone_target" "$target_dir" -- --quiet 2>&1); then
         local duration=$(($(date +%s) - start_time))
         log_success "Cloned: $repo_name (${duration}s)"
-        write_result "$repo_name" "clone" "ok" "$duration" ""
+        write_result "$repo_name" "clone" "ok" "$duration" "" "$target_dir"
         return 0
     else
         local exit_code=$?
         if is_timeout_error "$output"; then
             log_error "Timeout: $repo_name (network too slow)"
-            write_result "$repo_name" "clone" "timeout" "0" "$output"
+            write_result "$repo_name" "clone" "timeout" "0" "$output" "$target_dir"
         else
             log_error "Failed to clone: $repo_name"
             log_verbose "  $output"
-            write_result "$repo_name" "clone" "failed" "0" "$output"
+            write_result "$repo_name" "clone" "failed" "0" "$output" "$target_dir"
         fi
         return $exit_code
     fi
@@ -1131,7 +1133,7 @@ do_pull() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would pull: $repo_name (strategy: $strategy)"
-        write_result "$repo_name" "pull" "dry_run" "0" ""
+        write_result "$repo_name" "pull" "dry_run" "0" "" "$repo_path"
         return 0
     fi
 
@@ -1164,10 +1166,10 @@ do_pull() {
         # Determine if anything changed by comparing HEADs (not by parsing strings)
         if [[ "$old_head" == "$new_head" ]]; then
             log_info "Current: $repo_name"
-            write_result "$repo_name" "pull" "current" "$duration" ""
+            write_result "$repo_name" "pull" "current" "$duration" "" "$repo_path"
         else
             log_success "Updated: $repo_name (${duration}s)"
-            write_result "$repo_name" "pull" "updated" "$duration" ""
+            write_result "$repo_name" "pull" "updated" "$duration" "" "$repo_path"
         fi
         return 0
     else
@@ -1189,7 +1191,7 @@ do_pull() {
         fi
 
         log_verbose "  $output"
-        write_result "$repo_name" "pull" "$reason" "0" "$output"
+        write_result "$repo_name" "pull" "$reason" "0" "$output" "$repo_path"
         return $exit_code
     fi
 }
@@ -1802,7 +1804,7 @@ cmd_sync() {
                 # Exists - pull updates
                 if ! is_git_repo "$path"; then
                     log_warn "Not a git repo: $path"
-                    write_result "$repo_name" "skip" "not_git" "0" ""
+                    write_result "$repo_name" "skip" "not_git" "0" "" "$path"
                     continue
                 fi
                 do_pull "$path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH"
