@@ -7550,8 +7550,12 @@ repo_spec_to_github_id() {
     # Parse spec to get repo_id
     if resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
         # Check if it's a GitHub repo
-        if [[ "$url" =~ github\.com[/:] ]]; then
-            echo "$repo_id"
+        # If repo_id matches owner/repo (2 parts), it's implicitly GitHub (from resolve_repo_spec logic)
+        # If it matches github.com/owner/repo, it's explicit
+        if [[ "$repo_id" =~ ^([^/]+)/([^/]+)$ ]]; then
+             echo "$repo_id"
+        elif [[ "$repo_id" =~ ^github\.com/([^/]+)/([^/]+)$ ]]; then
+             echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
         fi
     fi
 }
@@ -7661,6 +7665,9 @@ discover_work_items() {
     # Format: repo_id|type|number|title|labels|created_at|updated_at|is_draft
     while IFS=$'\t' read -r repo_id item_type number title labels created_at updated_at is_draft; do
         [[ -z "$repo_id" ]] && continue
+        # Sanitize fields that might contain pipes
+        title="${title//|/ }"
+        labels="${labels//|/ }"
         # Convert TSV to pipe-separated for easier parsing later
         _items_ref+=("${repo_id}|${item_type}|${number}|${title}|${labels}|${created_at}|${updated_at}|${is_draft}")
     done <<< "$all_work_items"
@@ -7911,6 +7918,192 @@ show_discovery_summary() {
 }
 
 #------------------------------------------------------------------------------
+# REVIEW JSON OUTPUT HELPERS (bd-xcj6)
+#------------------------------------------------------------------------------
+
+# Count configured GitHub repos (for discovery summary)
+count_github_repos() {
+    local count=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local github_id
+        github_id=$(repo_spec_to_github_id "$line")
+        [[ -n "$github_id" ]] && ((count++))
+    done < <(get_all_repos)
+    echo "$count"
+}
+
+# Build JSON array of items
+# Args: work_items (pipe-separated strings)
+build_review_items_json() {
+    local items=("$@")
+    local item_list=""
+
+    for item in "${items[@]}"; do
+        IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+        [[ -z "$repo_id" ]] && continue
+
+        local score level number_json labels_json
+        score=$(calculate_item_priority_score "$item_type" "$labels" "$created_at" "$updated_at" "$is_draft" "$repo_id" "$number")
+        level=$(get_priority_level "$score")
+
+        number_json="$number"
+        [[ "$number_json" =~ ^[0-9]+$ ]] || number_json=0
+
+        labels_json="[]"
+        if [[ -n "$labels" ]]; then
+            labels_json=$(printf '%s\n' "$labels" | tr ',' '\n' | jq -R . | jq -s .)
+        fi
+
+        local item_json
+        item_json=$(jq -n \
+            --arg repo "$repo_id" \
+            --arg type "$item_type" \
+            --argjson number "$number_json" \
+            --arg title "$title" \
+            --arg priority "$level" \
+            --argjson score "$score" \
+            --argjson labels "$labels_json" \
+            --arg created_at "$created_at" \
+            --arg updated_at "$updated_at" \
+            '{repo:$repo,type:$type,number:$number,title:$title,priority:$priority,score:$score,labels:$labels,created_at:$created_at,updated_at:$updated_at}')
+
+        [[ -n "$item_list" ]] && item_list+=","
+        item_list+="$item_json"
+    done
+
+    echo "[${item_list}]"
+}
+
+# Build discovery summary JSON
+# Args: repos_scanned, work_items (pipe-separated strings)
+build_review_summary_json() {
+    local repos_scanned="$1"
+    shift
+    local items=("$@")
+
+    local issues=0 prs=0 critical=0 high=0 normal=0 low=0
+    local -A unique_repos=()
+
+    for item in "${items[@]}"; do
+        IFS="|" read -r repo_id item_type number title labels created_at updated_at is_draft <<< "$item"
+        [[ -z "$repo_id" ]] && continue
+        unique_repos["$repo_id"]=1
+
+        case "$item_type" in
+            issue) ((issues++)) ;;
+            pr) ((prs++)) ;;
+        esac
+
+        local score level
+        score=$(calculate_item_priority_score "$item_type" "$labels" "$created_at" "$updated_at" "$is_draft" "$repo_id" "$number")
+        level=$(get_priority_level "$score")
+
+        case "$level" in
+            CRITICAL) ((critical++)) ;;
+            HIGH) ((high++)) ;;
+            NORMAL) ((normal++)) ;;
+            LOW) ((low++)) ;;
+        esac
+    done
+
+    local items_found=${#items[@]}
+    local repos_found=${#unique_repos[@]}
+    local repos_scanned_num="$repos_scanned"
+    [[ "$repos_scanned_num" =~ ^[0-9]+$ ]] || repos_scanned_num="$repos_found"
+    if [[ "$repos_scanned_num" -eq 0 ]]; then
+        repos_scanned_num="$repos_found"
+    fi
+
+    jq -n \
+        --argjson repos_scanned "$repos_scanned_num" \
+        --argjson items_found "$items_found" \
+        --argjson critical "$critical" \
+        --argjson high "$high" \
+        --argjson normal "$normal" \
+        --argjson low "$low" \
+        --argjson issues "$issues" \
+        --argjson prs "$prs" \
+        '{repos_scanned:$repos_scanned,items_found:$items_found,by_priority:{critical:$critical,high:$high,normal:$normal,low:$low},by_type:{issues:$issues,prs:$prs}}'
+}
+
+# Build discovery JSON output
+# Args: run_id, repos_scanned, work_items (pipe-separated strings)
+build_review_discovery_json() {
+    local run_id="$1"
+    local repos_scanned="$2"
+    shift 2
+    local items=("$@")
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local summary_json
+    summary_json=$(build_review_summary_json "$repos_scanned" "${items[@]}")
+
+    local items_json
+    items_json=$(build_review_items_json "${items[@]}")
+
+    jq -n \
+        --arg command "review" \
+        --arg mode "discovery" \
+        --arg run_id "$run_id" \
+        --arg timestamp "$timestamp" \
+        --argjson summary "$summary_json" \
+        --argjson items "$items_json" \
+        '{command:$command,mode:$mode,run_id:$run_id,timestamp:$timestamp,summary:$summary,items:$items}'
+}
+
+# Build completion JSON output
+# Args: run_id, mode, start_epoch, exit_code, work_items...
+build_review_completion_json() {
+    local run_id="$1"
+    local mode="$2"
+    local start_epoch="$3"
+    local exit_code="$4"
+    shift 4
+    local items=("$@")
+
+    local end_epoch duration_seconds
+    end_epoch=$(date +%s)
+    duration_seconds=0
+    if [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
+        duration_seconds=$((end_epoch - start_epoch))
+    fi
+
+    local -A unique_repos=()
+    local item
+    for item in "${items[@]}"; do
+        IFS="|" read -r repo_id _ _ _ _ _ _ _ <<< "$item"
+        [[ -n "$repo_id" ]] && unique_repos["$repo_id"]=1
+    done
+
+    local repos_reviewed=${#unique_repos[@]}
+    local items_processed=${#items[@]}
+
+    local summary_json
+    summary_json=$(jq -n \
+        --argjson repos_reviewed "$repos_reviewed" \
+        --argjson items_processed "$items_processed" \
+        --argjson items_fixed 0 \
+        --argjson items_skipped 0 \
+        --argjson items_needs_info 0 \
+        --argjson commits_created 0 \
+        --argjson questions_asked 0 \
+        --argjson duration_seconds "$duration_seconds" \
+        '{repos_reviewed:$repos_reviewed,items_processed:$items_processed,items_fixed:$items_fixed,items_skipped:$items_skipped,items_needs_info:$items_needs_info,commits_created:$commits_created,questions_asked:$questions_asked,duration_seconds:$duration_seconds}')
+
+    jq -n \
+        --arg command "review" \
+        --arg mode "$mode" \
+        --arg run_id "$run_id" \
+        --arg status "complete" \
+        --argjson exit_code "$exit_code" \
+        --argjson summary "$summary_json" \
+        '{command:$command,mode:$mode,run_id:$run_id,status:$status,exit_code:$exit_code,summary:$summary,repos:{}}'
+}
+
+#------------------------------------------------------------------------------
 # REVIEW EXIT CODES + ERROR CLASSIFICATION (bd-jen3)
 #
 # Review uses ru's standard exit codes:
@@ -8000,6 +8193,9 @@ finalize_review_exit() {
 # cmd_review: Review GitHub issues and PRs using Claude Code
 #------------------------------------------------------------------------------
 cmd_review() {
+    local review_start_epoch
+    review_start_epoch=$(date +%s)
+
     # Parse review-specific arguments
     parse_review_args
 
@@ -8008,9 +8204,58 @@ cmd_review() {
         exit 3
     fi
 
+    local resume_pending_repos=""
+    local resume_run_id=""
+    local repos_scanned=0
+
+    if [[ "$REVIEW_RESUME" == "true" ]]; then
+        local checkpoint
+        checkpoint=$(load_review_checkpoint)
+
+        if [[ -z "$checkpoint" ]]; then
+            log_warn "No review checkpoint found; starting fresh"
+        else
+            resume_run_id=$(echo "$checkpoint" | jq -r '.run_id // empty' 2>/dev/null)
+            local checkpoint_mode checkpoint_hash pending_count
+            checkpoint_mode=$(echo "$checkpoint" | jq -r '.mode // empty' 2>/dev/null)
+            checkpoint_hash=$(echo "$checkpoint" | jq -r '.config_hash // empty' 2>/dev/null)
+            pending_count=$(echo "$checkpoint" | jq -r '.repos_pending // 0' 2>/dev/null || echo 0)
+
+            if [[ -n "$checkpoint_mode" && "$REVIEW_MODE" != "$checkpoint_mode" ]]; then
+                log_warn "Checkpoint mode '$checkpoint_mode' overrides requested mode '$REVIEW_MODE'"
+                REVIEW_MODE="$checkpoint_mode"
+            fi
+
+            if [[ -n "$checkpoint_hash" ]]; then
+                local current_hash
+                current_hash=$(get_config_hash)
+                if [[ "$current_hash" != "$checkpoint_hash" ]]; then
+                    log_warn "Repository list has changed since checkpoint"
+                fi
+            fi
+
+            resume_pending_repos=$(echo "$checkpoint" | jq -r '.pending_repos[]?' 2>/dev/null | tr '\n' ' ')
+            resume_pending_repos="${resume_pending_repos%" "}"
+            if [[ -n "$resume_pending_repos" ]]; then
+                repos_scanned=$(echo "$resume_pending_repos" | wc -w | tr -d ' ')
+                log_info "Resuming review with $pending_count pending repo(s)"
+            else
+                log_warn "Checkpoint contains no pending repos; starting fresh"
+            fi
+        fi
+    fi
+
     # Generate unique run ID
     local run_id
-    run_id="$(date +%Y%m%d-%H%M%S)-$$"
+    if [[ -n "$resume_run_id" ]]; then
+        run_id="$resume_run_id"
+    elif [[ "$REVIEW_MODE" == "apply" ]]; then
+        if ! run_id=$(resolve_review_apply_run_id); then
+            exit 4
+        fi
+    else
+        run_id="$(date +%Y%m%d-%H%M%S)-$$"
+    fi
     # shellcheck disable=SC2034  # Used by later phases and logging
     REVIEW_RUN_ID="$run_id"
 
@@ -8032,6 +8277,17 @@ cmd_review() {
     # Handle interrupts gracefully
     trap 'echo "" >&2; log_warn "Review interrupted - use --resume to continue"; exit 5' INT TERM
 
+    # Apply mode does not require discovery or a driver.
+    if [[ "$REVIEW_MODE" == "apply" ]]; then
+        local apply_code=0
+        cmd_review_apply
+        apply_code=$?
+        if [[ "$apply_code" -eq 0 ]]; then
+            clear_review_checkpoint
+        fi
+        finalize_review_exit "$apply_code"
+    fi
+
     # Auto-detect driver if needed
     if [[ "$REVIEW_DRIVER" == "auto" ]]; then
         REVIEW_DRIVER=$(detect_review_driver)
@@ -8046,21 +8302,56 @@ cmd_review() {
     # Discovery phase
     log_step "Scanning repositories for open issues and PRs..."
     local -a work_items
-    discover_work_items work_items "$REVIEW_PRIORITY" "$REVIEW_MAX_REPOS"
+    discover_work_items work_items "$REVIEW_PRIORITY" "$REVIEW_MAX_REPOS" "$resume_pending_repos"
+
+    if [[ $repos_scanned -eq 0 ]]; then
+        repos_scanned=$(count_github_repos)
+    fi
 
     if [[ ${#work_items[@]} -eq 0 ]]; then
         log_success "No work items need review"
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            build_review_discovery_json "$run_id" "$repos_scanned" "${work_items[@]}"
+        fi
+        if [[ "$REVIEW_DRY_RUN" != "true" ]]; then
+            clear_review_checkpoint
+        fi
         return 0
     fi
 
     # Show summary
-    show_discovery_summary "${work_items[@]}"
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local saved_json_output="$JSON_OUTPUT"
+        JSON_OUTPUT="false"
+        show_discovery_summary "${work_items[@]}"
+        JSON_OUTPUT="$saved_json_output"
+    else
+        show_discovery_summary "${work_items[@]}"
+    fi
+
+    if [[ "$JSON_OUTPUT" == "true" && "$REVIEW_DRY_RUN" == "true" ]]; then
+        build_review_discovery_json "$run_id" "$repos_scanned" "${work_items[@]}"
+    fi
 
     # Dry run exit point
     if [[ "$REVIEW_DRY_RUN" == "true" ]]; then
         log_info "Dry run complete - no sessions started"
         return 0
     fi
+
+    # Initialize checkpoint for resume (completed empty, pending from work items)
+    local pending_repos_list=""
+    local -A pending_seen=()
+    for item in "${work_items[@]}"; do
+        local repo_id=""
+        IFS="|" read -r repo_id _ _ _ _ _ _ _ <<< "$item"
+        if [[ -n "$repo_id" && -z "${pending_seen[$repo_id]:-}" ]]; then
+            pending_seen["$repo_id"]=1
+            pending_repos_list+="${repo_id} "
+        fi
+    done
+    pending_repos_list="${pending_repos_list%" "}"
+    checkpoint_review_state "" "$pending_repos_list"
 
     # TODO: Orchestration phases (implemented in later beads)
     # - Prepare worktrees
@@ -8078,6 +8369,480 @@ cmd_review() {
         log_info "Apply mode: would execute approved plans"
         if [[ "$REVIEW_PUSH" == "true" ]]; then
             log_info "Push enabled: would push approved changes"
+        fi
+    fi
+
+    clear_review_checkpoint
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        build_review_completion_json "$run_id" "$REVIEW_MODE" "$review_start_epoch" "0" "${work_items[@]}"
+    fi
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# resolve_review_apply_run_id: Determine which review run to apply
+#
+# If --resume is set, uses the checkpoint run_id.
+# Otherwise, selects the most recently modified directory under $RU_STATE_DIR/worktrees.
+#
+# Outputs:
+#   Run ID to stdout
+# Returns:
+#   0 on success, 1 on failure
+#------------------------------------------------------------------------------
+resolve_review_apply_run_id() {
+    local run_id=""
+
+    if [[ "${REVIEW_RESUME:-false}" == "true" ]]; then
+        local checkpoint
+        checkpoint=$(load_review_checkpoint)
+        if [[ -z "$checkpoint" ]]; then
+            log_error "No review checkpoint found (cannot --resume apply)"
+            return 1
+        fi
+
+        run_id=$(echo "$checkpoint" | jq -r '.run_id // ""' 2>/dev/null || echo "")
+        if [[ -z "$run_id" || "$run_id" == "null" ]]; then
+            log_error "Checkpoint missing run_id (cannot --resume apply)"
+            return 1
+        fi
+
+        echo "$run_id"
+        return 0
+    fi
+
+    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    if [[ ! -d "$base" ]]; then
+        log_error "No review worktrees directory found: $base"
+        return 1
+    fi
+
+    local best_run_id=""
+    local best_mtime=0
+
+    local dir
+    for dir in "$base"/*; do
+        [[ -d "$dir" ]] || continue
+
+        local mtime
+        if stat --version 2>/dev/null | grep -q GNU; then
+            mtime=$(stat -c %Y "$dir" 2>/dev/null || echo 0)
+        else
+            mtime=$(stat -f %m "$dir" 2>/dev/null || echo 0)
+        fi
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+
+        if (( mtime > best_mtime )); then
+            best_mtime="$mtime"
+            best_run_id="${dir##*/}"
+        fi
+    done
+
+    run_id="$best_run_id"
+
+    if [[ -z "$run_id" ]]; then
+        log_error "No review worktrees found under: $base"
+        return 1
+    fi
+
+    echo "$run_id"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# cmd_review_apply: Apply approved review plans for a run
+#
+# Uses the per-run worktree mapping file to locate worktrees and plan artifacts.
+#
+# Returns:
+#   Review exit code (0-5)
+#------------------------------------------------------------------------------
+cmd_review_apply() {
+    local run_id="${REVIEW_RUN_ID:-}"
+    if [[ -z "$run_id" ]]; then
+        log_error "No run ID available for apply"
+        return 4
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_error "jq is required for review --apply"
+        return 3
+    fi
+
+    local worktrees_dir
+    worktrees_dir=$(get_worktrees_dir)
+    local mapping_file="$worktrees_dir/mapping.json"
+
+    if [[ ! -f "$mapping_file" ]]; then
+        log_error "No worktree mapping found for run: $run_id"
+        log_error "Expected: $mapping_file"
+        return 4
+    fi
+
+    log_step "Applying review plans for run: $run_id"
+
+    local -a codes=()
+    local repo_id
+    while IFS= read -r repo_id; do
+        [[ -n "$repo_id" ]] || continue
+
+        local wt_path
+        wt_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file" 2>/dev/null || echo "")
+        if [[ -z "$wt_path" || ! -d "$wt_path" ]]; then
+            log_error "Missing or invalid worktree path for $repo_id (mapping.json)"
+            codes+=("2")
+            continue
+        fi
+
+        local code=0
+        apply_review_plan_for_repo "$repo_id" "$wt_path"
+        code=$?
+        codes+=("$code")
+    done < <(jq -r 'keys[]' "$mapping_file" 2>/dev/null)
+
+    local overall
+    overall=$(aggregate_exit_code "${codes[@]}")
+    return "$overall"
+}
+
+#------------------------------------------------------------------------------
+# get_main_repo_path_from_worktree: Resolve the main repo path from a worktree path
+#
+# Args:
+#   $1 - worktree path
+# Outputs:
+#   Main repo path to stdout
+# Returns:
+#   0 on success, 1 on failure
+#------------------------------------------------------------------------------
+get_main_repo_path_from_worktree() {
+    local wt_path="$1"
+
+    local common_dir
+    common_dir=$(git -C "$wt_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+    common_dir="${common_dir%/}"
+
+    if [[ "$common_dir" == */.git ]]; then
+        echo "${common_dir%/.git}"
+        return 0
+    fi
+
+    echo "$common_dir"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# archive_review_plan: Copy the plan artifact to review state for audit
+#
+# Args:
+#   $1 - repo_id
+#   $2 - plan_file
+# Returns:
+#   0 on success, 1 on failure
+#------------------------------------------------------------------------------
+archive_review_plan() {
+    local repo_id="$1"
+    local plan_file="$2"
+
+    if [[ ! -f "$plan_file" ]]; then
+        log_error "Cannot archive missing plan file: $plan_file"
+        return 1
+    fi
+
+    local state_dir
+    state_dir=$(get_review_state_dir)
+    local run_id="${REVIEW_RUN_ID:-unknown}"
+
+    local out_dir="$state_dir/applied-plans/$run_id"
+    ensure_dir "$out_dir"
+
+    local safe_repo="${repo_id//\//_}"
+    local dest="$out_dir/${safe_repo}.json"
+    if [[ -f "$dest" ]]; then
+        dest="$out_dir/${safe_repo}-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
+    fi
+
+    if ! cp "$plan_file" "$dest" 2>/dev/null; then
+        log_error "Failed to archive plan to: $dest"
+        return 1
+    fi
+
+    log_verbose "Archived plan: $dest"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# verify_push_safe: Refuse push/merge unless plan indicates it's safe
+#
+# Args:
+#   $1 - repo_id
+#   $2 - plan_file
+#   $3 - Optional: worktree path (for dirty check)
+#
+# Returns:
+#   0 if safe, 1 otherwise
+#------------------------------------------------------------------------------
+verify_push_safe() {
+    local repo_id="$1"
+    local plan_file="$2"
+    local wt_path="${3:-}"
+
+    if [[ ! -f "$plan_file" ]]; then
+        log_error "Plan file not found for $repo_id: $plan_file"
+        return 1
+    fi
+
+    local quality_ok tests_ok warning
+    quality_ok=$(jq -r '.git.quality_gates_ok // false' "$plan_file" 2>/dev/null || echo "false")
+    tests_ok=$(jq -r '.git.tests.ok // false' "$plan_file" 2>/dev/null || echo "false")
+    warning=$(jq -r '.git.quality_gates_warning // false' "$plan_file" 2>/dev/null || echo "false")
+
+    if [[ "$quality_ok" != "true" || "$tests_ok" != "true" ]]; then
+        log_error "Quality gates did not pass for $repo_id (refusing to push)"
+        return 1
+    fi
+
+    if [[ "$warning" == "true" ]]; then
+        log_error "Quality gates reported warnings for $repo_id (refusing to push)"
+        return 1
+    fi
+
+    local unanswered
+    unanswered=$(jq -r '[.questions // [] | .[] | select(.answered != true)] | length' "$plan_file" 2>/dev/null || echo "0")
+    if [[ "$unanswered" =~ ^[0-9]+$ ]] && [[ "$unanswered" -gt 0 ]]; then
+        log_error "$unanswered unanswered question(s) for $repo_id (refusing to push)"
+        return 1
+    fi
+
+    if [[ -n "$wt_path" && -d "$wt_path" ]]; then
+        local wt_status
+        wt_status=$(git -C "$wt_path" status --porcelain 2>/dev/null || true)
+        # Ignore ru-managed artifacts stored under .ru/
+        if [[ -n "$wt_status" ]]; then
+            wt_status=$(echo "$wt_status" | grep -vE '^\?\? \.ru(/|$)' 2>/dev/null || true)
+        fi
+
+        if [[ -n "$wt_status" ]]; then
+            log_error "Worktree has uncommitted changes for $repo_id (refusing to push)"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# record_review_push: Record a successful push in review state
+#
+# Args:
+#   $1 - repo_id
+#   $2 - branch (base branch pushed)
+#   $3 - commit sha (HEAD after push)
+# Returns:
+#   0 on success, 1 on failure
+#------------------------------------------------------------------------------
+record_review_push() {
+    local repo_id="$1"
+    local branch="$2"
+    local commit_sha="$3"
+
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    init_review_state
+
+    update_review_state "
+        .repos[\"$repo_id\"] = (.repos[\"$repo_id\"] // {}) + {
+            \"last_push\": \"$now\",
+            \"last_push_branch\": \"$branch\",
+            \"last_push_commit\": \"$commit_sha\"
+        }
+    "
+}
+
+#------------------------------------------------------------------------------
+# push_worktree_changes: Fast-forward merge worktree branch into base and push
+#
+# Args:
+#   $1 - repo_id
+#   $2 - worktree path
+#
+# Returns:
+#   0 on success, 1 on failure
+#------------------------------------------------------------------------------
+push_worktree_changes() {
+    local repo_id="$1"
+    local wt_path="$2"
+    local plan_file="$wt_path/.ru/review-plan.json"
+
+    if [[ ! -f "$plan_file" ]]; then
+        log_error "Plan file not found: $plan_file"
+        return 1
+    fi
+
+    local validation
+    validation=$(validate_review_plan "$plan_file")
+    if [[ "$validation" != "Valid" ]]; then
+        log_error "Invalid plan for $repo_id: $validation"
+        return 1
+    fi
+
+    local wt_branch base_ref
+    wt_branch=$(jq -r '.git.branch // ""' "$plan_file" 2>/dev/null || echo "")
+    base_ref=$(jq -r '.git.base_ref // ""' "$plan_file" 2>/dev/null || echo "")
+
+    if [[ -z "$wt_branch" ]]; then
+        wt_branch=$(git -C "$wt_path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$wt_branch" ]]; then
+        log_error "Cannot determine worktree branch for $repo_id"
+        return 1
+    fi
+
+    if [[ -z "$base_ref" ]]; then
+        log_error "Plan missing git.base_ref for $repo_id (cannot merge)"
+        return 1
+    fi
+
+    if ! git check-ref-format --branch "$wt_branch" >/dev/null 2>&1; then
+        log_error "Invalid worktree branch name in plan: $wt_branch"
+        return 1
+    fi
+
+    if ! git check-ref-format --branch "$base_ref" >/dev/null 2>&1; then
+        log_error "Invalid base_ref in plan: $base_ref"
+        return 1
+    fi
+
+    local main_repo
+    if ! main_repo=$(get_main_repo_path_from_worktree "$wt_path"); then
+        log_error "Failed to resolve main repo path from worktree: $wt_path"
+        return 1
+    fi
+
+    if [[ -n "$(git -C "$main_repo" status --porcelain 2>/dev/null)" ]]; then
+        log_error "Main repo has uncommitted changes: $main_repo"
+        return 1
+    fi
+
+    log_step "Merging changes for $repo_id into $base_ref"
+
+    git -C "$main_repo" fetch --quiet 2>/dev/null || true
+
+    local original_branch
+    original_branch=$(git -C "$main_repo" symbolic-ref --short HEAD 2>/dev/null || echo "")
+
+    if ! git -C "$main_repo" checkout --quiet "$base_ref" 2>/dev/null; then
+        log_error "Failed to checkout base ref $base_ref in $main_repo"
+        return 1
+    fi
+
+    local safe_repo tmp_ref
+    safe_repo="${repo_id//\//_}"
+    tmp_ref="refs/ru/tmp/worktree-${safe_repo}-$$"
+
+    if ! git -C "$main_repo" fetch --quiet "$wt_path" "+refs/heads/$wt_branch:$tmp_ref" 2>/dev/null; then
+        log_error "Failed to fetch worktree branch $wt_branch from $wt_path"
+        [[ -n "$original_branch" ]] && git -C "$main_repo" checkout --quiet "$original_branch" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! git -C "$main_repo" merge --ff-only --quiet "$tmp_ref" 2>/dev/null; then
+        log_error "Cannot fast-forward merge for $repo_id (manual resolution needed)"
+        git -C "$main_repo" update-ref -d "$tmp_ref" 2>/dev/null || true
+        [[ -n "$original_branch" ]] && git -C "$main_repo" checkout --quiet "$original_branch" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! git -C "$main_repo" push 2>/dev/null; then
+        log_error "Push failed for $repo_id"
+        git -C "$main_repo" update-ref -d "$tmp_ref" 2>/dev/null || true
+        [[ -n "$original_branch" ]] && git -C "$main_repo" checkout --quiet "$original_branch" 2>/dev/null || true
+        return 1
+    fi
+
+    git -C "$main_repo" update-ref -d "$tmp_ref" 2>/dev/null || true
+
+    local head_sha
+    head_sha=$(git -C "$main_repo" rev-parse HEAD 2>/dev/null || echo "")
+    record_review_push "$repo_id" "$base_ref" "$head_sha" || true
+    archive_review_plan "$repo_id" "$plan_file" || true
+
+    log_success "Pushed changes for $repo_id"
+
+    if [[ -n "$original_branch" && "$original_branch" != "$base_ref" ]]; then
+        git -C "$main_repo" checkout --quiet "$original_branch" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# apply_review_plan_for_repo: Apply a single repo's review plan from its worktree
+#
+# Returns:
+#   Review exit code (0-5) for this repo
+#------------------------------------------------------------------------------
+apply_review_plan_for_repo() {
+    local repo_id="$1"
+    local wt_path="$2"
+    local plan_file="$wt_path/.ru/review-plan.json"
+
+    if [[ ! -f "$plan_file" ]]; then
+        log_error "Missing review plan for $repo_id: $plan_file"
+        return "$(review_exit_code_for_error invalid_flag)"
+    fi
+
+    local validation
+    validation=$(validate_review_plan "$plan_file")
+    if [[ "$validation" != "Valid" ]]; then
+        log_error "Invalid review plan for $repo_id: $validation"
+        return "$(review_exit_code_for_error invalid_flag)"
+    fi
+
+    local commits_count
+    commits_count=$(jq -r '.git.commits // [] | length' "$plan_file" 2>/dev/null || echo "0")
+    [[ "$commits_count" =~ ^[0-9]+$ ]] || commits_count=0
+
+    local gates_json gates_rc
+    gates_json=$(run_quality_gates "$wt_path" "$plan_file")
+    gates_rc=$?
+    update_plan_with_gates "$plan_file" "$gates_json" || true
+
+    if [[ $gates_rc -ne 0 ]]; then
+        return "$(review_exit_code_for_error quality_gate_failed)"
+    fi
+
+    local pushed=false
+    if [[ "$commits_count" -gt 0 ]]; then
+        if [[ "${REVIEW_PUSH:-false}" != "true" ]]; then
+            log_info "Push disabled (use --push) - skipping merge/push for $repo_id"
+        elif ! repo_allows_push "$repo_id"; then
+            log_warn "Push not allowed by policy for $repo_id - skipping merge/push"
+        else
+            if ! verify_push_safe "$repo_id" "$plan_file" "$wt_path"; then
+                return "$(review_exit_code_for_error quality_gate_failed)"
+            fi
+
+            if ! push_worktree_changes "$repo_id" "$wt_path"; then
+                return "$(review_exit_code_for_error merge_conflict)"
+            fi
+            pushed=true
+        fi
+    fi
+
+    local actions_count
+    actions_count=$(jq -r '.gh_actions // [] | length' "$plan_file" 2>/dev/null || echo "0")
+    [[ "$actions_count" =~ ^[0-9]+$ ]] || actions_count=0
+
+    if [[ "$actions_count" -gt 0 ]]; then
+        if [[ "$commits_count" -gt 0 && "$pushed" != "true" ]]; then
+            log_warn "Skipping gh_actions for $repo_id (code changes not pushed)"
+        else
+            if ! execute_gh_actions "$repo_id" "$plan_file"; then
+                return "$(review_exit_code_for_error session_failed)"
+            fi
         fi
     fi
 
