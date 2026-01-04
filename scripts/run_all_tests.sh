@@ -83,22 +83,53 @@ fi
 discover_tests() {
     local tests=()
 
-    # Find all test_*.sh files except the framework itself
-    while IFS= read -r -d '' file; do
-        local basename
-        basename=$(basename "$file")
-        # Skip the framework files
-        if [[ "$basename" == "test_framework.sh" ]]; then
-            continue
-        fi
-        # Apply filter if provided
-        if [[ -n "$FILTER_PATTERN" ]]; then
-            if [[ "$basename" != *"$FILTER_PATTERN"* ]]; then
+    # Prefer git-tracked tests for determinism (avoids executing untracked local artifacts).
+    local project_dir
+    project_dir="$(dirname "$SCRIPT_DIR")"
+
+    if git -C "$project_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        while IFS= read -r -d '' file; do
+            local full_path="$project_dir/$file"
+            local basename
+            basename=$(basename "$file")
+
+            # Skip the framework file
+            if [[ "$basename" == "test_framework.sh" ]]; then
                 continue
             fi
-        fi
-        tests+=("$file")
-    done < <(find "$SCRIPT_DIR" -maxdepth 1 -name 'test_*.sh' -type f -print0 | sort -z)
+
+            # Apply filter if provided
+            if [[ -n "$FILTER_PATTERN" ]] && [[ "$basename" != *"$FILTER_PATTERN"* ]]; then
+                continue
+            fi
+
+            # Skip non-executable tracked tests (warn so it doesn't silently disappear)
+            if [[ ! -x "$full_path" ]]; then
+                echo "WARN: Skipping non-executable test: $file (run: chmod +x $file)" >&2
+                continue
+            fi
+
+            tests+=("$full_path")
+        done < <(git -C "$project_dir" ls-files -z -- 'scripts/test_*.sh')
+    else
+        # Fallback for non-git distributions (e.g., tarball installs)
+        while IFS= read -r -d '' file; do
+            local basename
+            basename=$(basename "$file")
+
+            if [[ "$basename" == "test_framework.sh" ]]; then
+                continue
+            fi
+            if [[ -n "$FILTER_PATTERN" ]] && [[ "$basename" != *"$FILTER_PATTERN"* ]]; then
+                continue
+            fi
+            if [[ ! -x "$file" ]]; then
+                echo "WARN: Skipping non-executable test: $file" >&2
+                continue
+            fi
+            tests+=("$file")
+        done < <(find "$SCRIPT_DIR" -maxdepth 1 -name 'test_*.sh' -type f -print0 | sort -z)
+    fi
 
     printf '%s\n' "${tests[@]}"
 }
