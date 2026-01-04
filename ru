@@ -3123,7 +3123,7 @@ cmd_prune() {
 
     # Check projects directory exists
     if [[ ! -d "$PROJECTS_DIR" ]]; then
-        log_warning "Projects directory does not exist: $PROJECTS_DIR"
+        log_warn "Projects directory does not exist: $PROJECTS_DIR"
         return 0
     fi
 
@@ -3145,13 +3145,14 @@ cmd_prune() {
     done < <(get_all_repos) | sort -u > "$configured_paths"
 
     # Find all git repositories in projects directory
+    # Depth to .git directory: flat=2, owner-repo=3, full=4
     local orphans=()
     local depth_limit
     case "$LAYOUT" in
-        flat)       depth_limit=1 ;;
-        owner-repo) depth_limit=2 ;;
-        full)       depth_limit=3 ;;
-        *)          depth_limit=3 ;;
+        flat)       depth_limit=2 ;;
+        owner-repo) depth_limit=3 ;;
+        full)       depth_limit=4 ;;
+        *)          depth_limit=4 ;;
     esac
 
     while IFS= read -r repo_path; do
@@ -3160,7 +3161,7 @@ cmd_prune() {
             continue
         fi
         orphans+=("$repo_path")
-    done < <(find "$PROJECTS_DIR" -mindepth 1 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null | sort)
+    done < <(/usr/bin/find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null | sort)
 
     # Report results
     if [[ ${#orphans[@]} -eq 0 ]]; then
