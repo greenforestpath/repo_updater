@@ -232,6 +232,125 @@ set_log_level() {
 }
 
 #==============================================================================
+# TAP (Test Anything Protocol) Output
+#==============================================================================
+# TAP format enables integration with prove, tap-junit, GitHub Actions, etc.
+# See: https://testanything.org/
+
+# TAP mode toggle (set via enable_tap_output or TF_TAP_MODE env var)
+TF_TAP_MODE="${TF_TAP_MODE:-false}"
+
+# TAP test counter (for numbering test lines)
+TF_TAP_TEST_NUM=0
+
+# TAP planned test count (for 1..N header)
+TF_TAP_PLAN_COUNT=0
+
+# Enable TAP output mode
+# Usage: enable_tap_output
+enable_tap_output() {
+    TF_TAP_MODE="true"
+    TF_TAP_TEST_NUM=0
+}
+
+# Disable TAP output mode (back to human-readable)
+# Usage: disable_tap_output
+disable_tap_output() {
+    TF_TAP_MODE="false"
+}
+
+# Check if TAP mode is enabled
+# Usage: if is_tap_mode; then ...; fi
+is_tap_mode() {
+    [[ "$TF_TAP_MODE" == "true" ]]
+}
+
+# Output TAP plan header
+# Usage: tap_plan 5    # Outputs: 1..5
+# Call this BEFORE running tests to declare expected test count
+tap_plan() {
+    local count="$1"
+    TF_TAP_PLAN_COUNT="$count"
+    if is_tap_mode; then
+        echo "1..$count"
+    fi
+}
+
+# Output TAP version header (optional, TAP 13+)
+# Usage: tap_version
+tap_version() {
+    if is_tap_mode; then
+        echo "TAP version 13"
+    fi
+}
+
+# Output TAP diagnostic comment
+# Usage: tap_diag "Some diagnostic message"
+tap_diag() {
+    local msg="$1"
+    if is_tap_mode; then
+        echo "# $msg"
+    fi
+}
+
+# Output TAP ok line (internal use - called by run_test)
+# Usage: _tap_ok test_name [directive]
+_tap_ok() {
+    local test_name="$1"
+    local directive="${2:-}"
+    ((TF_TAP_TEST_NUM++))
+    if [[ -n "$directive" ]]; then
+        echo "ok $TF_TAP_TEST_NUM - $test_name # $directive"
+    else
+        echo "ok $TF_TAP_TEST_NUM - $test_name"
+    fi
+}
+
+# Output TAP not ok line (internal use - called by run_test)
+# Usage: _tap_not_ok test_name [reason]
+_tap_not_ok() {
+    local test_name="$1"
+    local reason="${2:-}"
+    ((TF_TAP_TEST_NUM++))
+    echo "not ok $TF_TAP_TEST_NUM - $test_name"
+    if [[ -n "$reason" ]]; then
+        echo "# $reason"
+    fi
+}
+
+# Output TAP skip line
+# Usage: _tap_skip test_name reason
+_tap_skip() {
+    local test_name="$1"
+    local reason="${2:-}"
+    ((TF_TAP_TEST_NUM++))
+    if [[ -n "$reason" ]]; then
+        echo "ok $TF_TAP_TEST_NUM - $test_name # SKIP $reason"
+    else
+        echo "ok $TF_TAP_TEST_NUM - $test_name # SKIP"
+    fi
+}
+
+# Output TAP todo line (test expected to fail)
+# Usage: _tap_todo test_name reason
+_tap_todo() {
+    local test_name="$1"
+    local reason="${2:-}"
+    ((TF_TAP_TEST_NUM++))
+    echo "not ok $TF_TAP_TEST_NUM - $test_name # TODO $reason"
+}
+
+# Print TAP summary (called by print_results when in TAP mode)
+_tap_summary() {
+    tap_diag ""
+    tap_diag "Tests: $TF_TESTS_PASSED passed, $TF_TESTS_FAILED failed, $TF_TESTS_SKIPPED skipped"
+    tap_diag "Assertions: $TF_ASSERTIONS_PASSED passed, $TF_ASSERTIONS_FAILED failed"
+    if [[ $TF_TAP_PLAN_COUNT -gt 0 && $TF_TAP_TEST_NUM -ne $TF_TAP_PLAN_COUNT ]]; then
+        tap_diag "WARNING: Planned $TF_TAP_PLAN_COUNT tests but ran $TF_TAP_TEST_NUM"
+    fi
+}
+
+#==============================================================================
 # Core Assertion Functions
 #==============================================================================
 
