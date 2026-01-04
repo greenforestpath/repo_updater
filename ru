@@ -884,7 +884,8 @@ parse_repo_spec() {
     fi
 
     # Extract '@branch' if present
-    if [[ "$spec" =~ ^(.+)@([^@[:space:]]+)$ ]]; then
+    # Branch names don't contain ':' or '/' - this avoids matching SSH URLs like git@github.com:...
+    if [[ "$spec" =~ ^(.+)@([^@/:[:space:]]+)$ ]]; then
         _prs_url="${BASH_REMATCH[1]}"
         _prs_branch="${BASH_REMATCH[2]}"
     else
