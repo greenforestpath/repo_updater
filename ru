@@ -1888,7 +1888,11 @@ parse_args() {
                 shift
                 ;;
             --dry-run)
-                DRY_RUN="true"
+                if [[ "$COMMAND" == "review" ]]; then
+                    ARGS+=("$1")
+                else
+                    DRY_RUN="true"
+                fi
                 shift
                 ;;
             --clone-only)
@@ -1924,7 +1928,11 @@ parse_args() {
                 shift
                 ;;
             --resume)
-                RESUME="true"
+                if [[ "$COMMAND" == "review" ]]; then
+                    ARGS+=("$1")
+                else
+                    RESUME="true"
+                fi
                 shift
                 ;;
             --restart)
@@ -1940,20 +1948,38 @@ parse_args() {
                 shift 2
                 ;;
             --parallel)
-                if [[ $# -lt 2 ]]; then
-                    log_error "--parallel requires a number of workers"
-                    exit 4
+                if [[ "$COMMAND" == "review" ]]; then
+                    if [[ $# -lt 2 ]]; then
+                        log_error "--parallel requires a number"
+                        exit 4
+                    fi
+                    ARGS+=("--parallel=$2")
+                    shift 2
+                else
+                    if [[ $# -lt 2 ]]; then
+                        log_error "--parallel requires a number of workers"
+                        exit 4
+                    fi
+                    PARALLEL="$2"
+                    shift 2
                 fi
-                PARALLEL="$2"
-                shift 2
                 ;;
             -j)
-                if [[ $# -lt 2 ]]; then
-                    log_error "-j requires a number of workers"
-                    exit 4
+                if [[ "$COMMAND" == "review" ]]; then
+                    if [[ $# -lt 2 ]]; then
+                        log_error "-j requires a number"
+                        exit 4
+                    fi
+                    ARGS+=("-j$2")
+                    shift 2
+                else
+                    if [[ $# -lt 2 ]]; then
+                        log_error "-j requires a number of workers"
+                        exit 4
+                    fi
+                    PARALLEL="$2"
+                    shift 2
                 fi
-                PARALLEL="$2"
-                shift 2
                 ;;
             --example)
                 INIT_EXAMPLE="true"
@@ -1963,10 +1989,34 @@ parse_args() {
                 COMMAND="$1"
                 shift
                 ;;
-            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd|--plan|--apply|--mode=*|--repos=*|--skip-days=*|--priority=*|--push|--max-repos=*|--max-runtime=*|--max-questions=*|--parallel=*|-j[0-9]*)
+            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd)
                 # Subcommand-specific options - pass through to ARGS
                 ARGS+=("$1")
                 shift
+                ;;
+            --plan|--apply|--push|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--parallel=*|-j[0-9]*)
+                if [[ "$COMMAND" == "review" ]]; then
+                    ARGS+=("$1")
+                    shift
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                ;;
+            --mode|--repos|--skip-days|--priority|--max-repos|--max-runtime|--max-questions)
+                if [[ "$COMMAND" == "review" ]]; then
+                    if [[ $# -lt 2 ]]; then
+                        log_error "$1 requires a value"
+                        exit 4
+                    fi
+                    ARGS+=("$1=$2")
+                    shift 2
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
                 ;;
             -*)
                 log_error "Unknown option: $1"
@@ -3902,6 +3952,415 @@ detect_review_driver() {
     echo "none"
 }
 
+#------------------------------------------------------------------------------
+# UNIFIED SESSION DRIVER INTERFACE
+#
+# This interface defines the contract between the review orchestration layer
+# and the session drivers (ntm, local). Both drivers implement these functions.
+#
+# Event Schema (normalized across drivers):
+# {
+#   "type": "init|generating|waiting|complete|error",
+#   "session_id": "string",
+#   "timestamp": "ISO-8601",
+#   "wait_info": {                    # Only present when type="waiting"
+#     "reason": "ask_user_question|agent_question_text|external_prompt|unknown",
+#     "context": "string",
+#     "options": ["a) ...", "b) ..."],
+#     "recommended": "a",
+#     "risk_level": "low|medium|high"
+#   },
+#   "error_info": {                   # Only present when type="error"
+#     "code": "string",
+#     "message": "string",
+#     "retryable": boolean
+#   }
+# }
+#------------------------------------------------------------------------------
+
+# Load a review driver implementation
+# Args: driver_name ("ntm" or "local")
+# Returns: 0 on success, 1 on failure
+load_review_driver() {
+    local driver="$1"
+
+    case "$driver" in
+        ntm)
+            # ntm driver will be implemented in bd-k1kx
+            log_verbose "Loading ntm driver"
+            LOADED_DRIVER="ntm"
+            ;;
+        local)
+            # Local driver (tmux + stream-json)
+            log_verbose "Loading local driver"
+            LOADED_DRIVER="local"
+            _enable_local_driver
+            ;;
+        none)
+            log_error "No driver to load"
+            return 1
+            ;;
+        *)
+            log_error "Unknown driver: $driver"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# Query driver capabilities
+# Returns: JSON object with capability flags
+driver_capabilities() {
+    # Base implementation - drivers override this
+    cat <<EOF
+{
+  "name": "${LOADED_DRIVER:-unknown}",
+  "parallel_sessions": true,
+  "activity_detection": false,
+  "health_monitoring": false,
+  "question_routing": true,
+  "max_concurrent": 4
+}
+EOF
+}
+
+# Start a new Claude Code session in a worktree
+# Args: worktree_path, session_name, initial_prompt
+# Returns: session_id on stdout, 0 on success
+driver_start_session() {
+    # shellcheck disable=SC2034  # Variables used by driver implementations
+    local wt_path="$1" session_name="$2" prompt="$3"
+
+    # Stub - drivers must implement
+    log_error "driver_start_session not implemented for driver: ${LOADED_DRIVER:-none}"
+    return 1
+}
+
+# Send a message/answer to an existing session
+# Args: session_id, message
+# Returns: 0 on success
+driver_send_to_session() {
+    local session_id="$1"
+    local message="$2"
+
+    # Stub - drivers must implement
+    log_error "driver_send_to_session not implemented for driver: ${LOADED_DRIVER:-none}"
+    return 1
+}
+
+# Get current state of a session
+# Args: session_id
+# Returns: JSON with state info on stdout
+driver_get_session_state() {
+    local session_id="$1"
+
+    # Stub - drivers must implement
+    cat <<EOF
+{
+  "session_id": "$session_id",
+  "state": "unknown",
+  "error": "driver_get_session_state not implemented"
+}
+EOF
+    return 1
+}
+
+# Stop/kill a session gracefully
+# Args: session_id
+# Returns: 0 on success
+driver_stop_session() {
+    local session_id="$1"
+
+    # Stub - drivers must implement
+    log_error "driver_stop_session not implemented for driver: ${LOADED_DRIVER:-none}"
+    return 1
+}
+
+# Interrupt a session (Ctrl+C equivalent)
+# Args: session_id
+# Returns: 0 on success
+driver_interrupt_session() {
+    local session_id="$1"
+
+    # Stub - drivers must implement
+    log_error "driver_interrupt_session not implemented for driver: ${LOADED_DRIVER:-none}"
+    return 1
+}
+
+# Stream events from a session
+# Args: session_id, callback_function_name
+# The callback receives: event_type, event_json
+# Blocks until session completes or is interrupted
+driver_stream_events() {
+    # shellcheck disable=SC2034  # Variables used by driver implementations
+    local session_id="$1" callback="$2"
+
+    # Stub - drivers must implement
+    log_error "driver_stream_events not implemented for driver: ${LOADED_DRIVER:-none}"
+    return 1
+}
+
+# List all active sessions for this driver
+# Returns: newline-separated session IDs
+driver_list_sessions() {
+    # Stub - drivers must implement
+    log_error "driver_list_sessions not implemented for driver: ${LOADED_DRIVER:-none}"
+    return 1
+}
+
+# Check if a session is still alive
+# Args: session_id
+# Returns: 0 if alive, 1 if dead/unknown
+driver_session_alive() {
+    local session_id="$1"
+
+    # Stub - drivers must implement (default: unknown = dead)
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# LOCAL DRIVER IMPLEMENTATION (tmux + stream-json)
+#
+# This driver uses tmux to manage Claude Code sessions and parses the
+# stream-json output format for event detection.
+#------------------------------------------------------------------------------
+
+# Local driver: Start a new Claude Code session
+local_driver_start_session() {
+    local wt_path="$1"
+    local session_name="$2"
+    local prompt="$3"
+
+    # Validate tmux is available
+    if ! command -v tmux &>/dev/null; then
+        log_error "tmux is required for local driver"
+        return 1
+    fi
+
+    # Create .ru directory for session artifacts
+    local ru_dir="$wt_path/.ru"
+    ensure_dir "$ru_dir"
+
+    local log_file="$ru_dir/session.log"
+    local event_pipe="$ru_dir/events.pipe"
+    local state_file="$ru_dir/session.state"
+
+    # Create named pipe for event streaming
+    rm -f "$event_pipe"
+    if ! mkfifo "$event_pipe" 2>/dev/null; then
+        log_error "Failed to create event pipe: $event_pipe"
+        return 1
+    fi
+
+    # Initialize state file
+    cat > "$state_file" <<EOF
+{
+  "session_id": "$session_name",
+  "state": "starting",
+  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+    # Build claude command with stream-json output
+    # shellcheck disable=SC2016  # Single quotes intentional for tmux
+    local claude_cmd
+    claude_cmd='claude -p '"$(printf '%q' "$prompt")"' --output-format stream-json'
+
+    # Create tmux session running claude
+    if ! tmux new-session -d -s "$session_name" -c "$wt_path" \
+        "exec bash -c '$claude_cmd 2>&1 | tee \"$log_file\" > \"$event_pipe\"'"; then
+        log_error "Failed to create tmux session: $session_name"
+        rm -f "$event_pipe"
+        return 1
+    fi
+
+    # Update state to running
+    cat > "$state_file" <<EOF
+{
+  "session_id": "$session_name",
+  "state": "generating",
+  "worktree": "$wt_path",
+  "log_file": "$log_file",
+  "event_pipe": "$event_pipe",
+  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+    # Return session info on stdout
+    cat "$state_file"
+    return 0
+}
+
+# Local driver: Send a message to an existing session
+local_driver_send_to_session() {
+    local session_id="$1"
+    local message="$2"
+
+    # Check if session exists
+    if ! tmux has-session -t "$session_id" 2>/dev/null; then
+        log_error "Session not found: $session_id"
+        return 1
+    fi
+
+    # Send via tmux (each line as Enter-terminated input)
+    tmux send-keys -t "$session_id" "$message" Enter
+
+    return $?
+}
+
+# Local driver: Get current session state
+local_driver_get_session_state() {
+    local session_id="$1"
+
+    # Check if tmux session exists
+    if ! tmux has-session -t "$session_id" 2>/dev/null; then
+        cat <<EOF
+{
+  "session_id": "$session_id",
+  "state": "dead",
+  "reason": "tmux session not found"
+}
+EOF
+        return 0
+    fi
+
+    # Check if process is running in the session
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$session_id" -F "#{pane_pid}" 2>/dev/null | head -1)
+
+    if [[ -z "$pane_pid" ]]; then
+        cat <<EOF
+{
+  "session_id": "$session_id",
+  "state": "unknown",
+  "reason": "no pane found"
+}
+EOF
+        return 0
+    fi
+
+    # Check if child process (claude) is running
+    local children
+    children=$(pgrep -P "$pane_pid" 2>/dev/null | wc -l)
+
+    local state="generating"
+    if [[ "$children" -eq 0 ]]; then
+        state="complete"
+    fi
+
+    cat <<EOF
+{
+  "session_id": "$session_id",
+  "state": "$state",
+  "pane_pid": $pane_pid
+}
+EOF
+    return 0
+}
+
+# Local driver: Stop/kill a session gracefully
+local_driver_stop_session() {
+    local session_id="$1"
+
+    # Kill tmux session
+    tmux kill-session -t "$session_id" 2>/dev/null || true
+
+    return 0
+}
+
+# Local driver: Interrupt a session (Ctrl+C equivalent)
+local_driver_interrupt_session() {
+    local session_id="$1"
+
+    # Check if session exists
+    if ! tmux has-session -t "$session_id" 2>/dev/null; then
+        return 1
+    fi
+
+    # Send Ctrl+C
+    tmux send-keys -t "$session_id" C-c
+
+    return 0
+}
+
+# Local driver: Stream events from a session
+# Parses NDJSON from Claude's stream-json output
+local_driver_stream_events() {
+    # shellcheck disable=SC2034  # Variables used when implementation complete (bd-8zt6)
+    local session_id="$1" callback="$2"
+
+    # Find event pipe from session artifacts
+    # Session ID is used as tmux session name, need to find worktree
+    # For now, assume event_pipe path is passed or discoverable
+
+    log_warn "local_driver_stream_events: Full implementation pending (bd-8zt6)"
+
+    # This stub shows the pattern; full parsing in bd-8zt6
+    return 0
+}
+
+# Local driver: List all active sessions
+local_driver_list_sessions() {
+    # List tmux sessions with ru- prefix
+    tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^ru-" || true
+}
+
+# Local driver: Check if a session is still alive
+local_driver_session_alive() {
+    local session_id="$1"
+
+    tmux has-session -t "$session_id" 2>/dev/null
+    return $?
+}
+
+#------------------------------------------------------------------------------
+# DRIVER FUNCTION ROUTING
+# Routes driver_* calls to the appropriate implementation based on LOADED_DRIVER
+#------------------------------------------------------------------------------
+
+# Override stub functions when local driver is loaded
+_enable_local_driver() {
+    driver_start_session() {
+        local_driver_start_session "$@"
+    }
+    driver_send_to_session() {
+        local_driver_send_to_session "$@"
+    }
+    driver_get_session_state() {
+        local_driver_get_session_state "$@"
+    }
+    driver_stop_session() {
+        local_driver_stop_session "$@"
+    }
+    driver_interrupt_session() {
+        local_driver_interrupt_session "$@"
+    }
+    driver_stream_events() {
+        local_driver_stream_events "$@"
+    }
+    driver_list_sessions() {
+        local_driver_list_sessions "$@"
+    }
+    driver_session_alive() {
+        local_driver_session_alive "$@"
+    }
+
+    # Update capabilities for local driver
+    driver_capabilities() {
+        cat <<EOF
+{
+  "name": "local",
+  "parallel_sessions": true,
+  "activity_detection": false,
+  "health_monitoring": false,
+  "question_routing": true,
+  "max_concurrent": 4
+}
+EOF
+    }
+}
+
 # Parse review-specific arguments
 parse_review_args() {
     # Reset review-specific variables
@@ -4002,6 +4461,393 @@ parse_review_args() {
                 ;;
         esac
     done
+}
+
+#------------------------------------------------------------------------------
+# STATE PERSISTENCE FUNCTIONS
+# Atomic JSON operations with flock-based locking
+#------------------------------------------------------------------------------
+
+# File descriptor for state lock (separate from review session lock)
+STATE_LOCK_FD=201
+
+# Get path to review state directory
+get_review_state_dir() {
+    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/review"
+}
+
+# Acquire exclusive lock on state files
+# Returns: 0 on success, 1 on failure
+acquire_state_lock() {
+    local state_dir
+    state_dir=$(get_review_state_dir)
+    ensure_dir "$state_dir"
+    local lock_file="$state_dir/state.lock"
+
+    # Open fd for locking
+    eval "exec $STATE_LOCK_FD>\"$lock_file\""
+
+    # Get exclusive lock (blocking)
+    if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
+        log_error "Failed to acquire state lock"
+        return 1
+    fi
+    return 0
+}
+
+# Release state lock
+release_state_lock() {
+    flock -u "$STATE_LOCK_FD" 2>/dev/null || true
+}
+
+# Execute a function while holding the state lock
+# Args: function_name [args...]
+with_state_lock() {
+    acquire_state_lock || return 1
+    "$@"
+    local rc=$?
+    release_state_lock
+    return $rc
+}
+
+# Write JSON content atomically to a file
+# Args: file_path, content
+# Returns: 0 on success, 1 if JSON invalid or write failed
+write_json_atomic() {
+    local file="$1"
+    local content="$2"
+    local tmp_file="${file}.tmp.$$"
+
+    # Ensure parent directory exists
+    ensure_dir "$(dirname "$file")"
+
+    # Write to temp file
+    if ! echo "$content" > "$tmp_file" 2>/dev/null; then
+        log_error "Failed to write temp file: $tmp_file"
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # Validate JSON before committing (if jq is available)
+    if command -v jq &>/dev/null; then
+        if ! jq empty "$tmp_file" 2>/dev/null; then
+            log_error "Invalid JSON, refusing to write: $file"
+            rm -f "$tmp_file" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    # Atomic move
+    if ! mv "$tmp_file" "$file" 2>/dev/null; then
+        log_error "Failed to atomically update: $file"
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
+# Read JSON state file with locking
+# Args: file_path [default_content]
+# Returns: file contents on stdout (or default if file doesn't exist)
+read_state_json() {
+    local file="$1"
+    local default="${2:-{}}"
+
+    acquire_state_lock || { echo "$default"; return 1; }
+
+    if [[ -f "$file" ]]; then
+        cat "$file"
+    else
+        echo "$default"
+    fi
+
+    release_state_lock
+}
+
+# Get the review state file path
+get_review_state_file() {
+    echo "$(get_review_state_dir)/review-state.json"
+}
+
+# Get the questions queue file path
+get_questions_file() {
+    echo "$(get_review_state_dir)/review-questions.json"
+}
+
+# Get the checkpoint file path
+get_checkpoint_file() {
+    echo "$(get_review_state_dir)/review-checkpoint.json"
+}
+
+# Initialize empty review state if it doesn't exist
+init_review_state() {
+    local state_file
+    state_file=$(get_review_state_file)
+
+    if [[ ! -f "$state_file" ]]; then
+        local initial_state='{"version":2,"repos":{},"items":{},"runs":{}}'
+        with_state_lock write_json_atomic "$state_file" "$initial_state"
+    fi
+}
+
+# Update review state with a jq filter
+# Args: jq_filter
+# Returns: 0 on success
+update_review_state() {
+    local updates="$1"
+    local state_file
+    state_file=$(get_review_state_file)
+
+    acquire_state_lock || return 1
+
+    local current
+    if [[ -f "$state_file" ]]; then
+        current=$(cat "$state_file")
+    else
+        current='{"version":2,"repos":{},"items":{},"runs":{}}'
+    fi
+
+    # Apply jq update if jq is available
+    if command -v jq &>/dev/null; then
+        local updated
+        if ! updated=$(echo "$current" | jq "$updates" 2>/dev/null); then
+            log_error "Failed to apply state update: $updates"
+            release_state_lock
+            return 1
+        fi
+        write_json_atomic "$state_file" "$updated"
+    else
+        # Without jq, we can't do complex updates
+        log_warn "jq not available, state update skipped"
+    fi
+
+    release_state_lock
+}
+
+# Record outcome for a reviewed item (issue or PR)
+# Args: repo_id, item_type (issue|pr), number, outcome, notes
+record_item_outcome() {
+    local repo_id="$1"
+    local item_type="$2"
+    local number="$3"
+    local outcome="$4"
+    local notes="${5:-}"
+
+    local item_key="${repo_id}#${item_type}-${number}"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Escape notes for JSON
+    local escaped_notes
+    escaped_notes=$(json_escape "$notes")
+
+    update_review_state "
+        .items[\"$item_key\"] = {
+            \"type\": \"$item_type\",
+            \"number\": $number,
+            \"last_review\": \"$now\",
+            \"outcome\": \"$outcome\",
+            \"notes\": \"$escaped_notes\"
+        }
+    "
+}
+
+# Record outcome for a reviewed repository
+# Args: repo_id, outcome, duration_seconds, issues_reviewed, prs_reviewed
+record_repo_outcome() {
+    local repo_id="$1"
+    local outcome="$2"
+    local duration="${3:-0}"
+    local issues_reviewed="${4:-0}"
+    local prs_reviewed="${5:-0}"
+
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local run_id="${REVIEW_RUN_ID:-unknown}"
+
+    update_review_state "
+        .repos[\"$repo_id\"] = (.repos[\"$repo_id\"] // {}) + {
+            \"last_review\": \"$now\",
+            \"last_review_run_id\": \"$run_id\",
+            \"issues_reviewed\": $issues_reviewed,
+            \"prs_reviewed\": $prs_reviewed,
+            \"outcome\": \"$outcome\",
+            \"duration_seconds\": $duration
+        }
+    "
+}
+
+# Record a completed review run
+# Args: repos_processed, items_processed, questions_asked
+record_review_run() {
+    local repos_processed="${1:-0}"
+    local items_processed="${2:-0}"
+    local questions_asked="${3:-0}"
+
+    local run_id="${REVIEW_RUN_ID:-unknown}"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local mode="${REVIEW_MODE:-plan}"
+    # shellcheck disable=SC2153  # REVIEW_START_TIME is intentionally uppercase
+    local start_time="${REVIEW_START_TIME:-$now}"
+
+    update_review_state "
+        .runs[\"$run_id\"] = {
+            \"started_at\": \"$start_time\",
+            \"completed_at\": \"$now\",
+            \"repos_processed\": $repos_processed,
+            \"items_processed\": $items_processed,
+            \"questions_asked\": $questions_asked,
+            \"mode\": \"$mode\"
+        }
+    "
+}
+
+# Save a checkpoint for resume functionality
+# Args: completed_repos (space-separated), pending_repos (space-separated)
+checkpoint_review_state() {
+    local completed_repos="$1"
+    local pending_repos="$2"
+
+    local checkpoint_file
+    checkpoint_file=$(get_checkpoint_file)
+
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local run_id="${REVIEW_RUN_ID:-unknown}"
+    local mode="${REVIEW_MODE:-plan}"
+
+    # Convert space-separated to JSON arrays
+    local completed_json pending_json
+    if command -v jq &>/dev/null; then
+        completed_json=$(echo "$completed_repos" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s . 2>/dev/null || echo '[]')
+        pending_json=$(echo "$pending_repos" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s . 2>/dev/null || echo '[]')
+    else
+        # Simple fallback without jq
+        completed_json="[]"
+        pending_json="[]"
+    fi
+
+    # Count repos
+    local completed_count pending_count
+    completed_count=$(echo "$completed_repos" | wc -w | tr -d ' ')
+    pending_count=$(echo "$pending_repos" | wc -w | tr -d ' ')
+    local total=$((completed_count + pending_count))
+
+    local checkpoint
+    checkpoint=$(cat <<EOF
+{
+  "version": 1,
+  "timestamp": "$now",
+  "run_id": "$run_id",
+  "mode": "$mode",
+  "repos_total": $total,
+  "repos_completed": $completed_count,
+  "repos_pending": $pending_count,
+  "completed_repos": $completed_json,
+  "pending_repos": $pending_json
+}
+EOF
+)
+
+    with_state_lock write_json_atomic "$checkpoint_file" "$checkpoint"
+}
+
+# Load checkpoint for resume
+# Returns: JSON checkpoint on stdout, or empty if no checkpoint
+load_review_checkpoint() {
+    local checkpoint_file
+    checkpoint_file=$(get_checkpoint_file)
+
+    if [[ -f "$checkpoint_file" ]]; then
+        cat "$checkpoint_file"
+    else
+        echo ""
+    fi
+}
+
+# Clear checkpoint after successful completion
+clear_review_checkpoint() {
+    local checkpoint_file
+    checkpoint_file=$(get_checkpoint_file)
+    rm -f "$checkpoint_file" 2>/dev/null || true
+}
+
+# Check if a repo was recently reviewed (within skip_days)
+# Args: repo_id, skip_days
+# Returns: 0 if recently reviewed, 1 if not
+is_recently_reviewed() {
+    local repo_id="$1"
+    local skip_days="${2:-7}"
+
+    local state_file
+    state_file=$(get_review_state_file)
+
+    if [[ ! -f "$state_file" ]] || ! command -v jq &>/dev/null; then
+        return 1
+    fi
+
+    local last_review
+    last_review=$(jq -r ".repos[\"$repo_id\"].last_review // \"\"" "$state_file" 2>/dev/null)
+
+    if [[ -z "$last_review" || "$last_review" == "null" ]]; then
+        return 1
+    fi
+
+    # Calculate cutoff date
+    local cutoff
+    if date --version 2>/dev/null | grep -q GNU; then
+        cutoff=$(date -u -d "$skip_days days ago" +%Y-%m-%dT%H:%M:%SZ)
+    else
+        cutoff=$(date -u -v-${skip_days}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$cutoff" ]]; then
+        return 1
+    fi
+
+    # Compare timestamps (lexicographic comparison works for ISO format)
+    if [[ "$last_review" > "$cutoff" ]]; then
+        return 0  # Recently reviewed
+    fi
+
+    return 1  # Not recently reviewed
+}
+
+# Clean up old review state data
+# Args: max_age_days (default: 30)
+cleanup_old_review_state() {
+    local max_age_days="${1:-30}"
+    local state_dir
+    state_dir=$(get_review_state_dir)
+
+    # Clean old worktrees if they exist
+    local worktrees_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    if [[ -d "$worktrees_dir" ]]; then
+        find "$worktrees_dir" -maxdepth 1 -type d -mtime "+$max_age_days" \
+            -exec rm -rf {} \; 2>/dev/null || true
+    fi
+
+    # Prune old runs from state file (requires jq)
+    if ! command -v jq &>/dev/null; then
+        return 0
+    fi
+
+    local cutoff
+    if date --version 2>/dev/null | grep -q GNU; then
+        cutoff=$(date -u -d "$max_age_days days ago" +%Y-%m-%dT%H:%M:%SZ)
+    else
+        cutoff=$(date -u -v-${max_age_days}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$cutoff" ]]; then
+        return 0
+    fi
+
+    update_review_state "
+        .runs |= with_entries(select(.value.started_at > \"$cutoff\"))
+    "
 }
 
 # Stub: Discover work items from GitHub (will be implemented in bd-ff8h)
@@ -4109,6 +4955,216 @@ cmd_review() {
     fi
 
     return 0
+}
+
+#------------------------------------------------------------------------------
+# validate_review_plan: Validate review plan JSON schema
+#
+# Args:
+#   $1 - Path to review-plan.json file
+#
+# Returns:
+#   0 if valid, 1 if invalid
+#
+# Outputs:
+#   Validation message to stdout
+#------------------------------------------------------------------------------
+validate_review_plan() {
+    local plan_file="$1"
+
+    # Must exist
+    if [[ ! -f "$plan_file" ]]; then
+        echo "Plan file not found: $plan_file"
+        return 1
+    fi
+
+    # Must be valid JSON
+    if ! jq empty "$plan_file" 2>/dev/null; then
+        echo "Invalid JSON syntax"
+        return 1
+    fi
+
+    # Required top-level fields: schema_version, repo, items
+    if ! jq -e '.schema_version and .repo and .items' "$plan_file" >/dev/null 2>&1; then
+        echo "Missing required fields: schema_version, repo, or items"
+        return 1
+    fi
+
+    # Schema version check
+    local version
+    version=$(jq -r '.schema_version' "$plan_file")
+    if [[ "$version" != "1" ]]; then
+        echo "Unsupported schema version: $version (expected: 1)"
+        return 1
+    fi
+
+    # Items array validation
+    local items_count
+    items_count=$(jq '.items | length' "$plan_file")
+    if [[ "$items_count" -lt 0 ]]; then
+        echo "Invalid items array"
+        return 1
+    fi
+
+    # Items must have required fields: type, number, decision
+    if ! jq -e '.items | if length == 0 then true else all(.type and .number and .decision) end' "$plan_file" >/dev/null 2>&1; then
+        echo "Items missing required fields: type, number, or decision"
+        return 1
+    fi
+
+    # Validate item type values (must be "issue" or "pr")
+    local invalid_types
+    invalid_types=$(jq -r '.items[] | select(.type | IN("issue","pr") | not) | .type' "$plan_file" 2>/dev/null)
+    if [[ -n "$invalid_types" ]]; then
+        echo "Invalid item type values: $invalid_types (expected: issue or pr)"
+        return 1
+    fi
+
+    # Validate decision values (must be fix, skip, needs-info, or closed)
+    local invalid_decisions
+    invalid_decisions=$(jq -r '.items[] | select(.decision | IN("fix","skip","needs-info","closed") | not) | .decision' "$plan_file" 2>/dev/null)
+    if [[ -n "$invalid_decisions" ]]; then
+        echo "Invalid decision values: $invalid_decisions (expected: fix, skip, needs-info, or closed)"
+        return 1
+    fi
+
+    # Validate gh_actions if present
+    if jq -e '.gh_actions' "$plan_file" >/dev/null 2>&1; then
+        # gh_actions must have op and target fields
+        if ! jq -e '.gh_actions | if length == 0 then true else all(.op and .target) end' "$plan_file" >/dev/null 2>&1; then
+            echo "gh_actions missing required fields: op or target"
+            return 1
+        fi
+
+        # Validate op values (must be comment, close, label, or merge)
+        local invalid_ops
+        invalid_ops=$(jq -r '.gh_actions[] | select(.op | IN("comment","close","label","merge") | not) | .op' "$plan_file" 2>/dev/null)
+        if [[ -n "$invalid_ops" ]]; then
+            echo "Invalid gh_action op values: $invalid_ops (expected: comment, close, label, or merge)"
+            return 1
+        fi
+
+        # Validate target format (must be issue#N or pr#N)
+        local invalid_targets
+        invalid_targets=$(jq -r '.gh_actions[] | select(.target | test("^(issue|pr)#[0-9]+$") | not) | .target' "$plan_file" 2>/dev/null)
+        if [[ -n "$invalid_targets" ]]; then
+            echo "Invalid gh_action target format: $invalid_targets (expected: issue#N or pr#N)"
+            return 1
+        fi
+    fi
+
+    # Validate questions if present
+    if jq -e '.questions' "$plan_file" >/dev/null 2>&1; then
+        # Questions must have id, prompt, and answered fields
+        if ! jq -e '.questions | if length == 0 then true else all(.id and .prompt and (.answered != null)) end' "$plan_file" >/dev/null 2>&1; then
+            echo "Questions missing required fields: id, prompt, or answered"
+            return 1
+        fi
+    fi
+
+    echo "Valid"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# summarize_review_plan: Generate human-readable summary of review plan
+#
+# Args:
+#   $1 - Path to review-plan.json file
+#
+# Returns:
+#   0 on success, 1 on failure
+#
+# Outputs:
+#   Summary to stdout
+#------------------------------------------------------------------------------
+summarize_review_plan() {
+    local plan_file="$1"
+
+    # Validate first
+    local validation_result
+    validation_result=$(validate_review_plan "$plan_file")
+    if [[ "$validation_result" != "Valid" ]]; then
+        echo "Cannot summarize invalid plan: $validation_result"
+        return 1
+    fi
+
+    # Generate summary using jq
+    jq -r '
+        "Repository: \(.repo)",
+        "Run ID: \(.run_id // "N/A")",
+        "",
+        "Items reviewed: \(.items | length)",
+        "  - Fixed: \([.items[] | select(.decision == "fix")] | length)",
+        "  - Skipped: \([.items[] | select(.decision == "skip")] | length)",
+        "  - Needs info: \([.items[] | select(.decision == "needs-info")] | length)",
+        "  - Closed: \([.items[] | select(.decision == "closed")] | length)",
+        "",
+        "By type:",
+        "  - Issues: \([.items[] | select(.type == "issue")] | length)",
+        "  - PRs: \([.items[] | select(.type == "pr")] | length)",
+        "",
+        "Git changes:",
+        "  - Commits: \(.git.commits // [] | length)",
+        "  - Tests: \(if .git.tests.ok == true then "PASS" elif .git.tests.ok == false then "FAIL" else "NOT RUN" end)",
+        "",
+        "gh_actions pending: \(.gh_actions // [] | length)",
+        "Questions: \(.questions // [] | length) (\([.questions // [] | .[] | select(.answered == true)] | length) answered)"
+    ' "$plan_file"
+}
+
+#------------------------------------------------------------------------------
+# get_review_plan_json_summary: Generate JSON summary of review plan
+#
+# Args:
+#   $1 - Path to review-plan.json file
+#
+# Returns:
+#   0 on success, 1 on failure
+#
+# Outputs:
+#   JSON summary to stdout
+#------------------------------------------------------------------------------
+get_review_plan_json_summary() {
+    local plan_file="$1"
+
+    # Validate first
+    local validation_result
+    validation_result=$(validate_review_plan "$plan_file")
+    if [[ "$validation_result" != "Valid" ]]; then
+        echo "{\"error\": \"Invalid plan: $(json_escape "$validation_result")\"}"
+        return 1
+    fi
+
+    jq '{
+        repo: .repo,
+        run_id: (.run_id // null),
+        worktree_path: (.worktree_path // null),
+        summary: {
+            total_items: (.items | length),
+            by_decision: {
+                fix: ([.items[] | select(.decision == "fix")] | length),
+                skip: ([.items[] | select(.decision == "skip")] | length),
+                needs_info: ([.items[] | select(.decision == "needs-info")] | length),
+                closed: ([.items[] | select(.decision == "closed")] | length)
+            },
+            by_type: {
+                issues: ([.items[] | select(.type == "issue")] | length),
+                prs: ([.items[] | select(.type == "pr")] | length)
+            }
+        },
+        git: {
+            commits: (.git.commits // [] | length),
+            tests_passed: (.git.tests.ok // null)
+        },
+        gh_actions_count: (.gh_actions // [] | length),
+        questions: {
+            total: (.questions // [] | length),
+            answered: ([.questions // [] | .[] | select(.answered == true)] | length),
+            pending: ([.questions // [] | .[] | select(.answered == false or .answered == null)] | length)
+        },
+        metadata: (.metadata // null)
+    }' "$plan_file"
 }
 
 #==============================================================================
