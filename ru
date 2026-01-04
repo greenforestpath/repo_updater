@@ -512,7 +512,8 @@ get_config_value() {
     local config_file="$RU_CONFIG_DIR/config"
     if [[ -f "$config_file" ]]; then
         local file_value
-        file_value=$(grep "^${key}=" "$config_file" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+        # Read value and strip SURROUNDING quotes only (preserve internal quotes)
+        file_value=$(grep "^${key}=" "$config_file" 2>/dev/null | cut -d'=' -f2- | sed -E 's/^"//; s/"$//; s/^'\''//; s/'\''$//')
         if [[ -n "$file_value" ]]; then
             echo "$file_value"
             return
@@ -1246,7 +1247,12 @@ get_repo_status() {
     # Get ahead/behind counts using plumbing (deterministic, locale-independent)
     local ahead=0 behind=0
     # shellcheck disable=SC1083  # @{u} is valid git syntax for upstream tracking branch
-    read -r ahead behind < <(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null || echo "0 0")
+    if ! output=$(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null); then
+        # If rev-list fails (e.g. unrelated histories), assume diverged
+        echo "STATUS=diverged AHEAD=? BEHIND=? DIRTY=$dirty BRANCH=$branch"
+        return 0
+    fi
+    read -r ahead behind <<< "$output"
 
     # Determine status based on ahead/behind
     local status
@@ -3878,6 +3884,18 @@ check_review_prerequisites() {
         has_errors=true
     fi
 
+    # Check for jq (required for JSON processing)
+    if ! command -v jq &>/dev/null; then
+        log_error "jq is required for review command"
+        log_info "Install jq:"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            log_info "  brew install jq"
+        else
+            log_info "  sudo apt install jq   # Debian/Ubuntu"
+        fi
+        has_errors=true
+    fi
+
     # Check for Claude Code (claude command)
     if ! command -v claude &>/dev/null; then
         log_warn "Claude Code CLI not found. Review sessions will not work."
@@ -6108,7 +6126,10 @@ prepare_review_worktrees() {
         ensure_dir "$wt_path/.ru"
 
         # Record mapping for later phases
-        record_worktree_mapping "$repo_id" "$wt_path" "$wt_branch"
+        if ! record_worktree_mapping "$repo_id" "$wt_path" "$wt_branch"; then
+            log_warn "Worktree created but mapping failed for $repo_id"
+            # Continue anyway - worktree is usable, just not tracked
+        fi
 
         log_verbose "Created worktree: $repo_id → $wt_path"
         ((prepared++))
