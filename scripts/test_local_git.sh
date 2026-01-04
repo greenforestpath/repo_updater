@@ -3,6 +3,8 @@
 # Integration tests for git operations using local repositories
 # Tests run without network access - uses temporary bare repos as "remotes"
 #
+# shellcheck disable=SC2034  # Variables are used by sourced functions from ru
+# shellcheck disable=SC1090  # Dynamic sourcing is intentional
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Test URL parsing functions
+# shellcheck disable=SC1090  # Dynamic sourcing is intentional
 set -uo pipefail
 
 # Extract just the parsing functions from ru
