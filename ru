@@ -26,6 +26,7 @@
 #   doctor        Run system diagnostics
 #   self-update   Update ru to the latest version
 #   config        Show or set configuration values
+#   prune         Find and manage orphan repositories
 #
 # GLOBAL OPTIONS:
 #   -h, --help           Show help message
@@ -324,6 +325,7 @@ COMMANDS:
     doctor          Run system diagnostics
     self-update     Update ru to the latest version
     config          Show or set configuration values
+    prune           Find and manage orphan repositories
 
 GLOBAL OPTIONS:
     -h, --help           Show this help message
@@ -352,6 +354,11 @@ STATUS OPTIONS:
 INIT OPTIONS:
     --example            Include example repositories in initial config
 
+PRUNE OPTIONS:
+    (no options)         List orphan repositories (dry run)
+    --archive            Move orphans to archive directory
+    --delete             Delete orphans (requires confirmation)
+
 EXAMPLES:
     ru sync              Sync all configured repos
     ru sync --dry-run    Preview sync without changes
@@ -359,6 +366,8 @@ EXAMPLES:
     ru add owner/repo    Add a repository
     ru remove owner/repo Remove a repository
     ru doctor            Check system configuration
+    ru prune             Find orphan repos not in config
+    ru prune --archive   Archive orphan repos
 
 CONFIGURATION:
     Config:  ~/.config/ru/config
@@ -1667,11 +1676,11 @@ parse_args() {
                 INIT_EXAMPLE="true"
                 shift
                 ;;
-            sync|status|init|add|remove|list|doctor|self-update|config)
+            sync|status|init|add|remove|list|doctor|self-update|config|prune)
                 COMMAND="$1"
                 shift
                 ;;
-            --paths|--print|--set=*|--check)
+            --paths|--print|--set=*|--check|--archive|--delete)
                 # Subcommand-specific options - pass through to ARGS
                 ARGS+=("$1")
                 shift
@@ -3087,6 +3096,170 @@ cmd_config() {
     fi
 }
 
+#------------------------------------------------------------------------------
+# cmd_prune: Find and manage orphan repositories
+#------------------------------------------------------------------------------
+cmd_prune() {
+    local archive_mode="false"
+    local delete_mode="false"
+
+    # Parse arguments
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --archive) archive_mode="true" ;;
+            --delete) delete_mode="true" ;;
+            -*)
+                log_error "Unknown prune option: $arg"
+                exit 4
+                ;;
+        esac
+    done
+
+    # Check for conflicting options
+    if [[ "$archive_mode" == "true" && "$delete_mode" == "true" ]]; then
+        log_error "Cannot use both --archive and --delete"
+        exit 4
+    fi
+
+    # Check projects directory exists
+    if [[ ! -d "$PROJECTS_DIR" ]]; then
+        log_warning "Projects directory does not exist: $PROJECTS_DIR"
+        return 0
+    fi
+
+    # Build list of expected paths from config
+    local configured_paths
+    configured_paths=$(mktemp)
+    trap "rm -f '$configured_paths'" RETURN
+
+    while IFS= read -r spec; do
+        [[ -z "$spec" ]] && continue
+        local url branch custom_name local_path
+        parse_repo_spec "$spec" url branch custom_name
+        if [[ -n "$custom_name" ]]; then
+            local_path="${PROJECTS_DIR}/${custom_name}"
+        else
+            local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        fi
+        echo "$local_path"
+    done < <(get_all_repos) | sort -u > "$configured_paths"
+
+    # Find all git repositories in projects directory
+    local orphans=()
+    local depth_limit
+    case "$LAYOUT" in
+        flat)       depth_limit=1 ;;
+        owner-repo) depth_limit=2 ;;
+        full)       depth_limit=3 ;;
+        *)          depth_limit=3 ;;
+    esac
+
+    while IFS= read -r repo_path; do
+        # Skip if in configured paths
+        if grep -qxF "$repo_path" "$configured_paths" 2>/dev/null; then
+            continue
+        fi
+        orphans+=("$repo_path")
+    done < <(find "$PROJECTS_DIR" -mindepth 1 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null | sort)
+
+    # Report results
+    if [[ ${#orphans[@]} -eq 0 ]]; then
+        log_success "No orphan repositories found"
+        return 0
+    fi
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        # JSON output
+        local json_array="["
+        local first="true"
+        for path in "${orphans[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first="false"
+            else
+                json_array+=","
+            fi
+            json_array+="{\"path\":\"$path\"}"
+        done
+        json_array+="]"
+        echo "$json_array"
+    else
+        log_info "Found ${#orphans[@]} orphan repository(s):"
+        for path in "${orphans[@]}"; do
+            echo "  $path" >&2
+        done
+    fi
+
+    # Handle archive mode
+    if [[ "$archive_mode" == "true" ]]; then
+        local archive_dir="${RU_STATE_DIR}/archived"
+        mkdir -p "$archive_dir"
+
+        log_info "Archiving ${#orphans[@]} orphan(s) to $archive_dir"
+        local archived=0
+        for path in "${orphans[@]}"; do
+            local name
+            name=$(basename "$path")
+            local timestamp
+            timestamp=$(date +%Y%m%d_%H%M%S)
+            local dest="${archive_dir}/${name}_${timestamp}"
+
+            if mv "$path" "$dest" 2>/dev/null; then
+                log_step "Archived: $name -> $dest"
+                ((archived++))
+            else
+                log_error "Failed to archive: $path"
+            fi
+        done
+        log_success "Archived $archived orphan(s)"
+        return 0
+    fi
+
+    # Handle delete mode
+    if [[ "$delete_mode" == "true" ]]; then
+        if [[ "$NON_INTERACTIVE" != "true" ]]; then
+            log_warning "This will permanently delete ${#orphans[@]} repository(s)!"
+            echo "" >&2
+            for path in "${orphans[@]}"; do
+                echo "  $path" >&2
+            done
+            echo "" >&2
+
+            local confirm=""
+            if is_gum_available; then
+                if ! gum confirm "Delete these repositories?"; then
+                    log_info "Aborted"
+                    return 0
+                fi
+            else
+                echo -n "Type 'delete' to confirm: " >&2
+                read -r confirm
+                if [[ "$confirm" != "delete" ]]; then
+                    log_info "Aborted"
+                    return 0
+                fi
+            fi
+        fi
+
+        local deleted=0
+        for path in "${orphans[@]}"; do
+            local name
+            name=$(basename "$path")
+            if rm -rf "$path" 2>/dev/null; then
+                log_step "Deleted: $name"
+                ((deleted++))
+            else
+                log_error "Failed to delete: $path"
+            fi
+        done
+        log_success "Deleted $deleted orphan(s)"
+        return 0
+    fi
+
+    # Default: just list (dry run)
+    echo "" >&2
+    log_info "Use --archive to move to archive or --delete to remove"
+}
+
 #==============================================================================
 # SECTION 14: MAIN DISPATCH
 #==============================================================================
@@ -3112,6 +3285,7 @@ main() {
         doctor)     cmd_doctor ;;
         self-update) cmd_self_update ;;
         config)     cmd_config ;;
+        prune)      cmd_prune ;;
         *)
             log_error "Unknown command: $COMMAND"
             show_help
