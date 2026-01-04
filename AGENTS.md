@@ -141,8 +141,9 @@ repo_updater/
 | `0` | Success | All repos synced or already current |
 | `1` | Partial failure | Some repos failed (network/auth) |
 | `2` | Conflicts exist | Some repos have conflicts needing resolution |
-| `3` | Dependency error | gh missing, auth failed, etc. |
+| `3` | Dependency/system error | gh missing, auth failed, doctor issues |
 | `4` | Invalid arguments | Bad CLI options, missing files |
+| `5` | Interrupted sync | Use `--resume` or `--restart` to continue |
 
 ---
 
