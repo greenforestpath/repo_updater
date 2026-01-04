@@ -1835,7 +1835,6 @@ print_summary() {
         duration_str="${duration}s"
     fi
 
-    local log_path="$RU_LOG_DIR/latest"
 
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         # Use gum for beautiful box
@@ -1849,7 +1848,6 @@ print_summary() {
         [[ $failed -gt 0 ]] && summary_text+="  ❌ Failed:     $failed repos\n"
         summary_text+="─────────────────────────────────────────\n"
         summary_text+="  Total: $total repos processed in $duration_str\n"
-        summary_text+="  Logs:  $log_path"
 
         echo -e "$summary_text" | gum style --border rounded --padding "0 1" --border-foreground 212 >&2
     else
@@ -1865,7 +1863,6 @@ print_summary() {
         [[ $failed -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${RED}❌${RESET} Failed:     $failed repos                                   ${BOLD}│${RESET}" >&2
         echo -e "${BOLD}├─────────────────────────────────────────────────────────────┤${RESET}" >&2
         echo -e "${BOLD}│${RESET}  Total: $total repos processed in $duration_str                      ${BOLD}│${RESET}" >&2
-        echo -e "${BOLD}│${RESET}  Logs:  $log_path                           ${BOLD}│${RESET}" >&2
         echo -e "${BOLD}╰─────────────────────────────────────────────────────────────╯${RESET}" >&2
     fi
 }
@@ -2330,7 +2327,7 @@ cmd_sync() {
                 continue
             fi
 
-            if do_clone "$url" "$local_path" "$repo_name"; then
+            if do_clone "$url" "$local_path" "$repo_name" "$branch"; then
                 ((cloned++))
             else
                 ((failed++))
@@ -2382,7 +2379,7 @@ cmd_sync() {
                 continue
             fi
 
-            if do_pull "$local_path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH"; then
+            if do_pull "$local_path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
                 ((updated++))
             else
                 ((failed++))

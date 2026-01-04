@@ -476,7 +476,7 @@ test_status_json_output() {
     assert_exit_code 0 "$exit_code" "status --json exits with code 0"
     
     # Check if valid JSON
-    if echo "$json_output" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
+    if printf '%s\n' "$json_output" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
         pass "JSON output is valid"
     else
         fail "JSON output is invalid"
