@@ -1880,39 +1880,43 @@ generate_review_prompt() {
   local run_id="$3"
   local work_items_json="$4"
 
-  cat <<EOF
-POLICY: We don't allow PRs or outside contributions. Feel free to submit issues and PRs to illustrate fixes, but they will not be merged directly. The agent reviews and independently decides whether and how to address submissions. Bug reports are welcome.
+  # NOTE: Avoid unquoted heredocs here so any backticks/$() inside $work_items_json
+  # cannot trigger command substitution during prompt generation.
+  printf '%s\n' \
+    "POLICY: We don't allow PRs or outside contributions. Feel free to submit issues and PRs to illustrate fixes, but they will not be merged directly. The agent reviews and independently decides whether and how to address submissions. Bug reports are welcome." \
+    "" \
+    'TASK: Review the following work items using `gh` READ operations only:'
 
-TASK: Review the following work items using \`gh\` READ operations only:
-$work_items_json
+  printf '%s\n' "$work_items_json"
 
-For each item:
-1) Read the issue/PR independently via \`gh issue view\` or \`gh pr view\`.
-2) Verify claims independently; do not trust reports blindly.
-3) Check dates against recent commits (issues/PRs may be stale).
-4) If actionable: create local commits with focused fixes.
-5) If unclear: ask the maintainer using the \`AskUserQuestion\` tool (see Section 8.2).
-
-CRITICAL RESTRICTIONS (PLAN MODE):
-- DO NOT run any \`gh\` mutation commands (comment/close/label/merge/etc).
-- DO NOT push any changes.
-- Prefer minimal, reviewable commits; avoid broad refactors unless justified.
-
-REQUIRED OUTPUT (contract):
-- You MUST write \`.ru/review-plan.json\` as strictly valid JSON.
-- It MUST conform to Section 8.5 (schema v1).
-- Set:
-  - schema_version: 1
-  - run_id: "$run_id"
-  - repo: "$repo_name"
-  - worktree_path: "$worktree_path"
-  - metadata.model: your model id
-  - metadata.driver: "ntm" or "local"
-
-If you ask any maintainer questions:
-- Use \`AskUserQuestion\` with 2–4 options (label+description), multiSelect=false.
-- Mirror those into \`review-plan.json\` under \`questions[]\` with answered=false until answered.
-EOF
+  printf '%s\n' \
+    "" \
+    "For each item:" \
+    '1) Read the issue/PR independently via `gh issue view` or `gh pr view`.' \
+    "2) Verify claims independently; do not trust reports blindly." \
+    "3) Check dates against recent commits (issues/PRs may be stale)." \
+    "4) If actionable: create local commits with focused fixes." \
+    '5) If unclear: ask the maintainer using the `AskUserQuestion` tool (see Section 8.2).' \
+    "" \
+    "CRITICAL RESTRICTIONS (PLAN MODE):" \
+    '- DO NOT run any `gh` mutation commands (comment/close/label/merge/etc).' \
+    "- DO NOT push any changes." \
+    "- Prefer minimal, reviewable commits; avoid broad refactors unless justified." \
+    "" \
+    "REQUIRED OUTPUT (contract):" \
+    '- You MUST write `.ru/review-plan.json` as strictly valid JSON.' \
+    "- It MUST conform to Section 8.5 (schema v1)." \
+    "- Set:" \
+    "  - schema_version: 1" \
+    "  - run_id: \"$run_id\"" \
+    "  - repo: \"$repo_name\"" \
+    "  - worktree_path: \"$worktree_path\"" \
+    "  - metadata.model: your model id" \
+    "  - metadata.driver: \"ntm\" or \"local\"" \
+    "" \
+    "If you ask any maintainer questions:" \
+    '- Use `AskUserQuestion` with 2–4 options (label+description), multiSelect=false.' \
+    '- Mirror those into `.ru/review-plan.json` under `questions[]` with answered=false until answered.'
 }
 ```
 
