@@ -49,7 +49,9 @@ jobs:
       - name: Test installer
         run: |
           chmod +x install.sh
-          DEST=/tmp/ru-test ./install.sh
+          # Use RU_UNSAFE_MAIN=1 to test main-branch install path
+          # (avoids dependency on GitHub releases existing)
+          RU_UNSAFE_MAIN=1 DEST=/tmp/ru-test ./install.sh
           /tmp/ru-test/ru --version
 
   version-check:

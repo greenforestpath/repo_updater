@@ -48,4 +48,4 @@ jobs:
 
             ## Checksums
 
-            Verify downloads with the `.sha256` files attached to this release.
+            Verify downloads with `checksums.txt` attached to this release.
