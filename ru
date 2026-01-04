@@ -391,6 +391,7 @@ COMMANDS:
     config          Show or set configuration values
     prune           Find and manage orphan repositories
     import <file>   Import repos from file with auto visibility detection
+    review          Review GitHub issues and PRs using Claude Code
 
 GLOBAL OPTIONS:
     -h, --help           Show this help message
@@ -438,6 +439,21 @@ IMPORT OPTIONS:
     --private            Force all repos to be added as private
     --dry-run            Preview import without modifying config
 
+REVIEW OPTIONS:
+    --plan               Generate review plans only, no mutations (default)
+    --apply              Execute approved plans from previous --plan run
+    --mode=MODE          Driver: auto, ntm, or local (default: auto)
+    --parallel=N, -jN    Concurrent review sessions (default: 4)
+    --repos=PATTERN      Filter repos by pattern
+    --priority=LEVEL     Min priority: all, critical, high, normal, low
+    --skip-days=N        Skip repos reviewed within N days (default: 7)
+    --dry-run            Discovery only, don't start sessions
+    --resume             Resume interrupted review from checkpoint
+    --push               Allow pushing changes (with --apply)
+    --max-repos=N        Limit number of repos to review
+    --max-runtime=MIN    Time budget in minutes
+    --max-questions=N    Question budget before pausing
+
 EXAMPLES:
     ru sync              Sync all configured repos
     ru sync --dry-run    Preview sync without changes
@@ -448,6 +464,9 @@ EXAMPLES:
     ru prune             Find orphan repos not in config
     ru prune --archive   Archive orphan repos
     ru import repos.txt  Import repos from file (auto-detects visibility)
+    ru review --dry-run  Discover issues/PRs without starting reviews
+    ru review            Start AI-assisted review of issues/PRs
+    ru review --apply    Execute approved changes from plan
 
 CONFIGURATION:
     Config:  ~/.config/ru/config
@@ -1940,11 +1959,11 @@ parse_args() {
                 INIT_EXAMPLE="true"
                 shift
                 ;;
-            sync|status|init|add|remove|list|doctor|self-update|config|prune|import)
+            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review)
                 COMMAND="$1"
                 shift
                 ;;
-            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd)
+            --paths|--print|--set=*|--check|--archive|--delete|--private|--public|--from-cwd|--plan|--apply|--mode=*|--repos=*|--skip-days=*|--priority=*|--push|--max-repos=*|--max-runtime=*|--max-questions=*|--parallel=*|-j[0-9]*)
                 # Subcommand-specific options - pass through to ARGS
                 ARGS+=("$1")
                 shift
@@ -3792,6 +3811,306 @@ cmd_prune() {
     log_info "Use --archive to move to archive or --delete to remove"
 }
 
+#------------------------------------------------------------------------------
+# SECTION 13.5: REVIEW COMMAND SUPPORT FUNCTIONS
+#------------------------------------------------------------------------------
+
+# Check if review prerequisites are met
+check_review_prerequisites() {
+    local has_errors=false
+
+    # Check for gh CLI
+    if ! check_gh_installed; then
+        log_error "GitHub CLI (gh) is required for review command"
+        has_errors=true
+    elif ! check_gh_auth; then
+        log_error "gh CLI not authenticated. Run: gh auth login"
+        has_errors=true
+    fi
+
+    # Check for Claude Code (claude command)
+    if ! command -v claude &>/dev/null; then
+        log_warn "Claude Code CLI not found. Review sessions will not work."
+        log_warn "Install: npm install -g @anthropic-ai/claude-cli"
+        # Not a hard error - might be doing discovery only
+    fi
+
+    [[ "$has_errors" == "true" ]] && return 1
+    return 0
+}
+
+# Get path to review lock file
+get_review_lock_file() {
+    echo "${RU_STATE_DIR}/review.lock"
+}
+
+# Acquire review lock (prevents concurrent reviews)
+acquire_review_lock() {
+    local lock_file
+    lock_file=$(get_review_lock_file)
+    ensure_dir "$(dirname "$lock_file")"
+
+    # Try to get exclusive lock
+    exec 9>"$lock_file"
+    if ! flock -n 9 2>/dev/null; then
+        # Check if the lock holder is still running
+        local pid=""
+        if [[ -f "$lock_file" ]]; then
+            pid=$(cat "$lock_file" 2>/dev/null || true)
+        fi
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log_error "Another review is running (PID $pid)"
+        else
+            log_error "Stale lock file exists. Remove manually: $lock_file"
+        fi
+        return 1
+    fi
+
+    # Write our PID to the lock file
+    echo $$ > "$lock_file"
+    return 0
+}
+
+# Release review lock
+release_review_lock() {
+    local lock_file
+    lock_file=$(get_review_lock_file)
+    # Remove PID from file
+    : > "$lock_file"
+    # Release the flock (closing fd 9)
+    exec 9>&-
+}
+
+# Detect which review driver to use
+detect_review_driver() {
+    # Check if ntm is available and running
+    if command -v ntm &>/dev/null; then
+        # Try to query ntm status
+        if ntm list --robot 2>/dev/null | grep -q "session"; then
+            echo "ntm"
+            return
+        fi
+    fi
+
+    # Fallback to local driver (tmux + stream-json)
+    if command -v tmux &>/dev/null; then
+        echo "local"
+        return
+    fi
+
+    # No driver available
+    echo "none"
+}
+
+# Parse review-specific arguments
+parse_review_args() {
+    # Reset review-specific variables
+    REVIEW_MODE="plan"           # plan or apply
+    REVIEW_DRIVER="auto"         # auto, ntm, or local
+    REVIEW_PARALLEL=4            # concurrent sessions
+    REVIEW_DRY_RUN="false"       # discovery only
+    # shellcheck disable=SC2034  # Used by later phases
+    REVIEW_RESUME="${RESUME:-false}"  # use global --resume flag
+    REVIEW_PUSH="false"          # allow pushing (with apply)
+    REVIEW_PRIORITY="all"        # min priority threshold
+    REVIEW_REPOS_PATTERN=""      # filter repos by pattern
+    REVIEW_SKIP_DAYS=7           # skip recently reviewed
+    REVIEW_MAX_REPOS=""          # cost budget
+    REVIEW_MAX_RUNTIME=""        # time budget (minutes)
+    REVIEW_MAX_QUESTIONS=""      # question budget
+
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --plan)
+                REVIEW_MODE="plan"
+                ;;
+            --apply)
+                REVIEW_MODE="apply"
+                ;;
+            --mode=*)
+                REVIEW_DRIVER="${arg#--mode=}"
+                if [[ ! "$REVIEW_DRIVER" =~ ^(auto|ntm|local)$ ]]; then
+                    log_error "Invalid --mode: $REVIEW_DRIVER (use auto, ntm, or local)"
+                    exit 4
+                fi
+                ;;
+            --parallel=*|-j=*)
+                REVIEW_PARALLEL="${arg#*=}"
+                if ! is_positive_int "$REVIEW_PARALLEL"; then
+                    log_error "Invalid --parallel value: $REVIEW_PARALLEL"
+                    exit 4
+                fi
+                ;;
+            -j[0-9]*)
+                REVIEW_PARALLEL="${arg#-j}"
+                ;;
+            --repos=*)
+                REVIEW_REPOS_PATTERN="${arg#--repos=}"
+                ;;
+            --skip-days=*)
+                REVIEW_SKIP_DAYS="${arg#--skip-days=}"
+                if ! is_positive_int "$REVIEW_SKIP_DAYS"; then
+                    log_error "Invalid --skip-days value: $REVIEW_SKIP_DAYS"
+                    exit 4
+                fi
+                ;;
+            --priority=*)
+                REVIEW_PRIORITY="${arg#--priority=}"
+                if [[ ! "$REVIEW_PRIORITY" =~ ^(all|critical|high|normal|low)$ ]]; then
+                    log_error "Invalid --priority: $REVIEW_PRIORITY"
+                    exit 4
+                fi
+                ;;
+            --dry-run)
+                REVIEW_DRY_RUN="true"
+                ;;
+            --push)
+                REVIEW_PUSH="true"
+                ;;
+            --max-repos=*)
+                REVIEW_MAX_REPOS="${arg#--max-repos=}"
+                if ! is_positive_int "$REVIEW_MAX_REPOS"; then
+                    log_error "Invalid --max-repos value: $REVIEW_MAX_REPOS"
+                    exit 4
+                fi
+                ;;
+            --max-runtime=*)
+                REVIEW_MAX_RUNTIME="${arg#--max-runtime=}"
+                if ! is_positive_int "$REVIEW_MAX_RUNTIME"; then
+                    log_error "Invalid --max-runtime value: $REVIEW_MAX_RUNTIME"
+                    exit 4
+                fi
+                ;;
+            --max-questions=*)
+                REVIEW_MAX_QUESTIONS="${arg#--max-questions=}"
+                if ! is_positive_int "$REVIEW_MAX_QUESTIONS"; then
+                    log_error "Invalid --max-questions value: $REVIEW_MAX_QUESTIONS"
+                    exit 4
+                fi
+                ;;
+            -*)
+                log_error "Unknown review option: $arg"
+                exit 4
+                ;;
+            *)
+                # Positional arguments could be repo patterns
+                if [[ -z "$REVIEW_REPOS_PATTERN" ]]; then
+                    REVIEW_REPOS_PATTERN="$arg"
+                else
+                    REVIEW_REPOS_PATTERN="$REVIEW_REPOS_PATTERN $arg"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Stub: Discover work items from GitHub (will be implemented in bd-ff8h)
+discover_work_items() {
+    local -n _items_ref=$1
+    local priority_filter="$2"
+    local max_repos="$3"
+
+    # Stub implementation - returns empty array
+    # Real implementation will use GraphQL to batch-query repos
+    _items_ref=()
+
+    log_verbose "discover_work_items: stub - returning empty list"
+    log_verbose "  priority_filter=$priority_filter, max_repos=$max_repos"
+}
+
+# Stub: Show discovery summary (will be enhanced in later phases)
+show_discovery_summary() {
+    local items=("$@")
+
+    if [[ ${#items[@]} -eq 0 ]]; then
+        log_info "No work items to review"
+        return
+    fi
+
+    log_info "Found ${#items[@]} work item(s) to review"
+    # Real implementation will show priority breakdown, repo counts, etc.
+}
+
+#------------------------------------------------------------------------------
+# cmd_review: Review GitHub issues and PRs using Claude Code
+#------------------------------------------------------------------------------
+cmd_review() {
+    # Parse review-specific arguments
+    parse_review_args
+
+    # Check prerequisites
+    if ! check_review_prerequisites; then
+        exit 3
+    fi
+
+    # Generate unique run ID
+    local run_id
+    run_id="$(date +%Y%m%d-%H%M%S)-$$"
+    # shellcheck disable=SC2034  # Used by later phases and logging
+    REVIEW_RUN_ID="$run_id"
+
+    # Acquire global lock
+    if ! acquire_review_lock; then
+        log_error "Another review is running. Use --resume to continue or wait."
+        exit 1
+    fi
+
+    # Ensure cleanup on exit
+    # shellcheck disable=SC2064
+    trap "release_review_lock" EXIT
+
+    # Auto-detect driver if needed
+    if [[ "$REVIEW_DRIVER" == "auto" ]]; then
+        REVIEW_DRIVER=$(detect_review_driver)
+        log_verbose "Auto-detected driver: $REVIEW_DRIVER"
+    fi
+
+    if [[ "$REVIEW_DRIVER" == "none" ]]; then
+        log_error "No review driver available. Install tmux or ntm."
+        exit 3
+    fi
+
+    # Discovery phase
+    log_step "Scanning repositories for open issues and PRs..."
+    local -a work_items
+    discover_work_items work_items "$REVIEW_PRIORITY" "$REVIEW_MAX_REPOS"
+
+    if [[ ${#work_items[@]} -eq 0 ]]; then
+        log_success "No work items need review"
+        return 0
+    fi
+
+    # Show summary
+    show_discovery_summary "${work_items[@]}"
+
+    # Dry run exit point
+    if [[ "$REVIEW_DRY_RUN" == "true" ]]; then
+        log_info "Dry run complete - no sessions started"
+        return 0
+    fi
+
+    # TODO: Orchestration phases (implemented in later beads)
+    # - Prepare worktrees
+    # - Start Claude Code sessions
+    # - Monitor and aggregate questions
+    # - Apply approved changes
+
+    log_warn "Review orchestration not yet implemented"
+    log_info "Run ID: $run_id"
+    log_info "Driver: $REVIEW_DRIVER"
+    log_info "Mode: $REVIEW_MODE"
+    log_info "Parallel: $REVIEW_PARALLEL"
+
+    if [[ "$REVIEW_MODE" == "apply" ]]; then
+        log_info "Apply mode: would execute approved plans"
+        if [[ "$REVIEW_PUSH" == "true" ]]; then
+            log_info "Push enabled: would push approved changes"
+        fi
+    fi
+
+    return 0
+}
+
 #==============================================================================
 # SECTION 14: MAIN DISPATCH
 #==============================================================================
@@ -3820,6 +4139,7 @@ main() {
         config)     cmd_config ;;
         prune)      cmd_prune ;;
         import)     cmd_import ;;
+        review)     cmd_review ;;
         *)
             log_error "Unknown command: $COMMAND"
             show_help
