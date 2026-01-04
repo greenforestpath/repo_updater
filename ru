@@ -3097,6 +3097,11 @@ cmd_import() {
         esac
     done
 
+    if [[ "$force_public" == "true" && "$force_private" == "true" ]]; then
+        log_error "--public and --private are mutually exclusive"
+        exit 4
+    fi
+
     if [[ ${#file_args[@]} -eq 0 ]]; then
         log_error "Usage: ru import [--dry-run] [--public|--private] <file> [file2] ..."
         log_info ""
@@ -7894,6 +7899,92 @@ show_discovery_summary() {
 }
 
 #------------------------------------------------------------------------------
+# REVIEW EXIT CODES + ERROR CLASSIFICATION (bd-jen3)
+#
+# Review uses ru's standard exit codes:
+#   0 success
+#   1 partial failure
+#   2 conflicts / manual intervention required
+#   3 dependency/system error
+#   4 invalid arguments
+#   5 interrupted (resume supported by checkpoint bead)
+#------------------------------------------------------------------------------
+
+classify_review_error() {
+    local error_type="${1:-}"
+    local context="${2:-}"
+
+    case "$error_type" in
+        session_failed|rate_limited|network_error)
+            echo "partial"
+            ;;
+        merge_conflict|quality_gate_failed|tests_failed)
+            echo "conflict"
+            ;;
+        missing_dependency|auth_failed|no_driver)
+            echo "system"
+            ;;
+        invalid_flag|bad_mode|conflicting_options)
+            echo "invalid"
+            ;;
+        interrupted|timeout|max_runtime|max_questions)
+            echo "interrupted"
+            ;;
+        *)
+            # Default to "partial" because review can often continue on other repos.
+            echo "unknown"
+            ;;
+    esac
+}
+
+review_exit_code_for_classification() {
+    local classification="${1:-unknown}"
+    case "$classification" in
+        partial) echo 1 ;;
+        conflict) echo 2 ;;
+        system) echo 3 ;;
+        invalid) echo 4 ;;
+        interrupted) echo 5 ;;
+        *) echo 1 ;;
+    esac
+}
+
+review_exit_code_for_error() {
+    local error_type="${1:-}"
+    local context="${2:-}"
+
+    local classification
+    classification=$(classify_review_error "$error_type" "$context")
+    review_exit_code_for_classification "$classification"
+}
+
+aggregate_exit_code() {
+    local max_code=0
+    local code
+    for code in "$@"; do
+        [[ "$code" =~ ^[0-9]+$ ]] || continue
+        (( code > max_code )) && max_code="$code"
+    done
+    echo "$max_code"
+}
+
+finalize_review_exit() {
+    local exit_code="$1"
+
+    case "$exit_code" in
+        0) log_success "Review completed successfully" ;;
+        1) log_warn "Review completed with partial failures" ;;
+        2) log_error "Review blocked by conflicts - manual resolution needed" ;;
+        3) log_error "Review failed due to system/dependency error" ;;
+        4) log_error "Invalid arguments" ;;
+        5) log_warn "Review interrupted - use --resume to continue" ;;
+        *) log_error "Review failed (unknown exit code: $exit_code)" ;;
+    esac
+
+    exit "$exit_code"
+}
+
+#------------------------------------------------------------------------------
 # cmd_review: Review GitHub issues and PRs using Claude Code
 #------------------------------------------------------------------------------
 cmd_review() {
@@ -7927,7 +8018,7 @@ cmd_review() {
     trap cleanup_review EXIT
 
     # Handle interrupts gracefully
-    trap 'echo "" >&2; log_warn "Review interrupted!"; exit 130' INT TERM
+    trap 'echo "" >&2; log_warn "Review interrupted - use --resume to continue"; exit 5' INT TERM
 
     # Auto-detect driver if needed
     if [[ "$REVIEW_DRIVER" == "auto" ]]; then
@@ -8593,6 +8684,461 @@ apply_policy_priority_boost() {
     ((new_priority > 4)) && new_priority=4
 
     echo "$new_priority"
+}
+
+#==============================================================================
+# SECTION 13.7: QUALITY GATES FRAMEWORK
+#==============================================================================
+
+#------------------------------------------------------------------------------
+# detect_test_command: Auto-detect the test command for a project
+#
+# Args:
+#   $1 - Project directory path
+#
+# Returns:
+#   0 if command detected, 1 if no test framework found
+#
+# Outputs:
+#   Test command to stdout
+#------------------------------------------------------------------------------
+detect_test_command() {
+    local project_dir="$1"
+
+    # Check Makefile for test target
+    if [[ -f "$project_dir/Makefile" ]] && grep -q "^test:" "$project_dir/Makefile" 2>/dev/null; then
+        echo "make test"
+        return 0
+    fi
+
+    # Check for package.json (npm/node)
+    if [[ -f "$project_dir/package.json" ]]; then
+        if jq -e '.scripts.test' "$project_dir/package.json" >/dev/null 2>&1; then
+            echo "npm test"
+            return 0
+        fi
+    fi
+
+    # Check for Cargo.toml (Rust)
+    if [[ -f "$project_dir/Cargo.toml" ]]; then
+        echo "cargo test"
+        return 0
+    fi
+
+    # Check for Python projects
+    if [[ -f "$project_dir/pyproject.toml" ]] || [[ -f "$project_dir/setup.py" ]]; then
+        if [[ -d "$project_dir/tests" ]] || [[ -d "$project_dir/test" ]]; then
+            echo "pytest"
+            return 0
+        fi
+    fi
+
+    # Check for Go projects
+    if [[ -f "$project_dir/go.mod" ]]; then
+        echo "go test ./..."
+        return 0
+    fi
+
+    # Check for shell test scripts
+    if [[ -x "$project_dir/scripts/run_all_tests.sh" ]]; then
+        echo "./scripts/run_all_tests.sh"
+        return 0
+    fi
+
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# detect_lint_command: Auto-detect the lint command for a project
+#
+# Args:
+#   $1 - Project directory path
+#
+# Returns:
+#   0 if command detected, 1 if no linter found
+#
+# Outputs:
+#   Lint command to stdout
+#------------------------------------------------------------------------------
+detect_lint_command() {
+    local project_dir="$1"
+
+    # Check for package.json lint script
+    if [[ -f "$project_dir/package.json" ]]; then
+        if jq -e '.scripts.lint' "$project_dir/package.json" >/dev/null 2>&1; then
+            echo "npm run lint"
+            return 0
+        fi
+    fi
+
+    # Check for shell scripts (use shellcheck)
+    if command -v shellcheck &>/dev/null; then
+        local shell_scripts
+        shell_scripts=$(find "$project_dir" -maxdepth 2 -name "*.sh" -type f 2>/dev/null | head -1)
+        if [[ -n "$shell_scripts" ]]; then
+            echo "shellcheck -S warning \$(find . -name '*.sh' -type f)"
+            return 0
+        fi
+    fi
+
+    # Check for Python (ruff or flake8)
+    if [[ -f "$project_dir/pyproject.toml" ]] || [[ -f "$project_dir/setup.py" ]]; then
+        if command -v ruff &>/dev/null; then
+            echo "ruff check ."
+            return 0
+        elif command -v flake8 &>/dev/null; then
+            echo "flake8 ."
+            return 0
+        fi
+    fi
+
+    # Check for Go
+    if [[ -f "$project_dir/go.mod" ]]; then
+        echo "go vet ./..."
+        return 0
+    fi
+
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# run_test_gate: Run tests for a project
+#
+# Args:
+#   $1 - Project directory path
+#   $2 - Optional: Test command override
+#   $3 - Optional: Timeout in seconds (default: 300)
+#
+# Returns:
+#   0 on success, 1 on failure, 2 if no tests found
+#
+# Outputs:
+#   JSON result object to stdout
+#------------------------------------------------------------------------------
+run_test_gate() {
+    local project_dir="$1"
+    local test_cmd="${2:-}"
+    local timeout="${3:-300}"
+    local start_time
+    local exit_code=0
+    local output=""
+
+    start_time=$(date +%s)
+
+    # Auto-detect if not provided
+    if [[ -z "$test_cmd" ]]; then
+        test_cmd=$(detect_test_command "$project_dir") || {
+            jq -n '{ran: false, ok: null, reason: "no_tests_found"}'
+            return 2
+        }
+    fi
+
+    log_verbose "Running tests: $test_cmd"
+
+    # Run tests with timeout
+    if output=$(cd "$project_dir" && timeout "$timeout" bash -c "$test_cmd" 2>&1); then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    local end_time duration
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    # Summarize output (last 10 lines or key metrics)
+    local output_summary
+    output_summary=$(echo "$output" | tail -10 | tr '\n' ' ' | cut -c1-200)
+
+    jq -n \
+        --argjson ran true \
+        --argjson ok "$([ $exit_code -eq 0 ] && echo true || echo false)" \
+        --arg command "$test_cmd" \
+        --arg output_summary "$output_summary" \
+        --argjson duration_seconds "$duration" \
+        --argjson exit_code "$exit_code" \
+        '{
+            ran: $ran,
+            ok: $ok,
+            command: $command,
+            output_summary: $output_summary,
+            duration_seconds: $duration_seconds,
+            exit_code: $exit_code
+        }'
+
+    return $exit_code
+}
+
+#------------------------------------------------------------------------------
+# run_lint_gate: Run linting for a project
+#
+# Args:
+#   $1 - Project directory path
+#   $2 - Optional: Lint command override
+#
+# Returns:
+#   0 on success, 1 on failure, 2 if no linter found
+#
+# Outputs:
+#   JSON result object to stdout
+#------------------------------------------------------------------------------
+run_lint_gate() {
+    local project_dir="$1"
+    local lint_cmd="${2:-}"
+    local exit_code=0
+    local output=""
+
+    # Auto-detect if not provided
+    if [[ -z "$lint_cmd" ]]; then
+        lint_cmd=$(detect_lint_command "$project_dir") || {
+            jq -n '{ran: false, ok: null, reason: "no_linter_found"}'
+            return 2
+        }
+    fi
+
+    log_verbose "Running lint: $lint_cmd"
+
+    # Run linter
+    if output=$(cd "$project_dir" && bash -c "$lint_cmd" 2>&1); then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    local output_summary
+    output_summary=$(echo "$output" | head -20 | tr '\n' ' ' | cut -c1-300)
+
+    jq -n \
+        --argjson ran true \
+        --argjson ok "$([ $exit_code -eq 0 ] && echo true || echo false)" \
+        --arg command "$lint_cmd" \
+        --arg output_summary "$output_summary" \
+        --argjson exit_code "$exit_code" \
+        '{
+            ran: $ran,
+            ok: $ok,
+            command: $command,
+            output_summary: $output_summary,
+            exit_code: $exit_code
+        }'
+
+    return $exit_code
+}
+
+#------------------------------------------------------------------------------
+# run_secret_scan: Scan for secrets in project changes
+#
+# Args:
+#   $1 - Project directory path
+#   $2 - Optional: "staged" to scan only staged changes
+#
+# Returns:
+#   0 on success (no secrets), 1 on failure (secrets found), 2 on warning
+#
+# Outputs:
+#   JSON result object to stdout
+#------------------------------------------------------------------------------
+run_secret_scan() {
+    local project_dir="$1"
+    local scope="${2:-all}"
+    local findings=()
+    local exit_code=0
+
+    # Use gitleaks if available
+    if command -v gitleaks &>/dev/null; then
+        log_verbose "Scanning for secrets with gitleaks"
+        local gl_output
+        if ! gl_output=$(gitleaks detect --source "$project_dir" --no-git 2>&1); then
+            exit_code=1
+            # Include first line of gitleaks output in findings
+            local gl_summary
+            gl_summary=$(echo "$gl_output" | head -3 | tr '\n' ' ')
+            findings+=("gitleaks: ${gl_summary:-detected potential secrets}")
+        fi
+    else
+        # Regex fallback
+        log_verbose "Scanning for secrets with regex patterns"
+        local patterns=(
+            'password\s*[:=]'
+            'api.?key\s*[:=]'
+            'secret\s*[:=]'
+            'token\s*[:=]'
+            'AWS_ACCESS_KEY'
+            'AWS_SECRET_ACCESS_KEY'
+            'PRIVATE_KEY'
+            'BEGIN RSA PRIVATE KEY'
+            'BEGIN OPENSSH PRIVATE KEY'
+        )
+
+        local diff_output
+        if [[ "$scope" == "staged" ]]; then
+            diff_output=$(git -C "$project_dir" diff --cached 2>/dev/null || true)
+        else
+            diff_output=$(git -C "$project_dir" diff HEAD~1..HEAD 2>/dev/null || true)
+        fi
+
+        for pattern in "${patterns[@]}"; do
+            if echo "$diff_output" | grep -qiE "$pattern"; then
+                exit_code=2  # Warning
+                findings+=("Potential secret pattern: $pattern")
+            fi
+        done
+    fi
+
+    local findings_json="[]"
+    if [[ ${#findings[@]} -gt 0 ]]; then
+        findings_json=$(printf '%s\n' "${findings[@]}" | jq -R . | jq -s .)
+    fi
+
+    jq -n \
+        --argjson ran true \
+        --argjson ok "$([ $exit_code -eq 0 ] && echo true || echo false)" \
+        --argjson warning "$([ $exit_code -eq 2 ] && echo true || echo false)" \
+        --argjson findings "$findings_json" \
+        --arg tool "$(command -v gitleaks &>/dev/null && echo gitleaks || echo regex)" \
+        '{
+            ran: $ran,
+            ok: $ok,
+            warning: $warning,
+            tool: $tool,
+            findings: $findings
+        }'
+
+    return $exit_code
+}
+
+#------------------------------------------------------------------------------
+# run_quality_gates: Run all quality gates for a project
+#
+# Args:
+#   $1 - Project directory path (worktree)
+#   $2 - Path to review-plan.json file
+#
+# Returns:
+#   0 on success, 1 on test/lint failure, 2 on secret warning
+#
+# Outputs:
+#   Combined JSON result to stdout
+#------------------------------------------------------------------------------
+run_quality_gates() {
+    local wt_path="$1"
+    local plan_file="$2"
+    local repo_id=""
+    local overall_ok=true
+    local has_warning=false
+
+    # Get repo ID from plan
+    if [[ -f "$plan_file" ]]; then
+        repo_id=$(jq -r '.repo // ""' "$plan_file")
+    fi
+
+    # Load policy for this repo
+    local policy_json
+    policy_json=$(load_policy_for_repo "$repo_id")
+
+    local test_cmd lint_cmd
+    test_cmd=$(echo "$policy_json" | jq -r '.test_command // ""')
+    lint_cmd=$(echo "$policy_json" | jq -r '.lint_command // ""')
+
+    # Run lint gate
+    log_info "Running quality gates..."
+    local lint_result
+    lint_result=$(run_lint_gate "$wt_path" "$lint_cmd")
+    local lint_exit=$?
+
+    if [[ $lint_exit -eq 1 ]]; then
+        overall_ok=false
+        log_error "Lint gate failed"
+    elif [[ $lint_exit -eq 2 ]]; then
+        log_verbose "No linter configured"
+    else
+        log_info "Lint gate passed"
+    fi
+
+    # Run test gate
+    local test_result
+    test_result=$(run_test_gate "$wt_path" "$test_cmd")
+    local test_exit=$?
+
+    if [[ $test_exit -eq 1 ]]; then
+        overall_ok=false
+        log_error "Test gate failed"
+    elif [[ $test_exit -eq 2 ]]; then
+        log_verbose "No tests configured"
+    else
+        log_info "Test gate passed"
+    fi
+
+    # Run secret scan
+    local secret_result
+    secret_result=$(run_secret_scan "$wt_path")
+    local secret_exit=$?
+
+    if [[ $secret_exit -eq 1 ]]; then
+        overall_ok=false
+        log_error "Secret scan failed - secrets detected"
+    elif [[ $secret_exit -eq 2 ]]; then
+        has_warning=true
+        log_warn "Secret scan warning - potential secrets detected"
+    else
+        log_info "Secret scan passed"
+    fi
+
+    # Combine results
+    jq -n \
+        --argjson tests "$test_result" \
+        --argjson lint "$lint_result" \
+        --argjson secrets "$secret_result" \
+        --argjson overall_ok "$overall_ok" \
+        --argjson has_warning "$has_warning" \
+        '{
+            overall_ok: $overall_ok,
+            has_warning: $has_warning,
+            tests: $tests,
+            lint: $lint,
+            secrets: $secrets
+        }'
+
+    if [[ "$overall_ok" == "false" ]]; then
+        return 1
+    elif [[ "$has_warning" == "true" ]]; then
+        return 2
+    fi
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# update_plan_with_gates: Update review plan with quality gate results
+#
+# Args:
+#   $1 - Path to review-plan.json file
+#   $2 - Quality gates result JSON
+#
+# Returns:
+#   0 on success, 1 on failure
+#------------------------------------------------------------------------------
+update_plan_with_gates() {
+    local plan_file="$1"
+    local gates_result="$2"
+
+    if [[ ! -f "$plan_file" ]]; then
+        log_error "Plan file not found: $plan_file"
+        return 1
+    fi
+
+    # Merge gates result into plan's git section
+    local updated_plan
+    updated_plan=$(jq --argjson gates "$gates_result" '
+        .git = (.git // {}) |
+        .git.tests = $gates.tests |
+        .git.lint = $gates.lint |
+        .git.secrets = $gates.secrets |
+        .git.quality_gates_ok = $gates.overall_ok |
+        .git.quality_gates_warning = $gates.has_warning
+    ' "$plan_file")
+
+    echo "$updated_plan" > "$plan_file"
+    return 0
 }
 
 #==============================================================================
