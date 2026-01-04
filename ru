@@ -329,30 +329,30 @@ write_result() {
 
 log_info() {
     [[ "$QUIET" == "true" ]] && return
-    echo -e "${BLUE}ℹ${RESET} $*" >&2
+    printf '%b\n' "${BLUE}ℹ${RESET} $*" >&2
 }
 
 log_success() {
     [[ "$QUIET" == "true" ]] && return
-    echo -e "${GREEN}✓${RESET} $*" >&2
+    printf '%b\n' "${GREEN}✓${RESET} $*" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}⚠${RESET} $*" >&2
+    printf '%b\n' "${YELLOW}⚠${RESET} $*" >&2
 }
 
 log_error() {
-    echo -e "${RED}✗${RESET} $*" >&2
+    printf '%b\n' "${RED}✗${RESET} $*" >&2
 }
 
 log_step() {
     [[ "$QUIET" == "true" ]] && return
-    echo -e "${CYAN}→${RESET} $*" >&2
+    printf '%b\n' "${CYAN}→${RESET} $*" >&2
 }
 
 log_verbose() {
     [[ "$VERBOSE" != "true" ]] && return
-    echo -e "${DIM}$*${RESET}" >&2
+    printf '%b\n' "${DIM}$*${RESET}" >&2
 }
 
 # Output JSON to stdout (only in --json mode)
@@ -685,9 +685,9 @@ print_banner() {
         gum style --border rounded --padding "0 2" \
             "🔄 ru v$VERSION" "Repo Updater" >&2
     else
-        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
-        echo -e "  ${BOLD}ru${RESET} v$VERSION - Repo Updater" >&2
-        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
+        printf '%b\n' "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
+        printf '%b\n' "  ${BOLD}ru${RESET} v$VERSION - Repo Updater" >&2
+        printf '%b\n' "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" >&2
     fi
 }
 
@@ -699,7 +699,7 @@ gum_spin() {
     if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" != "true" ]]; then
         gum spin --spinner dot --title "$title" -- "$@"
     else
-        [[ "$QUIET" != "true" ]] && echo -e "${CYAN}→${RESET} $title" >&2
+        [[ "$QUIET" != "true" ]] && printf '%b\n' "${CYAN}→${RESET} $title" >&2
         "$@"
     fi
 }
@@ -996,6 +996,7 @@ load_repo_list() {
 #   owner/repo@develop            -> url, develop branch, empty local_name
 #   owner/repo as myname          -> url, empty branch, myname local_name
 #   owner/repo@develop as myname  -> url, develop branch, myname local_name
+#   owner/repo@feature/foo        -> url, feature/foo branch (branches can contain /)
 # Args: spec, url_var, branch_var, local_name_var (namerefs)
 parse_repo_spec() {
     local spec="$1"
@@ -1013,15 +1014,85 @@ parse_repo_spec() {
         _prs_local_name=""
     fi
 
-    # Extract '@branch' if present
-    # Branch names don't contain ':' or '/' - this avoids matching SSH URLs like git@github.com:...
-    if [[ "$spec" =~ ^(.+)@([^@/:[:space:]]+)$ ]]; then
-        _prs_url="${BASH_REMATCH[1]}"
-        _prs_branch="${BASH_REMATCH[2]}"
-    else
-        _prs_url="$spec"
-        _prs_branch=""
+    # Default: no branch
+    _prs_url="$spec"
+    _prs_branch=""
+
+    # Extract '@branch' by splitting on the LAST '@' and only accepting it if the
+    # left side is a valid repo URL. This avoids mis-parsing ssh://git@host/... forms
+    # while still supporting branch names with / like feature/foo
+    if [[ "$spec" == *"@"* ]]; then
+        local maybe_url maybe_branch host owner repo
+        maybe_url="${spec%@*}"
+        maybe_branch="${spec##*@}"
+        # Only accept as branch if: left side parses as URL, branch is non-empty and has no spaces
+        if [[ -n "$maybe_url" && -n "$maybe_branch" && "$maybe_branch" != *[[:space:]]* ]]; then
+            if parse_repo_url "$maybe_url" host owner repo; then
+                _prs_url="$maybe_url"
+                _prs_branch="$maybe_branch"
+            fi
+        fi
     fi
+}
+
+# Resolve a repo spec into validated parts and a local path
+# This is the central function for parsing and validating repo specifications.
+# Args: spec projects_dir layout url_var branch_var custom_var path_var repo_id_var (namerefs)
+# repo_id is canonical for reporting (host/owner/repo, or owner/repo for github.com)
+# Returns: 0 on success, 1 on invalid spec
+resolve_repo_spec() {
+    local spec="$1"
+    local projects_dir="$2"
+    local layout="$3"
+    local -n _rrs_url=$4
+    local -n _rrs_branch=$5
+    local -n _rrs_custom=$6
+    local -n _rrs_path=$7
+    local -n _rrs_repo_id=$8
+
+    local url branch custom host owner repo
+    parse_repo_spec "$spec" url branch custom
+
+    # Validate branch name to prevent option-injection into git checkout/switch
+    if [[ -n "$branch" ]]; then
+        # Reject branches starting with - (option injection)
+        [[ "$branch" == -* ]] && return 1
+        # Use git to validate ref format if available
+        if command -v git &>/dev/null; then
+            git check-ref-format --branch "$branch" >/dev/null 2>&1 || return 1
+        fi
+    fi
+
+    # Parse and validate the URL
+    if ! parse_repo_url "$url" host owner repo; then
+        return 1
+    fi
+
+    # Validate custom name if provided
+    if [[ -n "$custom" ]]; then
+        _is_safe_path_segment "$custom" || return 1
+        _rrs_path="${projects_dir}/${custom}"
+    else
+        case "$layout" in
+            flat)       _rrs_path="${projects_dir}/${repo}" ;;
+            owner-repo) _rrs_path="${projects_dir}/${owner}/${repo}" ;;
+            full)       _rrs_path="${projects_dir}/${host}/${owner}/${repo}" ;;
+            *)          return 1 ;;
+        esac
+    fi
+
+    _rrs_url="$url"
+    _rrs_branch="$branch"
+    _rrs_custom="$custom"
+
+    # Build canonical repo ID for display/reporting
+    if [[ "$host" == "github.com" ]]; then
+        _rrs_repo_id="${owner}/${repo}"
+    else
+        _rrs_repo_id="${host}/${owner}/${repo}"
+    fi
+
+    return 0
 }
 
 # Deduplicate repos by resolved local path
@@ -1031,14 +1102,10 @@ dedupe_repos() {
     local -A seen_paths
 
     while IFS= read -r spec; do
-        local url branch local_name
-        parse_repo_spec "$spec" url branch local_name
-
-        local path
-        if [[ -n "$local_name" ]]; then
-            path="${PROJECTS_DIR}/${local_name}"
-        else
-            path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        local url branch local_name path repo_id
+        if ! resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch local_name path repo_id; then
+            log_warn "Skipping invalid repo spec: $spec"
+            continue
         fi
 
         if [[ -z "${seen_paths[$path]:-}" ]]; then
@@ -1058,32 +1125,26 @@ detect_collisions() {
     local collisions=0
 
     while IFS= read -r spec; do
-        local url branch local_name
-        parse_repo_spec "$spec" url branch local_name
-
-        local path
-        if [[ -n "$local_name" ]]; then
-            path="${PROJECTS_DIR}/${local_name}"
-        else
-            path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        local url branch local_name path repo_id
+        if ! resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch local_name path repo_id; then
+            log_warn "Invalid repo spec (cannot check collisions): $spec"
+            ((collisions++))
+            continue
         fi
 
-        local repo_id
-        if [[ -n "$local_name" ]]; then
-            repo_id="${url} as ${local_name}"
-        else
-            repo_id="$url"
-        fi
+        # Build display label
+        local repo_label="$repo_id"
+        [[ -n "$local_name" ]] && repo_label="${repo_id} as ${local_name}"
 
-        if [[ -n "${path_to_repo[$path]:-}" && "${path_to_repo[$path]}" != "$repo_id" ]]; then
+        if [[ -n "${path_to_repo[$path]:-}" && "${path_to_repo[$path]}" != "$repo_label" ]]; then
             log_warn "Collision detected:"
             log_warn "  Path: $path"
             log_warn "  Configured: ${path_to_repo[$path]} (will be synced)"
-            log_warn "  Skipped:    $repo_id (same path)"
+            log_warn "  Skipped:    $repo_label (same path)"
             log_warn "  To fix: Change layout to 'owner-repo' in config"
             ((collisions++))
         else
-            path_to_repo[$path]="$repo_id"
+            path_to_repo[$path]="$repo_label"
         fi
     done
 
@@ -1562,47 +1623,46 @@ process_single_repo_worker() {
     local pull_only="$7"
     local fetch_remotes="$8"
 
-    # Parse the repo spec
-    local url branch custom_name local_path repo_name
-    parse_repo_spec "$repo_spec" url branch custom_name
-
-    # Calculate local path based on custom name or URL
-    if [[ -n "$custom_name" ]]; then
-        local_path="${projects_dir}/${custom_name}"
-    else
-        local_path=$(url_to_local_path "$url" "$projects_dir" "$layout")
+    # Parse and resolve the repo spec
+    local url branch custom_name local_path repo_id
+    if ! resolve_repo_spec "$repo_spec" "$projects_dir" "$layout" url branch custom_name local_path repo_id; then
+        echo "FAIL:invalid:$repo_spec"
+        return 1
     fi
-    repo_name=$(basename "$local_path")
+
+    # Build display label
+    local repo_label="$repo_id"
+    [[ -n "$custom_name" ]] && repo_label="${repo_id} as ${custom_name}"
 
     # Check if repo exists locally
     if [[ ! -d "$local_path" ]]; then
         if [[ "$pull_only" == "true" ]]; then
-            write_result "$repo_name" "skip" "skipped" "0" "pull-only mode" "$local_path"
-            echo "SKIP:skipped:$repo_name"
+            write_result "$repo_label" "skip" "skipped" "0" "pull-only mode" "$local_path"
+            echo "SKIP:skipped:$repo_label"
             return 0
         fi
 
-        if do_clone "$url" "$local_path" "$repo_name" "$branch" >/dev/null 2>&1; then
-            echo "OK:cloned:$repo_name"
+        if do_clone "$url" "$local_path" "$repo_label" "$branch" >/dev/null 2>&1; then
+            echo "OK:cloned:$repo_label"
         else
-            echo "FAIL:failed:$repo_name"
+            echo "FAIL:failed:$repo_label"
         fi
     else
         if [[ "$clone_only" == "true" ]]; then
-            write_result "$repo_name" "skip" "skipped" "0" "clone-only mode" "$local_path"
-            echo "SKIP:skipped:$repo_name"
+            write_result "$repo_label" "skip" "skipped" "0" "clone-only mode" "$local_path"
+            echo "SKIP:skipped:$repo_label"
             return 0
         fi
 
         if ! is_git_repo "$local_path"; then
-            write_result "$repo_name" "skip" "not_git" "0" "" "$local_path"
-            echo "CONFLICT:not_git:$repo_name"
+            write_result "$repo_label" "skip" "not_git" "0" "" "$local_path"
+            echo "CONFLICT:not_git:$repo_label"
             return 0
         fi
 
         if check_remote_mismatch "$local_path" "$url"; then
-            write_result "$repo_name" "pull" "mismatch" "0" "" "$local_path"
-            echo "CONFLICT:mismatch:$repo_name"
+            write_result "$repo_label" "pull" "mismatch" "0" "" "$local_path"
+            echo "CONFLICT:mismatch:$repo_label"
             return 0
         fi
 
@@ -1612,27 +1672,27 @@ process_single_repo_worker() {
         dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
 
         if [[ "$dirty" == "true" && "$autostash" != "true" ]]; then
-            write_result "$repo_name" "pull" "dirty" "0" "" "$local_path"
-            echo "CONFLICT:dirty:$repo_name"
+            write_result "$repo_label" "pull" "dirty" "0" "" "$local_path"
+            echo "CONFLICT:dirty:$repo_label"
             return 0
         fi
 
         if [[ "$status" == "current" ]]; then
-            write_result "$repo_name" "pull" "current" "0" "" "$local_path"
-            echo "OK:current:$repo_name"
+            write_result "$repo_label" "pull" "current" "0" "" "$local_path"
+            echo "OK:current:$repo_label"
             return 0
         fi
 
         if [[ "$status" == "diverged" ]]; then
-            write_result "$repo_name" "pull" "diverged" "0" "" "$local_path"
-            echo "CONFLICT:diverged:$repo_name"
+            write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
+            echo "CONFLICT:diverged:$repo_label"
             return 0
         fi
 
-        if do_pull "$local_path" "$repo_name" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
-            echo "OK:updated:$repo_name"
+        if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
+            echo "OK:updated:$repo_label"
         else
-            echo "FAIL:failed:$repo_name"
+            echo "FAIL:failed:$repo_label"
         fi
     fi
 }
@@ -1983,22 +2043,22 @@ print_summary() {
         summary_text+="─────────────────────────────────────────\n"
         summary_text+="  Total: $total repos processed in $duration_str\n"
 
-        echo -e "$summary_text" | gum style --border rounded --padding "0 1" --border-foreground 212 >&2
+        printf '%b' "$summary_text" | gum style --border rounded --padding "0 1" --border-foreground 212 >&2
     else
         # ANSI fallback
         echo "" >&2
-        echo -e "${BOLD}╭─────────────────────────────────────────────────────────────╮${RESET}" >&2
-        echo -e "${BOLD}│                    📊 Sync Summary                          │${RESET}" >&2
-        echo -e "${BOLD}├─────────────────────────────────────────────────────────────┤${RESET}" >&2
-        [[ $cloned -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${GREEN}✅${RESET} Cloned:     $cloned repos                                   ${BOLD}│${RESET}" >&2
-        [[ $updated -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${GREEN}✅${RESET} Updated:    $updated repos                                   ${BOLD}│${RESET}" >&2
-        [[ $current -gt 0 ]] && echo -e "${BOLD}│${RESET}  ⏭️  Current:    $current repos (already up to date)           ${BOLD}│${RESET}" >&2
-        [[ $skipped -gt 0 ]] && echo -e "${BOLD}│${RESET}  ⏭️  Skipped:    $skipped repos                                   ${BOLD}│${RESET}" >&2
-        [[ $conflicts -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${YELLOW}⚠️${RESET}  Conflicts:  $conflicts repos (need attention)              ${BOLD}│${RESET}" >&2
-        [[ $failed -gt 0 ]] && echo -e "${BOLD}│${RESET}  ${RED}❌${RESET} Failed:     $failed repos                                   ${BOLD}│${RESET}" >&2
-        echo -e "${BOLD}├─────────────────────────────────────────────────────────────┤${RESET}" >&2
-        echo -e "${BOLD}│${RESET}  Total: $total repos processed in $duration_str                      ${BOLD}│${RESET}" >&2
-        echo -e "${BOLD}╰─────────────────────────────────────────────────────────────╯${RESET}" >&2
+        printf '%b\n' "${BOLD}╭─────────────────────────────────────────────────────────────╮${RESET}" >&2
+        printf '%b\n' "${BOLD}│                    📊 Sync Summary                          │${RESET}" >&2
+        printf '%b\n' "${BOLD}├─────────────────────────────────────────────────────────────┤${RESET}" >&2
+        [[ $cloned -gt 0 ]] && printf '%b\n' "${BOLD}│${RESET}  ${GREEN}✅${RESET} Cloned:     $cloned repos                                   ${BOLD}│${RESET}" >&2
+        [[ $updated -gt 0 ]] && printf '%b\n' "${BOLD}│${RESET}  ${GREEN}✅${RESET} Updated:    $updated repos                                   ${BOLD}│${RESET}" >&2
+        [[ $current -gt 0 ]] && printf '%b\n' "${BOLD}│${RESET}  ⏭️  Current:    $current repos (already up to date)           ${BOLD}│${RESET}" >&2
+        [[ $skipped -gt 0 ]] && printf '%b\n' "${BOLD}│${RESET}  ⏭️  Skipped:    $skipped repos                                   ${BOLD}│${RESET}" >&2
+        [[ $conflicts -gt 0 ]] && printf '%b\n' "${BOLD}│${RESET}  ${YELLOW}⚠️${RESET}  Conflicts:  $conflicts repos (need attention)              ${BOLD}│${RESET}" >&2
+        [[ $failed -gt 0 ]] && printf '%b\n' "${BOLD}│${RESET}  ${RED}❌${RESET} Failed:     $failed repos                                   ${BOLD}│${RESET}" >&2
+        printf '%b\n' "${BOLD}├─────────────────────────────────────────────────────────────┤${RESET}" >&2
+        printf '%b\n' "${BOLD}│${RESET}  Total: $total repos processed in $duration_str                      ${BOLD}│${RESET}" >&2
+        printf '%b\n' "${BOLD}╰─────────────────────────────────────────────────────────────╯${RESET}" >&2
     fi
 }
 
@@ -2030,8 +2090,8 @@ print_conflict_help() {
     [[ "$has_conflicts" != "true" ]] && return
 
     echo "" >&2
-    echo -e "${BOLD}${YELLOW}Repositories Needing Attention${RESET}" >&2
-    echo -e "─────────────────────────────────────────────────────────────" >&2
+    printf '%b\n' "${BOLD}${YELLOW}Repositories Needing Attention${RESET}" >&2
+    printf '%b\n' "─────────────────────────────────────────────────────────────" >&2
     echo "" >&2
 
     local num=0
@@ -2057,81 +2117,81 @@ print_conflict_help() {
         case "$status" in
             dirty)
                 ((num++))
-                echo -e "${BOLD}$num. $repo${RESET}" >&2
-                echo -e "   Path:   $path" >&2
-                echo -e "   Issue:  ${YELLOW}Dirty working tree${RESET} (uncommitted changes)" >&2
+                printf '%b\n' "${BOLD}$num. $repo${RESET}" >&2
+                printf '%b\n' "   Path:   $path" >&2
+                printf '%b\n' "   Issue:  ${YELLOW}Dirty working tree${RESET} (uncommitted changes)" >&2
                 echo "" >&2
-                echo -e "   ${DIM}Resolution options:${RESET}" >&2
-                echo -e "     ${GREEN}a)${RESET} Stash and pull:" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git stash && git pull && git stash pop${RESET}" >&2
+                printf '%b\n' "   ${DIM}Resolution options:${RESET}" >&2
+                printf '%b\n' "     ${GREEN}a)${RESET} Stash and pull:" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git stash && git pull && git stash pop${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${GREEN}b)${RESET} Commit your changes:" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git add . && git commit -m \"WIP\"${RESET}" >&2
+                printf '%b\n' "     ${GREEN}b)${RESET} Commit your changes:" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git add . && git commit -m \"WIP\"${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${RED}c)${RESET} Discard local changes (${RED}DESTRUCTIVE${RESET}):" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git checkout . && git clean -fd${RESET}" >&2
+                printf '%b\n' "     ${RED}c)${RESET} Discard local changes (${RED}DESTRUCTIVE${RESET}):" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git checkout . && git clean -fd${RESET}" >&2
                 echo "" >&2
                 ;;
             diverged)
                 ((num++))
-                echo -e "${BOLD}$num. $repo${RESET}" >&2
-                echo -e "   Path:   $path" >&2
-                echo -e "   Issue:  ${YELLOW}Diverged${RESET} (local and remote both have new commits)" >&2
+                printf '%b\n' "${BOLD}$num. $repo${RESET}" >&2
+                printf '%b\n' "   Path:   $path" >&2
+                printf '%b\n' "   Issue:  ${YELLOW}Diverged${RESET} (local and remote both have new commits)" >&2
                 echo "" >&2
-                echo -e "   ${DIM}Resolution options:${RESET}" >&2
-                echo -e "     ${GREEN}a)${RESET} Rebase your changes:" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git pull --rebase${RESET}" >&2
+                printf '%b\n' "   ${DIM}Resolution options:${RESET}" >&2
+                printf '%b\n' "     ${GREEN}a)${RESET} Rebase your changes:" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git pull --rebase${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${GREEN}b)${RESET} Merge (creates merge commit):" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git pull --no-ff${RESET}" >&2
+                printf '%b\n' "     ${GREEN}b)${RESET} Merge (creates merge commit):" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git pull --no-ff${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${GREEN}c)${RESET} Push your changes first (if intentional):" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git push${RESET}" >&2
+                printf '%b\n' "     ${GREEN}c)${RESET} Push your changes first (if intentional):" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git push${RESET}" >&2
                 echo "" >&2
                 ;;
             mismatch)
                 ((num++))
-                echo -e "${BOLD}$num. $repo${RESET}" >&2
-                echo -e "   Path:   $path" >&2
-                echo -e "   Issue:  ${RED}Remote mismatch${RESET} (different repo at this path)" >&2
+                printf '%b\n' "${BOLD}$num. $repo${RESET}" >&2
+                printf '%b\n' "   Path:   $path" >&2
+                printf '%b\n' "   Issue:  ${RED}Remote mismatch${RESET} (different repo at this path)" >&2
                 echo "" >&2
-                echo -e "   ${DIM}Resolution options:${RESET}" >&2
-                echo -e "     ${GREEN}a)${RESET} Check current remote:" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git remote -v${RESET}" >&2
+                printf '%b\n' "   ${DIM}Resolution options:${RESET}" >&2
+                printf '%b\n' "     ${GREEN}a)${RESET} Check current remote:" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git remote -v${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${GREEN}b)${RESET} Update remote URL:" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git remote set-url origin <correct-url>${RESET}" >&2
+                printf '%b\n' "     ${GREEN}b)${RESET} Update remote URL:" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git remote set-url origin <correct-url>${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${RED}c)${RESET} Remove and re-clone (${RED}DESTRUCTIVE${RESET}):" >&2
-                echo -e "        ${CYAN}rm -rf \"$path\" && ru sync${RESET}" >&2
+                printf '%b\n' "     ${RED}c)${RESET} Remove and re-clone (${RED}DESTRUCTIVE${RESET}):" >&2
+                printf '%b\n' "        ${CYAN}rm -rf \"$path\" && ru sync${RESET}" >&2
                 echo "" >&2
                 ;;
             not_git)
                 ((num++))
-                echo -e "${BOLD}$num. $repo${RESET}" >&2
-                echo -e "   Path:   $path" >&2
-                echo -e "   Issue:  ${RED}Not a git repository${RESET}" >&2
+                printf '%b\n' "${BOLD}$num. $repo${RESET}" >&2
+                printf '%b\n' "   Path:   $path" >&2
+                printf '%b\n' "   Issue:  ${RED}Not a git repository${RESET}" >&2
                 echo "" >&2
-                echo -e "   ${DIM}Resolution options:${RESET}" >&2
-                echo -e "     ${GREEN}a)${RESET} Remove and re-clone:" >&2
-                echo -e "        ${CYAN}rm -rf \"$path\" && ru sync${RESET}" >&2
+                printf '%b\n' "   ${DIM}Resolution options:${RESET}" >&2
+                printf '%b\n' "     ${GREEN}a)${RESET} Remove and re-clone:" >&2
+                printf '%b\n' "        ${CYAN}rm -rf \"$path\" && ru sync${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${GREEN}b)${RESET} Initialize as git repo:" >&2
-                echo -e "        ${CYAN}cd \"$path\" && git init && git remote add origin <url>${RESET}" >&2
+                printf '%b\n' "     ${GREEN}b)${RESET} Initialize as git repo:" >&2
+                printf '%b\n' "        ${CYAN}cd \"$path\" && git init && git remote add origin <url>${RESET}" >&2
                 echo "" >&2
                 ;;
             failed|timeout)
                 ((num++))
-                echo -e "${BOLD}$num. $repo${RESET}" >&2
-                echo -e "   Path:   $path" >&2
-                echo -e "   Issue:  ${RED}Operation failed${RESET} (network/auth issue)" >&2
+                printf '%b\n' "${BOLD}$num. $repo${RESET}" >&2
+                printf '%b\n' "   Path:   $path" >&2
+                printf '%b\n' "   Issue:  ${RED}Operation failed${RESET} (network/auth issue)" >&2
                 echo "" >&2
-                echo -e "   ${DIM}Resolution options:${RESET}" >&2
-                echo -e "     ${GREEN}a)${RESET} Check network connectivity and retry:" >&2
-                echo -e "        ${CYAN}ru sync $repo${RESET}" >&2
+                printf '%b\n' "   ${DIM}Resolution options:${RESET}" >&2
+                printf '%b\n' "     ${GREEN}a)${RESET} Check network connectivity and retry:" >&2
+                printf '%b\n' "        ${CYAN}ru sync $repo${RESET}" >&2
                 echo "" >&2
-                echo -e "     ${GREEN}b)${RESET} Check GitHub authentication:" >&2
-                echo -e "        ${CYAN}gh auth status${RESET}" >&2
+                printf '%b\n' "     ${GREEN}b)${RESET} Check GitHub authentication:" >&2
+                printf '%b\n' "        ${CYAN}gh auth status${RESET}" >&2
                 echo "" >&2
                 ;;
         esac
@@ -2260,29 +2320,28 @@ cmd_sync() {
     if [[ ${#ARGS[@]} -gt 0 ]]; then
         # User passed repo URLs directly - sync them ad-hoc
         log_step "Syncing ${#ARGS[@]} repo(s)..."
-        local repo_spec url branch custom_name path repo_name
+        local repo_spec url branch custom_name path repo_id repo_label
         for repo_spec in "${ARGS[@]}"; do
-            # Parse the repo spec (supports @branch and 'as name' syntax)
-            parse_repo_spec "$repo_spec" url branch custom_name
-
-            if [[ -n "$custom_name" ]]; then
-                path="${PROJECTS_DIR}/${custom_name}"
-            else
-                path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+            # Parse and resolve the repo spec
+            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name path repo_id; then
+                log_error "Invalid repo spec: $repo_spec"
+                write_result "$repo_spec" "skip" "invalid" "0" "invalid repo spec" ""
+                continue
             fi
-            repo_name=$(basename "$path")
+            repo_label="$repo_id"
+            [[ -n "$custom_name" ]] && repo_label="${repo_id} as ${custom_name}"
 
             if [[ -d "$path" ]]; then
                 # Exists - pull updates
                 if ! is_git_repo "$path"; then
                     log_warn "Not a git repo: $path"
-                    write_result "$repo_name" "skip" "not_git" "0" "" "$path"
+                    write_result "$repo_label" "skip" "not_git" "0" "" "$path"
                     continue
                 fi
-                do_pull "$path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"
+                do_pull "$path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"
             else
                 # Missing - clone
-                do_clone "$url" "$path" "$repo_name" "$branch"
+                do_clone "$url" "$path" "$repo_label" "$branch"
             fi
         done
         exit 0
@@ -2334,12 +2393,10 @@ cmd_sync() {
 
                 # Filter out completed repos (use local_path for unique identification)
                 for repo_spec in "${repos[@]}"; do
-                    local url branch custom_name local_path
-                    parse_repo_spec "$repo_spec" url branch custom_name
-                    if [[ -n "$custom_name" ]]; then
-                        local_path="${PROJECTS_DIR}/${custom_name}"
-                    else
-                        local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+                    local url branch custom_name local_path repo_id
+                    if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+                        log_error "Invalid repo spec in config: $repo_spec"
+                        continue
                     fi
 
                     if is_repo_completed "$local_path"; then
@@ -2381,12 +2438,9 @@ cmd_sync() {
     local pending_names=()
     if [[ ${#pending_repos[@]} -gt 0 ]]; then
         for repo_spec in "${pending_repos[@]}"; do
-            local url branch custom_name local_path
-            parse_repo_spec "$repo_spec" url branch custom_name
-            if [[ -n "$custom_name" ]]; then
-                local_path="${PROJECTS_DIR}/${custom_name}"
-            else
-                local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+            local url branch custom_name local_path repo_id
+            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+                continue
             fi
             pending_names+=("$local_path")
         done
@@ -2445,19 +2499,16 @@ cmd_sync() {
         [[ -z "$repo_spec" ]] && continue
         ((current++))
 
-        # Parse the repo spec
-        local url branch custom_name local_path repo_name
-        parse_repo_spec "$repo_spec" url branch custom_name
-
-        # Calculate local path based on custom name or URL
-        if [[ -n "$custom_name" ]]; then
-            local_path="${PROJECTS_DIR}/${custom_name}"
-        else
-            local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        # Parse and validate the repo spec
+        local url branch custom_name local_path repo_id repo_label
+        if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+            log_warn "Invalid repo spec: $repo_spec"
+            ((failed++))
+            continue
         fi
-        repo_name=$(basename "$local_path")
+        repo_label="${repo_id}${custom_name:+ (as $custom_name)}"
 
-        log_step "[$current/$pending_count] $repo_name"
+        log_step "[$current/$pending_count] $repo_label"
 
         # Check if repo exists locally
         if [[ ! -d "$local_path" ]]; then
@@ -2467,7 +2518,7 @@ cmd_sync() {
                 continue
             fi
 
-            if do_clone "$url" "$local_path" "$repo_name" "$branch"; then
+            if do_clone "$url" "$local_path" "$repo_label" "$branch"; then
                 ((cloned++))
             else
                 ((failed++))
@@ -2482,14 +2533,14 @@ cmd_sync() {
             if ! is_git_repo "$local_path"; then
                 log_warn "Not a git repo: $local_path"
                 ((conflicts++))
-                write_result "$repo_name" "skip" "not_git" "0" "" "$local_path"
+                write_result "$repo_label" "skip" "not_git" "0" "" "$local_path"
                 continue
             fi
 
             if check_remote_mismatch "$local_path" "$url"; then
-                log_warn "Remote mismatch: $repo_name"
+                log_warn "Remote mismatch: $repo_label"
                 ((conflicts++))
-                write_result "$repo_name" "pull" "mismatch" "0" "" "$local_path"
+                write_result "$repo_label" "pull" "mismatch" "0" "" "$local_path"
                 continue
             fi
 
@@ -2499,27 +2550,27 @@ cmd_sync() {
             dirty=$(echo "$status_info" | sed 's/.*DIRTY=\([^ ]*\).*/\1/')
 
             if [[ "$dirty" == "true" && "$AUTOSTASH" != "true" ]]; then
-                log_warn "Dirty: $repo_name (uncommitted changes)"
+                log_warn "Dirty: $repo_label (uncommitted changes)"
                 ((conflicts++))
-                write_result "$repo_name" "pull" "dirty" "0" "" "$local_path"
+                write_result "$repo_label" "pull" "dirty" "0" "" "$local_path"
                 continue
             fi
 
             if [[ "$status" == "current" ]]; then
-                log_info "Current: $repo_name"
+                log_info "Current: $repo_label"
                 ((skipped++))
-                write_result "$repo_name" "pull" "current" "0" "" "$local_path"
+                write_result "$repo_label" "pull" "current" "0" "" "$local_path"
                 continue
             fi
 
             if [[ "$status" == "diverged" ]]; then
-                log_warn "Diverged: $repo_name"
+                log_warn "Diverged: $repo_label"
                 ((conflicts++))
-                write_result "$repo_name" "pull" "diverged" "0" "" "$local_path"
+                write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
                 continue
             fi
 
-            if do_pull "$local_path" "$repo_name" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
+            if do_pull "$local_path" "$repo_label" "$UPDATE_STRATEGY" "$AUTOSTASH" "$branch"; then
                 ((updated++))
             else
                 ((failed++))
@@ -2604,14 +2655,10 @@ cmd_status() {
         echo "["
         local first="true"
         for repo_spec in "${repos[@]}"; do
-            local url branch custom_name local_path repo_name
-            parse_repo_spec "$repo_spec" url branch custom_name
-            if [[ -n "$custom_name" ]]; then
-                local_path="${PROJECTS_DIR}/${custom_name}"
-            else
-                local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+            local url branch custom_name local_path repo_id
+            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+                continue
             fi
-            repo_name=$(basename "$local_path")
             local status="missing" ahead=0 behind=0 dirty="false" branch_name=""
             if [[ -d "$local_path" ]] && is_git_repo "$local_path"; then
                 local status_info
@@ -2631,7 +2678,7 @@ cmd_status() {
             safe_path=$(json_escape "$local_path")
             safe_branch=$(json_escape "$branch_name")
             printf '{"repo":"%s","path":"%s","status":"%s","branch":"%s","ahead":%d,"behind":%d,"dirty":%s}' \
-                "$repo_name" "$safe_path" "$status" "$safe_branch" "$ahead" "$behind" "$dirty"
+                "$repo_id" "$safe_path" "$status" "$safe_branch" "$ahead" "$behind" "$dirty"
         done
         echo "]"
     else
@@ -2642,14 +2689,10 @@ cmd_status() {
         printf "%-30s %-12s %-15s %s\n" "Repository" "Status" "Branch" "Ahead/Behind" >&2
         printf "%-30s %-12s %-15s %s\n" "------------------------------" "------------" "---------------" "------------" >&2
         for repo_spec in "${repos[@]}"; do
-            local url branch custom_name local_path repo_name
-            parse_repo_spec "$repo_spec" url branch custom_name
-            if [[ -n "$custom_name" ]]; then
-                local_path="${PROJECTS_DIR}/${custom_name}"
-            else
-                local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+            local url branch custom_name local_path repo_id
+            if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+                continue
             fi
-            repo_name=$(basename "$local_path")
             local status="missing" ahead=0 behind=0 dirty="false" branch_name="" status_display
             if [[ -d "$local_path" ]] && is_git_repo "$local_path"; then
                 local status_info
@@ -2673,7 +2716,7 @@ cmd_status() {
                 *)           status_display="$status" ;;
             esac
             [[ "$dirty" == "true" ]] && status_display="${status_display}${YELLOW}*${RESET}"
-            printf "%-30s %-12b %-15s %d/%d\n" "${repo_name:0:30}" "$status_display" "${branch_name:0:15}" "$ahead" "$behind" >&2
+            printf "%-30s %-12b %-15s %d/%d\n" "${repo_id:0:30}" "$status_display" "${branch_name:0:15}" "$ahead" "$behind" >&2
         done
         echo "" >&2
         log_info "Legend: * = uncommitted changes"
@@ -3024,9 +3067,9 @@ cmd_import() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo -e "${BOLD}Import Preview${RESET} (dry-run)" >&2
+        printf '%b\n' "${BOLD}Import Preview${RESET} (dry-run)" >&2
     else
-        echo -e "${BOLD}Import Summary${RESET}" >&2
+        printf '%b\n' "${BOLD}Import Summary${RESET}" >&2
     fi
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
 
@@ -3034,42 +3077,42 @@ cmd_import() {
 
     # Success stats
     if [[ $total_imported -gt 0 ]]; then
-        echo -e "${GREEN}✓${RESET} Imported:    ${BOLD}$total_imported${RESET} repos" >&2
+        printf '%b\n' "${GREEN}✓${RESET} Imported:    ${BOLD}$total_imported${RESET} repos" >&2
         if [[ $imported_public -gt 0 ]]; then
-            echo -e "              └─ ${CYAN}$imported_public public${RESET}" >&2
+            printf '%b\n' "              └─ ${CYAN}$imported_public public${RESET}" >&2
         fi
         if [[ $imported_private -gt 0 ]]; then
-            echo -e "              └─ ${MAGENTA}$imported_private private${RESET}" >&2
+            printf '%b\n' "              └─ ${MAGENTA}$imported_private private${RESET}" >&2
         fi
     fi
 
     # Skip stats
     if [[ $skipped_duplicate -gt 0 ]]; then
-        echo -e "${YELLOW}⏭${RESET}  Duplicates: ${BOLD}$skipped_duplicate${RESET} (already configured)" >&2
+        printf '%b\n' "${YELLOW}⏭${RESET}  Duplicates: ${BOLD}$skipped_duplicate${RESET} (already configured)" >&2
     fi
 
     if [[ $skipped_invalid -gt 0 ]]; then
-        echo -e "${RED}✗${RESET} Invalid:     ${BOLD}$skipped_invalid${RESET} (couldn't parse)" >&2
+        printf '%b\n' "${RED}✗${RESET} Invalid:     ${BOLD}$skipped_invalid${RESET} (couldn't parse)" >&2
         if [[ "$VERBOSE" == "true" ]]; then
             for item in "${invalid_repos[@]}"; do
-                echo -e "              └─ ${DIM}$item${RESET}" >&2
+                printf '%b\n' "              └─ ${DIM}$item${RESET}" >&2
             done
         fi
     fi
 
     if [[ $skipped_error -gt 0 ]]; then
-        echo -e "${RED}✗${RESET} Errors:      ${BOLD}$skipped_error${RESET} (API/network issues)" >&2
+        printf '%b\n' "${RED}✗${RESET} Errors:      ${BOLD}$skipped_error${RESET} (API/network issues)" >&2
         if [[ "$VERBOSE" == "true" ]]; then
             for item in "${error_repos[@]}"; do
                 local repo_part="${item%%|*}"
                 local error_part="${item#*|}"
-                echo -e "              └─ ${DIM}$repo_part: $error_part${RESET}" >&2
+                printf '%b\n' "              └─ ${DIM}$repo_part: $error_part${RESET}" >&2
             done
         fi
     fi
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
-    echo -e "Total lines processed: ${BOLD}$total_lines${RESET}" >&2
+    printf '%b\n' "Total lines processed: ${BOLD}$total_lines${RESET}" >&2
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "" >&2
@@ -3235,15 +3278,12 @@ cmd_list() {
     echo "" >&2
 
     for repo_spec in "${repos[@]}"; do
-        local url branch custom_name local_path
-        parse_repo_spec "$repo_spec" url branch custom_name
+        local url branch custom_name local_path repo_id
+        if ! resolve_repo_spec "$repo_spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+            continue
+        fi
 
         if [[ "$show_paths" == "true" ]]; then
-            if [[ -n "$custom_name" ]]; then
-                local_path="${PROJECTS_DIR}/${custom_name}"
-            else
-                local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
-            fi
             echo "$local_path"
         else
             echo "$url"
@@ -3261,9 +3301,9 @@ cmd_doctor() {
     if command -v git &>/dev/null; then
         local git_version
         git_version=$(git --version | sed 's/git version //')
-        echo -e "${GREEN}[OK]${RESET} git: $git_version" >&2
+        printf '%b\n' "${GREEN}[OK]${RESET} git: $git_version" >&2
     else
-        echo -e "${RED}[!!]${RESET} git: not installed" >&2
+        printf '%b\n' "${RED}[!!]${RESET} git: not installed" >&2
         ((issues++))
     fi
 
@@ -3273,20 +3313,20 @@ cmd_doctor() {
         gh_version=$(gh --version | head -1 | awk '{print $3}')
         if gh auth status &>/dev/null; then
             gh_user=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
-            echo -e "${GREEN}[OK]${RESET} gh: $gh_version (authenticated as $gh_user)" >&2
+            printf '%b\n' "${GREEN}[OK]${RESET} gh: $gh_version (authenticated as $gh_user)" >&2
         else
-            echo -e "${YELLOW}[??]${RESET} gh: $gh_version (not authenticated)" >&2
+            printf '%b\n' "${YELLOW}[??]${RESET} gh: $gh_version (not authenticated)" >&2
             ((issues++))
         fi
     else
-        echo -e "${YELLOW}[??]${RESET} gh: not installed (needed for private repos)" >&2
+        printf '%b\n' "${YELLOW}[??]${RESET} gh: not installed (needed for private repos)" >&2
     fi
 
     # Check config directory
     if [[ -d "$RU_CONFIG_DIR" ]]; then
-        echo -e "${GREEN}[OK]${RESET} Config: $RU_CONFIG_DIR" >&2
+        printf '%b\n' "${GREEN}[OK]${RESET} Config: $RU_CONFIG_DIR" >&2
     else
-        echo -e "${YELLOW}[??]${RESET} Config: not initialized (run: ru init)" >&2
+        printf '%b\n' "${YELLOW}[??]${RESET} Config: not initialized (run: ru init)" >&2
     fi
 
     # Check repos configured
@@ -3297,30 +3337,30 @@ cmd_doctor() {
         done < <(get_all_repos 2>/dev/null)
     fi
     if [[ $repo_count -gt 0 ]]; then
-        echo -e "${GREEN}[OK]${RESET} Repos: $repo_count configured" >&2
+        printf '%b\n' "${GREEN}[OK]${RESET} Repos: $repo_count configured" >&2
     else
-        echo -e "${YELLOW}[??]${RESET} Repos: none configured" >&2
+        printf '%b\n' "${YELLOW}[??]${RESET} Repos: none configured" >&2
     fi
 
     # Check projects directory
     if [[ -d "$PROJECTS_DIR" ]]; then
         if [[ -w "$PROJECTS_DIR" ]]; then
-            echo -e "${GREEN}[OK]${RESET} Projects: $PROJECTS_DIR (writable)" >&2
+            printf '%b\n' "${GREEN}[OK]${RESET} Projects: $PROJECTS_DIR (writable)" >&2
         else
-            echo -e "${RED}[!!]${RESET} Projects: $PROJECTS_DIR (not writable)" >&2
+            printf '%b\n' "${RED}[!!]${RESET} Projects: $PROJECTS_DIR (not writable)" >&2
             ((issues++))
         fi
     else
-        echo -e "${YELLOW}[??]${RESET} Projects: $PROJECTS_DIR (will be created)" >&2
+        printf '%b\n' "${YELLOW}[??]${RESET} Projects: $PROJECTS_DIR (will be created)" >&2
     fi
 
     # Check gum (optional)
     if command -v gum &>/dev/null; then
         local gum_version
         gum_version=$(gum --version 2>/dev/null | head -1 || echo "unknown")
-        echo -e "${GREEN}[OK]${RESET} gum: $gum_version" >&2
+        printf '%b\n' "${GREEN}[OK]${RESET} gum: $gum_version" >&2
     else
-        echo -e "${DIM}[  ]${RESET} gum: not installed (optional, for prettier UI)" >&2
+        printf '%b\n' "${DIM}[  ]${RESET} gum: not installed (optional, for prettier UI)" >&2
     fi
 
     echo "" >&2
@@ -3616,14 +3656,10 @@ cmd_prune() {
 
     while IFS= read -r spec; do
         [[ -z "$spec" ]] && continue
-        local url branch custom_name local_path
-        parse_repo_spec "$spec" url branch custom_name
-        if [[ -n "$custom_name" ]]; then
-            local_path="${PROJECTS_DIR}/${custom_name}"
-        else
-            local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
+        local url branch custom_name local_path repo_id
+        if resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+            echo "$local_path"
         fi
-        echo "$local_path"
     done < <(get_all_repos) | sort -u > "$configured_paths"
 
     # Find all git repositories in projects directory
