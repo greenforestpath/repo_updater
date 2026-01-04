@@ -1801,7 +1801,7 @@ aggregate_results() {
         fi
 
         case "$status" in
-            ok|cloned)   ((cloned++)) ;;
+            ok)          ((cloned++)) ;;
             updated)     ((updated++)) ;;
             current)     ((current++)) ;;
             failed|timeout)  ((failed++)) ;;
@@ -2631,16 +2631,82 @@ cmd_add() {
     fi
 
     for repo in "${repo_args[@]}"; do
-        # Validate the repo URL can be parsed
+        # Parse the repo spec to extract URL (ignoring branch/custom name for dupe check)
+        local spec_url spec_branch spec_name
+        parse_repo_spec "$repo" spec_url spec_branch spec_name
+
+        # Validate the URL can be parsed and get canonical form
         local host owner repo_name
-        if ! parse_repo_url "$repo" host owner repo_name; then
+        if ! parse_repo_url "$spec_url" host owner repo_name; then
             log_error "Invalid repo format: $repo"
             continue
         fi
 
-        # Check if already in file (only non-comment lines)
-        if grep -v '^[[:space:]]*#' "$repos_file" 2>/dev/null | grep -qxF "$repo"; then
-            log_warn "Already configured: $repo"
+        # Build canonical form for duplicate detection: host/owner/repo
+        local canonical="${host}/${owner}/${repo_name}"
+
+        # Check if already in file by comparing normalized URLs
+        # This handles owner/repo vs https://github.com/owner/repo as duplicates
+        local already_exists="false"
+        local matching_line=""
+
+        # Read all non-comment lines and check each one
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+
+            # Parse the existing spec to get its URL
+            local existing_url existing_branch existing_name
+            parse_repo_spec "$line" existing_url existing_branch existing_name
+
+            # Parse and normalize the existing URL
+            local existing_host existing_owner existing_repo
+            if parse_repo_url "$existing_url" existing_host existing_owner existing_repo; then
+                local existing_canonical="${existing_host}/${existing_owner}/${existing_repo}"
+                if [[ "$canonical" == "$existing_canonical" ]]; then
+                    already_exists="true"
+                    matching_line="$line"
+                    break
+                fi
+            fi
+        done < <(grep -v '^[[:space:]]*#' "$repos_file" 2>/dev/null)
+
+        if [[ "$already_exists" == "true" ]]; then
+            if [[ "$repo" == "$matching_line" ]]; then
+                log_warn "Already configured: $repo"
+            else
+                log_warn "Already configured: $repo (matches: $matching_line)"
+            fi
+            continue
+        fi
+
+        # Also check the other repos file (public vs private)
+        local other_file other_label
+        if [[ "$use_private" == "true" ]]; then
+            other_file="$RU_CONFIG_DIR/repos.d/repos.txt"
+            other_label="public"
+        else
+            other_file="$RU_CONFIG_DIR/repos.d/private.txt"
+            other_label="private"
+        fi
+
+        if [[ -f "$other_file" ]]; then
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local existing_url existing_branch existing_name
+                parse_repo_spec "$line" existing_url existing_branch existing_name
+                local existing_host existing_owner existing_repo
+                if parse_repo_url "$existing_url" existing_host existing_owner existing_repo; then
+                    local existing_canonical="${existing_host}/${existing_owner}/${existing_repo}"
+                    if [[ "$canonical" == "$existing_canonical" ]]; then
+                        log_warn "Already configured in $other_label list: $line"
+                        already_exists="true"
+                        break
+                    fi
+                fi
+            done < <(grep -v '^[[:space:]]*#' "$other_file" 2>/dev/null)
+        fi
+
+        if [[ "$already_exists" == "true" ]]; then
             continue
         fi
 
@@ -3224,7 +3290,9 @@ cmd_prune() {
             else
                 json_array+=","
             fi
-            json_array+="{\"path\":\"$path\"}"
+            local safe_path
+            safe_path=$(json_escape "$path")
+            json_array+="{\"path\":\"$safe_path\"}"
         done
         json_array+="]"
         echo "$json_array"
