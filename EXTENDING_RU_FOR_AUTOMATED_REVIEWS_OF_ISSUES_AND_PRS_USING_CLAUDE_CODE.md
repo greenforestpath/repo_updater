@@ -352,46 +352,108 @@ Starting 4 parallel review sessions...
 **Approach**: Extend `ru` with a new `review` subcommand entirely in Bash.
 
 ```bash
+# Implementation sketch
 cmd_review() {
-    # Scan repos, launch tmux sessions, poll output, show gum prompts
+    local repos_with_issues=()
+
+    # Scan repos for open issues/PRs
+    while IFS= read -r repo_spec; do
+        local issue_count pr_count
+        issue_count=$(gh issue list -R "$repo" --state open --json number | jq length)
+        pr_count=$(gh pr list -R "$repo" --state open --json number | jq length)
+
+        if [[ $((issue_count + pr_count)) -gt 0 ]]; then
+            repos_with_issues+=("$repo_spec")
+        fi
+    done < <(get_all_repos)
+
+    # Process each repo sequentially
+    for repo in "${repos_with_issues[@]}"; do
+        # Launch tmux session with Claude Code
+        # Send prompts via tmux send-keys
+        # Poll for questions using output pattern matching
+        # Show questions via gum
+    done
 }
 ```
 
 | Pros | Cons |
 |------|------|
-| Keeps ru as pure Bash | Bash awkward for complex TUI |
-| No new dependencies | Limited concurrency control |
-| Simple deployment | Output parsing is fragile |
+| Keeps ru as pure Bash (consistent with existing codebase) | Bash awkward for complex TUI interactions |
+| No new dependencies beyond what ru already uses | Limited concurrency control |
+| Simple deployment (single script) | Output parsing is fragile |
 | | No real-time monitoring |
-| | Reinvents ntm functionality |
+| | Would reinvent functionality that exists elsewhere (ntm) |
+| | Hard to maintain as complexity grows |
 
-**Verdict**: ❌ Not recommended for full implementation.
+**Verdict**: ❌ Not recommended for full implementation, but useful for basic functionality.
 
 ### 5.2 Option B: Standalone Go/Rust Helper Binary
 
-**Approach**: Create `ru-review` as a separate binary.
+**Approach**: Create `ru-review` as a separate binary that ru calls.
+
+```go
+// ru-review/main.go sketch
+func main() {
+    repos := scanForActivity()
+    sessions := make(map[string]*Session)
+
+    for _, repo := range repos {
+        session := launchClaudeSession(repo)
+        sessions[repo] = session
+        go monitorSession(session)
+    }
+
+    runTUI(sessions)
+}
+```
 
 | Pros | Cons |
 |------|------|
-| Proper TUI support | New codebase to maintain |
-| Better parsing/state | Duplicates ntm functionality |
-| Good concurrency | More complex build/install |
-| Type safety | Different language from ru |
+| Proper TUI support (using tview, bubbletea, etc.) | New codebase to maintain |
+| Better output parsing and state management | Duplicates functionality from ntm |
+| Good concurrency primitives | More complex build and installation |
+| Type safety and better error handling | Different language from ru (coordination overhead) |
 
 **Verdict**: ⚠️ Reasonable but suboptimal given ntm exists.
 
 ### 5.3 Option C: Deep ntm Integration
 
-**Approach**: Use ntm as orchestration engine, ru as repo management.
+**Approach**: Use ntm as the orchestration engine, ru as the repo management layer.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           ru review                                  │
+│                              │                                       │
+│                    ┌─────────┴─────────┐                            │
+│                    ▼                   ▼                            │
+│              ┌──────────┐       ┌──────────────┐                    │
+│              │  ru      │       │  ntm         │                    │
+│              │  (Bash)  │       │  (Go)        │                    │
+│              └────┬─────┘       └──────┬───────┘                    │
+│                   │                    │                            │
+│    Repo config    │                    │  Session mgmt              │
+│    Issue scanning │                    │  Activity detection        │
+│    Git operations │                    │  TUI/Dashboard             │
+│                   │                    │  Robot mode API            │
+│                   └────────┬───────────┘                            │
+│                            │                                        │
+│                            ▼                                        │
+│                    ┌───────────────┐                                │
+│                    │ Claude Code   │                                │
+│                    │ (tmux panes)  │                                │
+│                    └───────────────┘                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 | Pros | Cons |
 |------|------|
-| Mature orchestration (~29K lines Go) | Adds ntm as dependency |
-| Beautiful TUI already exists | Requires ntm setup |
-| Health monitoring, restart | Two-language coordination |
-| Robot mode for Bash→Go communication | |
-| Workflow pipelines | |
-| Session persistence | |
+| Leverages mature, tested orchestration code (~29K lines of Go) | Adds ntm as dependency |
+| Beautiful TUI already exists (command palette, dashboard) | Requires ntm installation and configuration |
+| Health monitoring, auto-restart, activity detection | More complex initial setup |
+| Robot mode enables Bash→Go communication | Two-language coordination (Bash + Go) |
+| Workflow pipelines for complex sequences | |
+| Session persistence across disconnections | |
 
 **Verdict**: ✅ **Recommended** - leverages existing sophisticated tooling.
 
@@ -1110,6 +1172,189 @@ outputs:
     value: ${steps.review_issues_prs.issues_count:-0}
   prs_reviewed:
     value: ${steps.review_issues_prs.prs_count:-0}
+```
+
+### 9.4 New ntm Components Needed
+
+```
+internal/
+├── review/
+│   ├── detector.go      # Question detection logic
+│   ├── aggregator.go    # Question queue management
+│   ├── router.go        # Answer routing
+│   └── state.go         # Review state persistence
+├── cli/
+│   ├── review_dashboard.go  # TUI dashboard command
+│   └── review_start.go      # Start review sessions
+└── workflows/
+    └── templates/
+        └── github-review.yaml  # Built-in review workflow
+```
+
+### 9.5 Communication Protocol
+
+```
+ru (Bash) ←──────────────────────→ ntm (Go)
+    │                                  │
+    │  ntm --robot-spawn               │
+    │  ──────────────────────────────▶│
+    │                                  │
+    │  {"status":"ok","session":"..."}│
+    │◀──────────────────────────────── │
+    │                                  │
+    │  ntm --robot-status              │
+    │  ──────────────────────────────▶│
+    │                                  │
+    │  {"sessions":[...],"questions":[...]}
+    │◀──────────────────────────────── │
+    │                                  │
+    │  ntm --robot-answer              │
+    │  --question-id=123               │
+    │  --answer="a"                    │
+    │  ──────────────────────────────▶│
+    │                                  │
+    │  {"status":"ok","routed":true}  │
+    │◀──────────────────────────────── │
+```
+
+### 9.6 Question Context Extraction (ntm Go Code)
+
+```go
+// Extract relevant context around a question
+func ExtractQuestionContext(output string, maxLines int) string {
+    lines := strings.Split(output, "\n")
+
+    // Find the question line
+    questionIdx := -1
+    for i := len(lines) - 1; i >= 0; i-- {
+        if isQuestionLine(lines[i]) {
+            questionIdx = i
+            break
+        }
+    }
+
+    if questionIdx == -1 {
+        // No question found, return last N lines
+        start := max(0, len(lines)-maxLines)
+        return strings.Join(lines[start:], "\n")
+    }
+
+    // Get context before and after question
+    start := max(0, questionIdx-10)
+    end := min(len(lines), questionIdx+5)
+
+    return strings.Join(lines[start:end], "\n")
+}
+```
+
+### 9.7 Answer Routing (ntm Go Code)
+
+```go
+// Route answer back to appropriate session
+func RouteAnswer(question *Question, answer string) error {
+    // Get the tmux pane
+    pane, err := tmux.GetPane(question.SessionID, question.PaneID)
+    if err != nil {
+        return err
+    }
+
+    // Send the answer
+    return pane.SendKeys(answer + "\n")
+}
+```
+
+### 9.8 Activity Detection (ntm Go Code)
+
+```go
+// Activity states for Claude Code
+const (
+    StateGenerating = "GENERATING"  // High output velocity (>10 chars/sec)
+    StateWaiting    = "WAITING"     // Idle at prompt, ready for input
+    StateThinking   = "THINKING"    // Low velocity, processing
+    StateError      = "ERROR"       // Error patterns detected
+)
+
+// Detection heuristics
+func DetectClaudeState(pane *Pane) string {
+    output := pane.CaptureLastN(50)  // Last 50 lines
+    velocity := pane.OutputVelocity()
+
+    // Check for error patterns
+    if containsErrorPattern(output) {
+        return StateError
+    }
+
+    // Check for waiting patterns (prompt visible, no activity)
+    if velocity < 1.0 && containsPromptPattern(output) {
+        return StateWaiting
+    }
+
+    // Check for active generation
+    if velocity > 10.0 {
+        return StateGenerating
+    }
+
+    return StateThinking
+}
+
+// Patterns indicating Claude is waiting for input
+var waitingPatterns = []string{
+    `^\s*>\s*$`,                    // Empty prompt
+    `\[y/N\]`,                      // Yes/No prompt
+    `\[Y/n\]`,                      // Yes/No prompt
+    `Select.*:`,                    // Selection prompt
+    `Enter.*:`,                     // Input prompt
+    `Press Enter to continue`,     // Continuation prompt
+}
+
+// Patterns indicating a question
+var questionPatterns = []string{
+    `Should I`,
+    `Do you want`,
+    `Would you like`,
+    `Please confirm`,
+    `Choose.*:`,
+    `Which.*\?`,
+    `What.*\?`,
+    `How should`,
+}
+```
+
+### 9.9 Fallback When ntm Unavailable
+
+```bash
+# Check for ntm and gracefully degrade
+check_review_prerequisites() {
+    if ! command -v gh &>/dev/null; then
+        log_error "GitHub CLI (gh) is required for reviews"
+        log_info "Install: https://cli.github.com/"
+        return 3
+    fi
+
+    if ! gh auth status &>/dev/null; then
+        log_error "GitHub CLI is not authenticated"
+        log_info "Run: gh auth login"
+        return 3
+    fi
+
+    # ntm is optional but recommended
+    if ! command -v ntm &>/dev/null; then
+        log_warn "ntm not found - using basic mode (sequential, limited TUI)"
+        log_info "For enhanced experience, install ntm: https://github.com/..."
+        REVIEW_MODE="basic"
+        return 0
+    fi
+
+    # Verify ntm version supports robot mode
+    if ! ntm --robot-status &>/dev/null; then
+        log_warn "ntm version doesn't support robot mode - using basic mode"
+        REVIEW_MODE="basic"
+        return 0
+    fi
+
+    REVIEW_MODE="ntm"
+    return 0
+}
 ```
 
 ---
