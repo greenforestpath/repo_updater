@@ -64,6 +64,57 @@
 #   3. Explicit error handling is more predictable
 set -uo pipefail
 
+# Basic sanity: this script relies heavily on $HOME for defaults.
+: "${HOME:?ru: HOME must be set}"
+
+# Bash >= 4.3 is required (namerefs + associative arrays). macOS ships Bash 3.2 by default.
+if [[ -z "${BASH_VERSINFO[*]:-}" ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    printf 'ru: Bash >= 4.3 is required (found: %s)\n' "${BASH_VERSION:-unknown}" >&2
+
+    # Check if we're on macOS and can offer to install via Homebrew
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        printf 'ru: On macOS, the system Bash is outdated.\n' >&2
+
+        # Check if Homebrew is available and if we have an interactive terminal
+        if command -v brew &>/dev/null && [[ -t 0 && -t 2 ]]; then
+            printf '\n' >&2
+            printf 'Would you like to install Bash 5.x via Homebrew now? [y/N] ' >&2
+            read -r response
+            case "${response:-}" in
+                [yY]|[yY][eE][sS])
+                    printf '\nInstalling Bash via Homebrew...\n' >&2
+                    if brew install bash; then
+                        printf '\n' >&2
+                        printf '✓ Bash installed successfully!\n' >&2
+                        printf '\n' >&2
+                        printf 'Please run ru again using the new Bash:\n' >&2
+                        # Handle both Apple Silicon (/opt/homebrew) and Intel (/usr/local) Macs
+                        printf '  %s %s\n' "$(brew --prefix)/bin/bash" "${BASH_SOURCE[0]}" >&2
+                        printf '\n' >&2
+                        printf 'Or add this to your shell profile for permanent use:\n' >&2
+                        printf '  alias ru="%s %s"\n' "$(brew --prefix)/bin/bash" "${BASH_SOURCE[0]}" >&2
+                    else
+                        printf '\n' >&2
+                        printf '✗ Failed to install Bash via Homebrew\n' >&2
+                        printf 'Try running: brew install bash\n' >&2
+                    fi
+                    ;;
+                *)
+                    printf '\n' >&2
+                    printf 'To install manually: brew install bash\n' >&2
+                    printf 'Then run: $(brew --prefix)/bin/bash %s\n' "${BASH_SOURCE[0]}" >&2
+                    ;;
+            esac
+        else
+            printf 'Install Bash: brew install bash\n' >&2
+            printf 'Then run: $(brew --prefix)/bin/bash %s\n' "${BASH_SOURCE[0]}" >&2
+        fi
+    else
+        printf 'ru: Install Bash 4.3+ from your package manager\n' >&2
+    fi
+    exit 3
+fi
+
 #==============================================================================
 # SECTION 1: VERSION AND CONSTANTS
 #==============================================================================
@@ -181,16 +232,39 @@ ensure_dir() {
     fi
 }
 
-# Escape a string for JSON (handles quotes, backslashes, newlines)
+# mktemp compatibility: BSD (macOS) mktemp requires a template or -t.
+mktemp_file() {
+    local tmp
+    if tmp=$(mktemp 2>/dev/null); then
+        printf '%s\n' "$tmp"
+        return 0
+    fi
+    tmp=$(mktemp -t ru 2>/dev/null) || return 1
+    printf '%s\n' "$tmp"
+}
+
+mktemp_dir() {
+    local tmp
+    if tmp=$(mktemp -d 2>/dev/null); then
+        printf '%s\n' "$tmp"
+        return 0
+    fi
+    tmp=$(mktemp -d -t ru 2>/dev/null) || return 1
+    printf '%s\n' "$tmp"
+}
+
+# Escape a string for JSON (handles quotes, backslashes, control characters)
 json_escape() {
     local str="$1"
-    # Escape backslashes first, then quotes, then newlines
+    # Escape backslashes first, then quotes, then control characters
     str="${str//\\/\\\\}"
     str="${str//\"/\\\"}"
     str="${str//$'\n'/\\n}"
     str="${str//$'\r'/\\r}"
     str="${str//$'\t'/\\t}"
-    echo "$str"
+    str="${str//$'\b'/\\b}"
+    str="${str//$'\f'/\\f}"
+    printf '%s\n' "$str"
 }
 
 # Write a result to the NDJSON results file
@@ -1287,10 +1361,10 @@ get_config_hash() {
     local input
     input=$(get_all_repos 2>/dev/null | sort)
     if command -v md5sum &>/dev/null; then
-        echo "$input" | md5sum | cut -d' ' -f1
+        printf '%s\n' "$input" | md5sum | cut -d' ' -f1
     elif command -v md5 &>/dev/null; then
-        # macOS uses 'md5' instead of 'md5sum'
-        echo "$input" | md5
+        # macOS uses 'md5' instead of 'md5sum'; -q for quiet (hash only)
+        printf '%s\n' "$input" | md5 -q
     else
         # Fallback: use wc and date for a rough "hash"
         echo "${#input}-$(date +%s)"
@@ -1356,7 +1430,7 @@ save_sync_state() {
 
     # Build JSON
     local run_id
-    run_id="${SYNC_RUN_ID:-$(date -Iseconds)}"
+    run_id="${SYNC_RUN_ID:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
     local config_hash
     config_hash=$(get_config_hash)
 
@@ -1532,10 +1606,10 @@ run_parallel_sync() {
 
     # Create temporary files for work queue and results
     local work_queue results_file lock_file progress_file
-    work_queue=$(mktemp)
-    results_file=$(mktemp)
-    lock_file=$(mktemp)
-    progress_file=$(mktemp)
+    work_queue=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    results_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    lock_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    progress_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
 
     # Write repos to work queue
     printf '%s\n' "${repos_ref[@]}" > "$work_queue"
@@ -2141,23 +2215,22 @@ cmd_sync() {
         exit 0
     fi
 
+    # Load all repos from config (checks all .txt files in repos.d/)
+    local repos=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && repos+=("$line")
+    done < <(get_all_repos)
+
     # No arguments - check for configured repos
-    local repos_file="$RU_CONFIG_DIR/repos.d/repos.txt"
-    if [[ ! -f "$repos_file" ]] || [[ ! -s "$repos_file" ]] || ! grep -Eqv '^[[:space:]]*#|^[[:space:]]*$' "$repos_file" 2>/dev/null; then
+    if [[ ${#repos[@]} -eq 0 ]]; then
         log_info "No repositories configured yet."
         echo "" >&2
         log_info "To add repos:"
         log_info "  ru add owner/repo              # Add to list"
         log_info "  ru sync owner/repo             # Sync directly (without adding)"
-        log_info "  echo 'owner/repo' >> $repos_file  # Edit file directly"
+        log_info "  echo 'owner/repo' >> $RU_CONFIG_DIR/repos.d/repos.txt  # Edit file directly"
         exit 0
     fi
-
-    # Load all repos from config
-    local repos=()
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && repos+=("$line")
-    done < <(get_all_repos)
 
     local total=${#repos[@]}
     local current=0
@@ -2186,18 +2259,17 @@ cmd_sync() {
                     log_warn "Repository list has changed since last sync"
                 fi
 
-                # Filter out completed repos
+                # Filter out completed repos (use local_path for unique identification)
                 for repo_spec in "${repos[@]}"; do
-                    local url branch custom_name local_path repo_name
+                    local url branch custom_name local_path
                     parse_repo_spec "$repo_spec" url branch custom_name
                     if [[ -n "$custom_name" ]]; then
                         local_path="${PROJECTS_DIR}/${custom_name}"
                     else
                         local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
                     fi
-                    repo_name=$(basename "$local_path")
 
-                    if is_repo_completed "$repo_name"; then
+                    if is_repo_completed "$local_path"; then
                         ((resumed++))
                     else
                         pending_repos+=("$repo_spec")
@@ -2232,19 +2304,18 @@ cmd_sync() {
     }
     trap handle_sync_interrupt INT TERM
 
-    # Initialize pending repos array for state tracking
+    # Initialize pending repos array for state tracking (use local_path for unique ID)
     local pending_names=()
     if [[ ${#pending_repos[@]} -gt 0 ]]; then
         for repo_spec in "${pending_repos[@]}"; do
-            local url branch custom_name local_path repo_name
+            local url branch custom_name local_path
             parse_repo_spec "$repo_spec" url branch custom_name
             if [[ -n "$custom_name" ]]; then
                 local_path="${PROJECTS_DIR}/${custom_name}"
             else
                 local_path=$(url_to_local_path "$url" "$PROJECTS_DIR" "$LAYOUT")
             fi
-            repo_name=$(basename "$local_path")
-            pending_names+=("$repo_name")
+            pending_names+=("$local_path")
         done
 
         # Save initial state
@@ -2382,13 +2453,13 @@ cmd_sync() {
             fi
         fi
 
-        # Update state: mark this repo as completed
-        SYNC_COMPLETED+=("$repo_name")
+        # Update state: mark this repo as completed (use local_path for unique ID)
+        SYNC_COMPLETED+=("$local_path")
         # Remove from pending_names (handle empty array with set -u)
         local new_pending=()
         if [[ ${#pending_names[@]} -gt 0 ]]; then
             for p in "${pending_names[@]}"; do
-                [[ "$p" != "$repo_name" ]] && new_pending+=("$p")
+                [[ "$p" != "$local_path" ]] && new_pending+=("$p")
             done
         fi
         pending_names=()
@@ -3270,10 +3341,9 @@ cmd_self_update() {
 
     # Create temp directory for download
     local temp_dir
-    temp_dir=$(mktemp -d)
-    # Clean up on exit
-    cleanup_temp() { rm -rf "$temp_dir"; }
-    trap cleanup_temp EXIT
+    temp_dir=$(mktemp_dir) || { log_error "Failed to create temp directory"; exit 3; }
+    # Clean up on exit, but preserve global cleanup behavior
+    trap 'rm -rf "$temp_dir"; cleanup' EXIT
 
     # Download URLs
     local release_base="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/download/v$latest_version"
@@ -3348,9 +3418,16 @@ cmd_self_update() {
         exit 1
     fi
 
-    # Get the path to the current script
+    # Get the path to the current script (with fallback for systems without realpath)
     local script_path
-    script_path=$(realpath "${BASH_SOURCE[0]}")
+    if command -v realpath &>/dev/null; then
+        script_path=$(realpath "${BASH_SOURCE[0]}")
+    elif command -v readlink &>/dev/null && readlink -f "${BASH_SOURCE[0]}" &>/dev/null 2>&1; then
+        script_path=$(readlink -f "${BASH_SOURCE[0]}")
+    else
+        # Fallback: use cd/pwd to resolve
+        script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    fi
 
     # Check if we can write to the script location
     if [[ ! -w "$script_path" ]]; then
@@ -3460,7 +3537,7 @@ cmd_prune() {
 
     # Build list of expected paths from config
     local configured_paths
-    configured_paths=$(mktemp)
+    configured_paths=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
     # shellcheck disable=SC2064  # Immediate expansion is intentional - path is already known
     trap "rm -f \"$configured_paths\"" RETURN
 
@@ -3493,7 +3570,7 @@ cmd_prune() {
             continue
         fi
         orphans+=("$repo_path")
-    done < <(/usr/bin/find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null | sort)
+    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth "$depth_limit" -type d -name ".git" -exec dirname {} \; 2>/dev/null | sort)
 
     # Report results
     if [[ ${#orphans[@]} -eq 0 ]]; then
@@ -3607,7 +3684,7 @@ main() {
     resolve_config
 
     # Create results file for this run
-    RESULTS_FILE=$(mktemp)
+    RESULTS_FILE=$(mktemp_file) || { log_error "Failed to create temp file"; exit 3; }
 
     # Dispatch to command
     case "$COMMAND" in
