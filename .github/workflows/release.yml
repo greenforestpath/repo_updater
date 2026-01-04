@@ -29,8 +29,7 @@ jobs:
 
       - name: Generate checksums
         run: |
-          sha256sum ru > ru.sha256
-          sha256sum install.sh > install.sh.sha256
+          sha256sum ru install.sh > checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -38,8 +37,7 @@ jobs:
           files: |
             ru
             install.sh
-            ru.sha256
-            install.sh.sha256
+            checksums.txt
           generate_release_notes: true
           body: |
             ## Installation

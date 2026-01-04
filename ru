@@ -44,8 +44,9 @@
 #   0 - Success (all repos synced or already current)
 #   1 - Partial failure (some repos failed)
 #   2 - Conflicts exist (repos need manual resolution)
-#   3 - Dependency error (gh missing, auth failed)
+#   3 - Dependency/system error (gh missing, auth failed, doctor issues)
 #   4 - Invalid arguments (bad CLI options, missing config)
+#   5 - Interrupted sync detected (use --resume or --restart)
 #
 # REPOSITORY:
 #   https://github.com/Dicklesworthstone/repo_updater
@@ -101,13 +102,12 @@ if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
     GREEN='\033[0;32m'
     YELLOW='\033[0;33m'
     BLUE='\033[0;34m'
-    MAGENTA='\033[0;35m'
     CYAN='\033[0;36m'
     BOLD='\033[1m'
     DIM='\033[2m'
     RESET='\033[0m'
 else
-    RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' BOLD='' DIM='' RESET=''
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' RESET=''
 fi
 
 #==============================================================================
@@ -136,7 +136,6 @@ RESULTS_FILE=""
 # Resume support
 RESUME="false"
 RESTART="false"
-SYNC_STATE_FILE=""
 SYNC_INTERRUPTED="false"
 
 # Gum availability
@@ -168,6 +167,18 @@ ensure_dir() {
     fi
 }
 
+# Escape a string for JSON (handles quotes, backslashes, newlines)
+json_escape() {
+    local str="$1"
+    # Escape backslashes first, then quotes, then newlines
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    str="${str//$'\n'/\\n}"
+    str="${str//$'\r'/\\r}"
+    str="${str//$'\t'/\\t}"
+    echo "$str"
+}
+
 # Write a result to the NDJSON results file
 write_result() {
     local repo_name="$1"
@@ -177,8 +188,11 @@ write_result() {
     local message="${5:-}"
 
     if [[ -n "$RESULTS_FILE" ]]; then
+        # Escape message for JSON safety
+        local safe_message
+        safe_message=$(json_escape "$message")
         printf '{"repo":"%s","action":"%s","status":"%s","duration":%s,"message":"%s","timestamp":"%s"}\n' \
-            "$repo_name" "$action" "$status" "${duration:-0}" "$message" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$repo_name" "$action" "$status" "${duration:-0}" "$safe_message" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             >> "$RESULTS_FILE"
     fi
 }
@@ -336,9 +350,9 @@ EXIT CODES:
     0  Success
     1  Partial failure (some repos failed)
     2  Conflicts exist (need manual resolution)
-    3  Interrupted sync detected (use --resume or --restart)
+    3  Dependency/system error (gh missing, auth failed, doctor issues)
     4  Invalid arguments
-    5  Dependency error (gh missing, auth failed)
+    5  Interrupted sync detected (use --resume or --restart)
 
 More info: https://github.com/Dicklesworthstone/repo_updater
 EOF
@@ -1000,6 +1014,7 @@ get_repo_status() {
 
     # Get ahead/behind counts using plumbing (deterministic, locale-independent)
     local ahead=0 behind=0
+    # shellcheck disable=SC1083  # @{u} is valid git syntax for upstream tracking branch
     read -r ahead behind < <(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null || echo "0 0")
 
     # Determine status based on ahead/behind
@@ -1215,7 +1230,6 @@ load_sync_state() {
     SYNC_RUN_ID=$(echo "$content" | grep -o '"run_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/')
     SYNC_STATUS=$(echo "$content" | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/')
     SYNC_CONFIG_HASH=$(echo "$content" | grep -o '"config_hash"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/')
-    SYNC_RESULTS_FILE=$(echo "$content" | grep -o '"results_file"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/')
 
     # Extract completed array (comma-separated inside brackets)
     local completed_str
@@ -1506,10 +1520,8 @@ cmd_sync() {
     # Resume support: check for interrupted sync
     SYNC_COMPLETED=()
     local pending_repos=()
-    local state_exists="false"
 
     if load_sync_state; then
-        state_exists="true"
         if [[ "$SYNC_STATUS" == "in_progress" ]]; then
             if [[ "$RESTART" == "true" ]]; then
                 # User wants to start fresh
@@ -1553,7 +1565,7 @@ cmd_sync() {
                 log_info "Options:"
                 log_info "  ru sync --resume   # Continue from where you left off"
                 log_info "  ru sync --restart  # Start fresh, discard progress"
-                exit 3
+                exit 5
             fi
         else
             # State exists but completed - start fresh
@@ -1622,7 +1634,7 @@ cmd_sync() {
         fi
         repo_name=$(basename "$local_path")
 
-        log_step "[$current/$total] $repo_name"
+        log_step "[$current/$pending_count] $repo_name"
 
         # Check if repo exists locally
         if [[ ! -d "$local_path" ]]; then
@@ -1918,13 +1930,8 @@ cmd_remove() {
             continue
         fi
 
-        # Create a pattern that matches the repo in various formats
-        # Match: owner/repo, github.com/owner/repo, https://github.com/owner/repo, git@github.com:owner/repo
-        local pattern_short="${owner}/${repo_name}"
-        local pattern_full="github.com/${owner}/${repo_name}"
-        local pattern_ssh="${owner}/${repo_name}.git"
-
-        # Read file, filter out matching lines, write back
+        # Parse each line and compare owner/repo to avoid substring matching issues
+        # (e.g., "owner/repo" should not match "owner/repo-extra")
         local tmp_file="${repos_file}.tmp.$$"
         local found="false"
 
@@ -1935,10 +1942,20 @@ cmd_remove() {
                 continue
             fi
 
-            # Check if this line matches the repo to remove
-            if [[ "$line" == *"$pattern_short"* ]] || \
-               [[ "$line" == *"$pattern_full"* ]] || \
-               [[ "$line" == *"$pattern_ssh"* ]]; then
+            # Parse the line to extract URL and compare owner/repo
+            local line_url line_branch line_custom_name
+            parse_repo_spec "$line" line_url line_branch line_custom_name
+
+            local line_host line_owner line_repo
+            local should_remove="false"
+            if parse_repo_url "$line_url" line_host line_owner line_repo; then
+                # Match if owner and repo name are exactly the same
+                if [[ "$line_owner" == "$owner" && "$line_repo" == "$repo_name" ]]; then
+                    should_remove="true"
+                fi
+            fi
+
+            if [[ "$should_remove" == "true" ]]; then
                 found="true"
                 # Don't add to tmp file (remove it)
             else
