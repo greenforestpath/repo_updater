@@ -4835,7 +4835,7 @@ ntm_is_available() {
         return 1
     fi
     # Verify ntm responds to status query
-    if ! ntm --robot-status &>/dev/null 2>&1; then
+    if ! ntm --robot-status &>/dev/null; then
         return 1
     fi
     return 0
