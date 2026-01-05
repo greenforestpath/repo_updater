@@ -5887,11 +5887,25 @@ start_rate_limit_governor() {
     done
 }
 
-# Start governor in background
+# Synchronous governor update - call before starting new sessions
+# This is the RECOMMENDED approach as it updates GOVERNOR_STATE in the current process.
+# Updates rate limits and adjusts parallelism in one call.
+governor_update() {
+    update_github_rate_limit
+    check_model_rate_limit
+    adjust_parallelism
+}
+
+# Start governor in background (DEPRECATED - see warning below)
+# WARNING: Background subshell cannot update parent GOVERNOR_STATE!
+# The background loop only provides logging; actual state updates require
+# calling governor_update() synchronously before each session start.
 # Args: lock_file (governor stops when this file is removed)
 # Sets: GOVERNOR_STATE[governor_pid]
 start_governor_background() {
     local lock_file="${1:-}"
+
+    log_warn "start_governor_background: Background governor only logs status; call governor_update() for actual state updates"
 
     # Create lock file if path provided
     if [[ -n "$lock_file" ]]; then
@@ -7042,12 +7056,9 @@ summarize_non_interactive_questions() {
     log_file=$(get_skipped_questions_log_file)
 
     if [[ -f "$log_file" ]]; then
-        local count=0
-        if command -v jq &>/dev/null; then
-            count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
-        else
-            count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
-        fi
+        # JSONL format: one entry per line, so wc -l counts entries
+        local count
+        count=$(wc -l < "$log_file" 2>/dev/null | tr -d ' ') || count=0
         if [[ "$count" -gt 0 ]]; then
             log_warn "Review completed with $count skipped question(s)"
             log_info "Skipped questions logged to: $log_file"

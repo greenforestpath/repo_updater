@@ -36,6 +36,7 @@ source_ru_function "get_target_parallelism"
 source_ru_function "adjust_parallelism"
 source_ru_function "can_start_new_session"
 source_ru_function "governor_record_error"
+source_ru_function "governor_update"
 
 # get_governor_status has a heredoc that doesn't source well - define inline
 get_governor_status() {
@@ -277,6 +278,27 @@ test_get_governor_status_json() {
     log_test_pass "$test_name"
 }
 
+test_governor_update_syncs_state() {
+    local test_name="governor_update: updates state synchronously"
+    log_test_start "$test_name"
+
+    reset_governor_state
+    GOVERNOR_STATE[github_remaining]=800
+    GOVERNOR_STATE[model_in_backoff]="false"
+
+    # Mock update_github_rate_limit to not actually call API
+    update_github_rate_limit() { :; }
+    check_model_rate_limit() { :; }
+
+    # governor_update should call adjust_parallelism
+    governor_update
+
+    # With github_remaining=800, effective should be halved (4/2=2)
+    assert_equals "2" "${GOVERNOR_STATE[effective_parallelism]}" "governor_update adjusts parallelism"
+
+    log_test_pass "$test_name"
+}
+
 run_test test_get_target_parallelism_default
 run_test test_get_target_parallelism_override
 run_test test_adjust_parallelism_normal
@@ -290,6 +312,7 @@ run_test test_can_start_session_model_backoff
 run_test test_governor_record_error_increments
 run_test test_circuit_breaker_triggers
 run_test test_get_governor_status_json
+run_test test_governor_update_syncs_state
 
 print_results
 exit $?
