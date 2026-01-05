@@ -250,8 +250,9 @@ _make_minimal_path_bin_without_drivers() {
     # rm: State file cleanup
     # printf: Output formatting
     # ln: Various symlink operations
+    # kill/sleep/rmdir: portable directory-locking (stale lock detection + release)
     local -a cmds=(
-        awk basename cat cut date dirname grep head jq ln mkdir mktemp
+        awk basename cat cut date dirname grep head jq kill ln mkdir mktemp rmdir sleep
         printf pwd rm sed sort tr uniq wc
     )
 
