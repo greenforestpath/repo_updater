@@ -51,6 +51,7 @@ TF_TESTS_SKIPPED=0
 TF_ASSERTIONS_PASSED=0
 TF_ASSERTIONS_FAILED=0
 TF_CURRENT_TEST=""
+TF_TEST_WAS_SKIPPED="false"  # Flag for skip_test to communicate with run_test
 
 # Temp directory management
 TF_TEMP_DIRS=()
@@ -448,6 +449,7 @@ _json_git_state() {
     if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
         local branch commit dirty
         branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "detached")
+        branch=$(_json_escape "$branch")
         commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
         dirty="false"
         if ! git diff --quiet 2>/dev/null; then
@@ -517,6 +519,10 @@ _json_log() {
     if [[ -n "$TF_JSON_SUITE_NAME" ]]; then
         json+=",\"suite_name\":\"$TF_JSON_SUITE_NAME\""
     fi
+    # Add custom test context if set (not empty object)
+    if [[ -n "$TF_JSON_TEST_CONTEXT" && "$TF_JSON_TEST_CONTEXT" != "{}" ]]; then
+        json+=",\"context\":$TF_JSON_TEST_CONTEXT"
+    fi
 
     # Add key-value pairs
     while [[ $# -ge 2 ]]; do
@@ -580,9 +586,9 @@ log_suite_end_json() {
 }
 
 # Log test start (JSON)
-# Usage: log_test_start_json "test_name"
+# Usage: log_test_start_json
+# Note: test_name is automatically included via TF_CURRENT_TEST in _json_log
 log_test_start_json() {
-    local test_name="$1"
     _json_log "test_start" \
         "phase" "execute"
 }
@@ -1087,6 +1093,7 @@ run_test() {
     local test_start_us elapsed_us elapsed_ms
 
     TF_CURRENT_TEST="$test_name"
+    TF_TEST_WAS_SKIPPED="false"  # Reset skip flag
     test_start_us=$(_json_timestamp_us)
 
     if ! is_tap_mode; then
@@ -1095,14 +1102,18 @@ run_test() {
         echo "----------------------------------------"
     fi
 
-    # JSON: log test start
-    log_test_start_json "$test_name"
+    # JSON: log test start (test_name comes from TF_CURRENT_TEST)
+    log_test_start_json
 
     # Run the test
     if "$test_name"; then
-        elapsed_us=$(_json_elapsed_us "$test_start_us")
-        elapsed_ms=$((elapsed_us / 1000))
-        if [[ $TF_ASSERTIONS_FAILED -eq $failed_before ]]; then
+        # Check if test was skipped (skip_test was called)
+        if [[ "$TF_TEST_WAS_SKIPPED" == "true" ]]; then
+            # Skip already handled by skip_test - don't double-count
+            :
+        elif [[ $TF_ASSERTIONS_FAILED -eq $failed_before ]]; then
+            elapsed_us=$(_json_elapsed_us "$test_start_us")
+            elapsed_ms=$((elapsed_us / 1000))
             ((TF_TESTS_PASSED++))
             if is_tap_mode; then
                 _tap_ok "$test_name"
@@ -1112,6 +1123,8 @@ run_test() {
             # JSON: log test pass
             log_test_result_json "pass" "$elapsed_ms"
         else
+            elapsed_us=$(_json_elapsed_us "$test_start_us")
+            elapsed_ms=$((elapsed_us / 1000))
             ((TF_TESTS_FAILED++))
             if is_tap_mode; then
                 _tap_not_ok "$test_name" "assertions failed"
@@ -1135,6 +1148,7 @@ run_test() {
     fi
 
     TF_CURRENT_TEST=""
+    TF_TEST_WAS_SKIPPED="false"
     clear_test_context
 }
 
@@ -1143,11 +1157,14 @@ run_test() {
 skip_test() {
     local reason="${1:-}"
     ((TF_TESTS_SKIPPED++))
+    TF_TEST_WAS_SKIPPED="true"  # Signal to run_test that test was skipped
     if is_tap_mode; then
         _tap_skip "$TF_CURRENT_TEST" "$reason"
     else
         echo "${TF_YELLOW}SKIP${TF_RESET}: $TF_CURRENT_TEST${reason:+ ($reason)}"
     fi
+    # JSON: log test skip
+    log_test_result_json "skip" "0" "$reason"
     return 0
 }
 
