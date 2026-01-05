@@ -18,6 +18,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/test_framework.sh"
 
 # Source helper functions from ru
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_var"
 source_ru_function "is_git_repo"
 source_ru_function "ensure_dir"
 source_ru_function "get_worktrees_dir"

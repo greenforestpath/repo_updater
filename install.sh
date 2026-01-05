@@ -365,33 +365,6 @@ get_latest_release() {
         fi
     fi
 
-    if [[ "$api_rc" -ne 0 ]]; then
-        # Try a non-API method before failing (avoids API rate limits / weird proxies).
-        local redirect_version=""
-        if redirect_version=$(get_latest_release_from_redirect); then
-            log_warn "GitHub API unavailable; detected latest release via redirect."
-            printf '%s\n' "$redirect_version"
-            return 0
-        fi
-
-        local redirect_rc=$?
-        if [[ "$redirect_rc" -eq 1 ]]; then
-            return 1
-        fi
-
-        local msg
-        msg=$(extract_json_string_field "$response" "message")
-        if [[ -n "$msg" ]]; then
-            log_error "GitHub API error while fetching latest release: $msg"
-        elif printf '%s\n' "$response" | grep -qi "rate limit"; then
-            log_error "GitHub API rate limit exceeded while fetching latest release."
-        else
-            log_error "Failed to fetch latest release from GitHub."
-        fi
-        log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
-        return 2
-    fi
-
     # Extract tag_name from JSON (simple approach for portability)
     local version=""
     if command_exists jq; then

@@ -11,6 +11,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/test_framework.sh"
 
+source_ru_function "_is_valid_var_name"
+source_ru_function "_set_out_var"
+source_ru_function "_set_out_array"
 source_ru_function "json_escape"
 source_ru_function "retry_with_backoff"
 source_ru_function "log_error"

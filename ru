@@ -274,7 +274,10 @@ _set_out_array() {
     _is_valid_var_name "$out_name" || return 1
 
     local -a tmp=("$@")
-    # Use eval to assign into the caller scope without Bash 4.3+ namerefs.
+    # Use eval to assign into the caller scope.
+    # Note: This works when called from the main script but NOT when the
+    # caller has a local array variable (eval creates a new variable).
+    # For functions using nameref (local -n), this is not needed.
     eval "$out_name=(\"\${tmp[@]}\")"
 }
 
@@ -1135,7 +1138,10 @@ parse_repo_url() {
     local owner_var="$3"
     local repo_var="$4"
 
-    local host="" owner="" repo=""
+    # Use _out_ prefix to avoid shadowing caller's output variable names.
+    # Without this, if caller passes "host" as host_var, `local host=""` shadows
+    # it and `printf -v host` sets the local instead of caller's variable.
+    local _out_host="" _out_owner="" _out_repo=""
 
     # Normalize: strip .git suffix and trailing slashes
     url="${url%.git}"
@@ -1145,46 +1151,46 @@ parse_repo_url() {
 
     # SSH scp-like format: git@host:owner/repo (repo must not contain /)
     if [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/]+)$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        owner="${BASH_REMATCH[2]}"
-        repo="${BASH_REMATCH[3]}"
+        _out_host="${BASH_REMATCH[1]}"
+        _out_owner="${BASH_REMATCH[2]}"
+        _out_repo="${BASH_REMATCH[3]}"
         matched="true"
     # SSH URL format: ssh://git@host/owner/repo (optional user part)
     elif [[ "$url" =~ ^ssh://([^@/]+@)?([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        host="${BASH_REMATCH[2]}"
-        owner="${BASH_REMATCH[3]}"
-        repo="${BASH_REMATCH[4]}"
+        _out_host="${BASH_REMATCH[2]}"
+        _out_owner="${BASH_REMATCH[3]}"
+        _out_repo="${BASH_REMATCH[4]}"
         matched="true"
     # HTTPS format: https://host/owner/repo (optional user@ for auth)
     elif [[ "$url" =~ ^https?://([^@/]+@)?([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        host="${BASH_REMATCH[2]}"
-        owner="${BASH_REMATCH[3]}"
-        repo="${BASH_REMATCH[4]}"
+        _out_host="${BASH_REMATCH[2]}"
+        _out_owner="${BASH_REMATCH[3]}"
+        _out_repo="${BASH_REMATCH[4]}"
         matched="true"
     # Host/owner/repo format (no protocol): github.com/owner/repo
     elif [[ "$url" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        owner="${BASH_REMATCH[2]}"
-        repo="${BASH_REMATCH[3]}"
+        _out_host="${BASH_REMATCH[1]}"
+        _out_owner="${BASH_REMATCH[2]}"
+        _out_repo="${BASH_REMATCH[3]}"
         matched="true"
     # Shorthand: owner/repo (assumes github.com)
     elif [[ "$url" =~ ^([^/]+)/([^/]+)$ ]]; then
-        host="github.com"
-        owner="${BASH_REMATCH[1]}"
-        repo="${BASH_REMATCH[2]}"
+        _out_host="github.com"
+        _out_owner="${BASH_REMATCH[1]}"
+        _out_repo="${BASH_REMATCH[2]}"
         matched="true"
     fi
 
     # Validate parsed components for path safety
     if [[ "$matched" == "true" ]]; then
         # Strip optional :port from host (avoid filesystem-unfriendly ':' in full layout)
-        host="${host%%:*}"
-        if ! _is_safe_path_segment "$owner" || ! _is_safe_path_segment "$repo"; then
+        _out_host="${_out_host%%:*}"
+        if ! _is_safe_path_segment "$_out_owner" || ! _is_safe_path_segment "$_out_repo"; then
             return 1
         fi
-        _set_out_var "$host_var" "$host" || return 1
-        _set_out_var "$owner_var" "$owner" || return 1
-        _set_out_var "$repo_var" "$repo" || return 1
+        _set_out_var "$host_var" "$_out_host" || return 1
+        _set_out_var "$owner_var" "$_out_owner" || return 1
+        _set_out_var "$repo_var" "$_out_repo" || return 1
         return 0
     fi
 
@@ -1330,41 +1336,42 @@ parse_repo_spec() {
     local branch_var="$3"
     local local_name_var="$4"
 
-    local url="" branch="" local_name=""
+    # Use _out_ prefix to avoid shadowing caller's output variable names.
+    local _out_url="" _out_branch="" _out_local_name=""
 
     # Extract 'as <name>' if present (must be last)
     if [[ "$spec" =~ ^(.+)[[:space:]]+as[[:space:]]+([^[:space:]]+)$ ]]; then
         spec="${BASH_REMATCH[1]}"
         # Trim trailing whitespace from spec (greedy .+ may capture trailing spaces)
         spec="${spec%"${spec##*[![:space:]]}"}"
-        local_name="${BASH_REMATCH[2]}"
+        _out_local_name="${BASH_REMATCH[2]}"
     else
-        local_name=""
+        _out_local_name=""
     fi
 
     # Default: no branch
-    url="$spec"
-    branch=""
+    _out_url="$spec"
+    _out_branch=""
 
     # Extract '@branch' by splitting on the LAST '@' and only accepting it if the
     # left side is a valid repo URL. This avoids mis-parsing ssh://git@host/... forms
     # while still supporting branch names with / like feature/foo
     if [[ "$spec" == *"@"* ]]; then
-        local maybe_url maybe_branch host owner repo
+        local maybe_url maybe_branch _tmp_host _tmp_owner _tmp_repo
         maybe_url="${spec%@*}"
         maybe_branch="${spec##*@}"
         # Only accept as branch if: left side parses as URL, branch is non-empty and has no spaces
         if [[ -n "$maybe_url" && -n "$maybe_branch" && "$maybe_branch" != *[[:space:]]* ]]; then
-            if parse_repo_url "$maybe_url" host owner repo; then
-                url="$maybe_url"
-                branch="$maybe_branch"
+            if parse_repo_url "$maybe_url" _tmp_host _tmp_owner _tmp_repo; then
+                _out_url="$maybe_url"
+                _out_branch="$maybe_branch"
             fi
         fi
     fi
 
-    _set_out_var "$url_var" "$url" || return 1
-    _set_out_var "$branch_var" "$branch" || return 1
-    _set_out_var "$local_name_var" "$local_name" || return 1
+    _set_out_var "$url_var" "$_out_url" || return 1
+    _set_out_var "$branch_var" "$_out_branch" || return 1
+    _set_out_var "$local_name_var" "$_out_local_name" || return 1
 }
 
 # Resolve a repo spec into validated parts and a local path
@@ -1885,10 +1892,13 @@ save_sync_state() {
     _is_valid_var_name "$completed_name" || return 1
     _is_valid_var_name "$pending_name" || return 1
 
-    local -a completed=()
-    local -a pending=()
-    eval "completed=(\"\${${completed_name}[@]-}\")"
-    eval "pending=(\"\${${pending_name}[@]-}\")"
+    # Use _arr_ prefix to avoid shadowing caller's variable names.
+    # If caller passes "completed" as completed_name, `local completed=()` would
+    # shadow it and eval would expand the empty local instead of caller's array.
+    local -a _arr_completed=()
+    local -a _arr_pending=()
+    eval "_arr_completed=(\"\${${completed_name}[@]-}\")"
+    eval "_arr_pending=(\"\${${pending_name}[@]-}\")"
 
     local state_file
     state_file=$(get_sync_state_file)
@@ -1904,8 +1914,8 @@ save_sync_state() {
 
     # Build completed array JSON (handle empty array with set -u)
     local completed_json=""
-    if [[ ${#completed[@]} -gt 0 ]]; then
-        for item in "${completed[@]}"; do
+    if [[ ${#_arr_completed[@]} -gt 0 ]]; then
+        for item in "${_arr_completed[@]}"; do
             [[ -n "$completed_json" ]] && completed_json+=","
             completed_json+="\"$(json_escape "$item")\""
         done
@@ -1913,8 +1923,8 @@ save_sync_state() {
 
     # Build pending array JSON (handle empty array with set -u)
     local pending_json=""
-    if [[ ${#pending[@]} -gt 0 ]]; then
-        for item in "${pending[@]}"; do
+    if [[ ${#_arr_pending[@]} -gt 0 ]]; then
+        for item in "${_arr_pending[@]}"; do
             [[ -n "$pending_json" ]] && pending_json+=","
             pending_json+="\"$(json_escape "$item")\""
         done
@@ -9345,10 +9355,11 @@ get_worktree_mapping() {
     local wt_path_var="$3"
 
     # Extract repo_id from work item (first field before |)
-    local repo_id="${work_item%%|*}"
-    _set_out_var "$repo_id_var" "$repo_id" || return 1
+    # Use _gwm_ prefix to avoid shadowing caller's output variable names.
+    local _gwm_repo_id="${work_item%%|*}"
+    _set_out_var "$repo_id_var" "$_gwm_repo_id" || return 1
 
-    get_worktree_path "$repo_id" "$wt_path_var"
+    get_worktree_path "$_gwm_repo_id" "$wt_path_var"
 }
 
 # Prepare worktrees for review
@@ -9845,15 +9856,11 @@ repo_spec_to_github_id() {
 # Discover work items from GitHub using GraphQL batching
 # Args: result_array_name, priority_filter, max_repos, allowed_repo_ids(optional)
 discover_work_items() {
-    local out_array_name="$1"
+    local -n _items_ref=$1
     # shellcheck disable=SC2034  # Used in bd-5jph (priority scoring)
     local priority_filter="$2"
     local max_repos="$3"
     local allowed_repos="${4:-}"
-
-    # Initialize output array to empty immediately to avoid "unbound variable"
-    # errors if we return early (set -u mode). Must do this before any returns.
-    _set_out_array "$out_array_name" || return 1
 
     local -A allowed_repo_map=()
     if [[ -n "$allowed_repos" ]]; then
@@ -9863,7 +9870,7 @@ discover_work_items() {
         done
     fi
 
-    local -a items=()
+    _items_ref=()
 
     # Check for jq (required for parsing)
     if ! command -v jq &>/dev/null; then
@@ -9955,16 +9962,15 @@ discover_work_items() {
         title="${title//|/ }"
         labels="${labels//|/ }"
         # Convert TSV to pipe-separated for easier parsing later
-        items+=("${repo_id}|${item_type}|${number}|${title}|${labels}|${created_at}|${updated_at}|${is_draft}")
+        _items_ref+=("${repo_id}|${item_type}|${number}|${title}|${labels}|${created_at}|${updated_at}|${is_draft}")
     done <<< "$all_work_items"
 
     # Apply max_repos limit if specified
-    if [[ -n "$max_repos" ]] && [[ ${#items[@]} -gt $max_repos ]]; then
-        items=("${items[@]:0:$max_repos}")
+    if [[ -n "$max_repos" ]] && [[ ${#_items_ref[@]} -gt $max_repos ]]; then
+        _items_ref=("${_items_ref[@]:0:$max_repos}")
     fi
 
-    _set_out_array "$out_array_name" "${items[@]}" || return 1
-    log_verbose "Discovered ${#items[@]} work item(s)"
+    log_verbose "Discovered ${#_items_ref[@]} work item(s)"
 }
 
 #------------------------------------------------------------------------------
