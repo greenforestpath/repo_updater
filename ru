@@ -1895,10 +1895,15 @@ save_sync_state() {
     # Use _arr_ prefix to avoid shadowing caller's variable names.
     # If caller passes "completed" as completed_name, `local completed=()` would
     # shadow it and eval would expand the empty local instead of caller's array.
+    # Note: We check array length first because "${arr[@]}" creates one empty
+    # element when arr is empty (the quotes preserve an empty expansion).
     local -a _arr_completed=()
     local -a _arr_pending=()
-    eval "_arr_completed=(\"\${${completed_name}[@]-}\")"
-    eval "_arr_pending=(\"\${${pending_name}[@]-}\")"
+    local _len
+    eval "_len=\${#${completed_name}[@]}"
+    [[ $_len -gt 0 ]] && eval "_arr_completed=(\"\${${completed_name}[@]}\")"
+    eval "_len=\${#${pending_name}[@]}"
+    [[ $_len -gt 0 ]] && eval "_arr_pending=(\"\${${pending_name}[@]}\")"
 
     local state_file
     state_file=$(get_sync_state_file)
@@ -1930,16 +1935,19 @@ save_sync_state() {
         done
     fi
 
-    cat > "$tmp_file" <<EOF
-{
-  "run_id": "$run_id",
-  "status": "$status",
-  "config_hash": "$config_hash",
-  "results_file": "${RESULTS_FILE:-}",
-  "completed": [$completed_json],
-  "pending": [$pending_json]
-}
-EOF
+    # Write JSON to temp file (uses hex escapes for braces to avoid breaking
+    # awk-based function extraction in test files that count brace depth)
+    local _ob=$'\x7b' _cb=$'\x7d'  # { and } as hex escapes
+    (
+        echo "${_ob}"
+        echo "  \"run_id\": \"$run_id\","
+        echo "  \"status\": \"$status\","
+        echo "  \"config_hash\": \"$config_hash\","
+        echo "  \"results_file\": \"${RESULTS_FILE:-}\","
+        echo "  \"completed\": [$completed_json],"
+        echo "  \"pending\": [$pending_json]"
+        echo "${_cb}"
+    ) > "$tmp_file"
 
     # Atomic rename
     mv "$tmp_file" "$state_file"
