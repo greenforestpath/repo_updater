@@ -1198,6 +1198,167 @@ get_exit_code() {
 }
 
 #==============================================================================
+# Parallel Test Execution
+#==============================================================================
+# Run multiple tests in parallel with proper isolation.
+# Uses namespaced temp directories and aggregates results.
+
+# Run tests in parallel
+# Usage: run_parallel_tests [--jobs N] test_func1 test_func2 ...
+# Returns aggregated results in TF_TESTS_PASSED/FAILED/SKIPPED
+run_parallel_tests() {
+    local max_jobs=""
+    local tests=()
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --jobs|-j)
+                max_jobs="$2"
+                shift 2
+                ;;
+            -j[0-9]*)
+                max_jobs="${1#-j}"
+                shift
+                ;;
+            *)
+                tests+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#tests[@]} -eq 0 ]]; then
+        log_warn "run_parallel_tests: No tests provided"
+        return 0
+    fi
+
+    # Default to 4 jobs or nproc
+    max_jobs="${max_jobs:-$(nproc 2>/dev/null || echo 4)}"
+
+    local tmpdir
+    tmpdir=$(mktemp -d "/tmp/tf-parallel-XXXXXX")
+    TF_TEMP_DIRS+=("$tmpdir")
+
+    local pids=()
+    local running_jobs=0
+    local test_num=0
+
+    log_info "Running ${#tests[@]} tests in parallel (max $max_jobs jobs)..."
+
+    # Cleanup trap
+    local old_trap
+    old_trap=$(trap -p INT TERM)
+    # shellcheck disable=SC2317  # Function is invoked via trap
+    _tf_parallel_cleanup() {
+        log_warn "Parallel execution interrupted - cleaning up..."
+        for pid in "${pids[@]}"; do
+            kill "$pid" 2>/dev/null || true
+        done
+        rm -rf "$tmpdir"
+    }
+    trap _tf_parallel_cleanup INT TERM
+
+    # Launch tests with throttling
+    for test_name in "${tests[@]}"; do
+        ((test_num++))
+        local result_file="$tmpdir/result_$test_num"
+        local test_tmpdir="$tmpdir/test_$test_num"
+
+        # Wait if we've hit the job limit
+        while [[ $running_jobs -ge $max_jobs ]]; do
+            wait -n 2>/dev/null || true
+            running_jobs=$(jobs -r | wc -l)
+        done
+
+        # Run test in subshell with isolated env
+        # shellcheck disable=SC2030  # Variable modifications intentionally local to subshell
+        (
+            # Set up isolated temp directory for this test
+            TF_TEMP_DIRS=()
+            TF_CURRENT_TEST="$test_name"
+            mkdir -p "$test_tmpdir"
+            cd "$test_tmpdir" || exit 1
+
+            # Reset counters for this test
+            local passed_before=$TF_ASSERTIONS_PASSED
+            local failed_before=$TF_ASSERTIONS_FAILED
+            local test_result="pass"
+            local exit_code=0
+
+            # Run the test function
+            if ! "$test_name"; then
+                test_result="fail"
+                exit_code=1
+            elif [[ $TF_ASSERTIONS_FAILED -gt $failed_before ]]; then
+                test_result="fail"
+                exit_code=1
+            fi
+
+            # Write result to file
+            printf '%s|%d|%d|%d|%d\n' \
+                "$test_result" \
+                "$exit_code" \
+                "$((TF_ASSERTIONS_PASSED - passed_before))" \
+                "$((TF_ASSERTIONS_FAILED - failed_before))" \
+                0 > "$result_file"
+
+            exit "$exit_code"
+        ) &
+        pids+=($!)
+        ((running_jobs++))
+    done
+
+    # Wait for all jobs
+    local any_failed=0
+    for pid in "${pids[@]}"; do
+        if ! wait "$pid" 2>/dev/null; then
+            any_failed=1
+        fi
+    done
+
+    # Restore trap
+    eval "$old_trap"
+
+    # Aggregate results
+    local total_passed=0 total_failed=0 total_assertions_passed=0 total_assertions_failed=0
+    test_num=0
+    for test_name in "${tests[@]}"; do
+        ((test_num++))
+        local result_file="$tmpdir/result_$test_num"
+        if [[ -f "$result_file" ]]; then
+            local result exit_code assertions_passed assertions_failed skipped
+            IFS='|' read -r result exit_code assertions_passed assertions_failed skipped < "$result_file"
+            if [[ "$result" == "pass" ]]; then
+                ((total_passed++))
+                echo "${TF_GREEN}PASS${TF_RESET}: $test_name (parallel)"
+            else
+                ((total_failed++))
+                echo "${TF_RED}FAIL${TF_RESET}: $test_name (parallel)"
+            fi
+            ((total_assertions_passed += assertions_passed))
+            ((total_assertions_failed += assertions_failed))
+        else
+            ((total_failed++))
+            echo "${TF_RED}FAIL${TF_RESET}: $test_name (no result file)"
+        fi
+    done
+
+    # Update global counters
+    ((TF_TESTS_PASSED += total_passed))
+    ((TF_TESTS_FAILED += total_failed))
+    ((TF_ASSERTIONS_PASSED += total_assertions_passed))
+    ((TF_ASSERTIONS_FAILED += total_assertions_failed))
+
+    log_info "Parallel execution complete: $total_passed passed, $total_failed failed"
+
+    # Cleanup temp dir
+    rm -rf "$tmpdir"
+
+    return $any_failed
+}
+
+#==============================================================================
 # Utility Functions for ru Tests
 #==============================================================================
 
@@ -1533,7 +1694,7 @@ export -f log_debug log_info log_warn log_error
 export -f log_test_start log_test_pass log_test_fail log_test_skip log_suite_start
 export -f init_log_file set_log_level
 export -f create_temp_dir cleanup_temp_dirs reset_test_env create_test_env get_test_env_root setup_cleanup_trap
-export -f run_test skip_test print_results get_exit_code
+export -f run_test skip_test print_results get_exit_code run_parallel_tests
 export -f enable_tap_output disable_tap_output is_tap_mode tap_plan tap_version tap_diag
 export -f _tap_ok _tap_not_ok _tap_skip _tap_todo _tap_summary
 export -f get_project_dir source_ru_function
