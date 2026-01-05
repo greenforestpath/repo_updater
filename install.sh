@@ -146,24 +146,64 @@ in_path() {
 }
 
 # Get latest release version from GitHub
+# Returns:
+#   0 with version on stdout - success
+#   1 - no releases exist (caller should fall back to main)
+#   2 - API error (rate limit, network, etc.)
 get_latest_release() {
     local url="$GITHUB_API/repos/$REPO_OWNER/$REPO_NAME/releases/latest"
-    local response
+    local response http_code
 
     if command_exists curl; then
-        response=$(curl -sS "$url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            return 1
+        # Capture both response body and HTTP status code
+        response=$(curl -sS -w '\n%{http_code}' "$url" 2>/dev/null) || {
+            log_error "Failed to connect to GitHub API"
+            return 2
         }
+        http_code=$(echo "$response" | tail -1)
+        response=$(echo "$response" | sed '$d')
     elif command_exists wget; then
-        response=$(wget -qO- "$url" 2>/dev/null) || {
-            log_error "Failed to fetch latest release from GitHub"
-            return 1
-        }
+        response=$(wget -qO- "$url" 2>/dev/null)
+        local wget_exit=$?
+        if [[ $wget_exit -ne 0 ]]; then
+            # wget returns 8 for server errors (4xx/5xx)
+            if [[ $wget_exit -eq 8 ]]; then
+                # Try to detect if it's a 404 by checking response content
+                if echo "$response" | grep -q '"message"[[:space:]]*:[[:space:]]*"Not Found"'; then
+                    return 1
+                fi
+            fi
+            log_error "Failed to connect to GitHub API"
+            return 2
+        fi
+        http_code="200"
     else
         log_error "Neither curl nor wget found. Please install one of them."
-        return 1
+        return 2
     fi
+
+    # Handle HTTP status codes
+    case "$http_code" in
+        200)
+            ;;
+        404)
+            # No releases exist - caller should fall back to main
+            return 1
+            ;;
+        403)
+            # Rate limited or forbidden
+            if echo "$response" | grep -qi "rate limit"; then
+                log_error "GitHub API rate limit exceeded. Try again later or set RU_UNSAFE_MAIN=1 to install from main branch."
+            else
+                log_error "GitHub API access forbidden (403). Check your network or try RU_UNSAFE_MAIN=1."
+            fi
+            return 2
+            ;;
+        *)
+            log_error "GitHub API returned HTTP $http_code"
+            return 2
+            ;;
+    esac
 
     # Extract tag_name from JSON (simple grep approach for portability)
     local version
@@ -171,17 +211,27 @@ get_latest_release() {
 
     if [[ -z "$version" ]]; then
         log_error "Could not parse version from GitHub API response"
-        return 1
+        return 2
     fi
 
     # Remove 'v' prefix if present
     echo "${version#v}"
 }
 
-# Download a file
+# Download a file with cache-busting
+# Adds a timestamp query parameter to bypass CDN/proxy caches
 download_file() {
     local url="$1"
     local dest="$2"
+    local cache_bust
+
+    # Add cache-busting query parameter
+    cache_bust=$(date +%s 2>/dev/null || echo "$$")
+    if [[ "$url" == *"?"* ]]; then
+        url="${url}&_cb=${cache_bust}"
+    else
+        url="${url}?_cb=${cache_bust}"
+    fi
 
     if command_exists curl; then
         curl -fsSL "$url" -o "$dest"
@@ -401,22 +451,44 @@ main() {
 
     # Determine version and installation source
     if [[ -n "${RU_UNSAFE_MAIN:-}" ]] && [[ "$RU_UNSAFE_MAIN" == "1" ]]; then
-        # Install from main branch
+        # Install from main branch (explicit request)
         log_info "Installing from main branch (RU_UNSAFE_MAIN=1)"
         install_from_main "$install_dir" || exit 1
     else
         # Install from release
         local version
+        local get_release_exit=0
         if [[ -n "${RU_VERSION:-}" ]]; then
             version="$RU_VERSION"
             log_info "Installing version: $version"
         else
             log_step "Fetching latest release version..."
-            version=$(get_latest_release) || exit 1
-            log_info "Latest version: $version"
+            version=$(get_latest_release) || get_release_exit=$?
+
+            case $get_release_exit in
+                0)
+                    log_info "Latest version: $version"
+                    ;;
+                1)
+                    # No releases exist - fall back to main branch with warning
+                    log_warn "No releases found for this repository."
+                    log_warn "Falling back to installation from main branch."
+                    log_warn "This is equivalent to RU_UNSAFE_MAIN=1."
+                    printf '\n' >&2
+                    install_from_main "$install_dir" || exit 1
+                    version=""  # Skip release installation below
+                    ;;
+                *)
+                    # API error - already logged by get_latest_release
+                    exit 1
+                    ;;
+            esac
         fi
 
-        install_from_release "$version" "$install_dir" || exit 1
+        # Install from release (if we have a version)
+        if [[ -n "$version" ]]; then
+            install_from_release "$version" "$install_dir" || exit 1
+        fi
     fi
 
     # Check PATH and offer to add if needed
