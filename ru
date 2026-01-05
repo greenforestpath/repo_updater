@@ -10310,7 +10310,7 @@ show_discovery_summary_gum() {
     [[ $high -gt 0 ]] && gum style --foreground "#fab387" "  HIGH: $high" >&2
     [[ $normal -gt 0 ]] && gum style --foreground "#f9e2af" "  NORMAL: $normal" >&2
     [[ $low -gt 0 ]] && gum style --foreground "#6c7086" "  LOW: $low" >&2
-    echo "" >&2
+    printf '\n' >&2
 
     if [[ ${#items[@]} -gt 0 ]]; then
         local display_count=$max_display
@@ -10336,11 +10336,11 @@ show_discovery_summary_gum() {
             local short_title="${title:0:45}"
             [[ ${#title} -gt 45 ]] && short_title="${short_title}..."
 
-            echo -n "  $i. " >&2
+            printf '  %d. ' "$i" >&2
             gum style --foreground "$badge_color" --inline "[$level]" >&2
-            echo " ${repo_id}#${number}: $short_title" >&2
+            printf ' %s#%s: %s\n' "$repo_id" "$number" "$short_title" >&2
         done
-        echo "" >&2
+        printf '\n' >&2
     fi
 }
 
