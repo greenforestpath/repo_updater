@@ -27,8 +27,7 @@
 <p align="center">
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
-# You can omit the `?ru_cb=...` once installed; it's just a cache-buster for the installer fetch.
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
 ```
 
 </p>
@@ -252,12 +251,7 @@ Keep your projects directory clean:
 
 **One-liner (recommended):**
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
-```
-
-**If you suspect CDN caching (stale installer):**
-```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
 ```
 
 <details>
@@ -1316,7 +1310,6 @@ scripts/
 ├── test_unit_config.sh       # Configuration handling
 ├── test_unit_gum_wrappers.sh # Gum fallback behavior
 ├── test_e2e_init.sh          # Init workflow
-├── test_e2e_review.sh         # Review discovery workflow
 ├── test_e2e_add.sh           # Add command
 ├── test_e2e_sync.sh          # Sync workflow
 ├── test_e2e_status.sh        # Status command
