@@ -120,7 +120,7 @@ fi
 #==============================================================================
 
 # Version: read from VERSION file, fallback to embedded
-VERSION="1.0.0"
+VERSION="1.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
     VERSION="$(cat "$SCRIPT_DIR/VERSION")"
@@ -3306,8 +3306,8 @@ cmd_import() {
             line="${line#"${line%%[![:space:]]*}"}"
             line="${line%"${line##*[![:space:]]}"}"
 
-            local ex_url ex_branch ex_name ex_host ex_owner ex_repo
             # shellcheck disable=SC2034 # Variables set by nameref
+            local ex_url ex_branch ex_name ex_host ex_owner ex_repo
             parse_repo_spec "$line" ex_url ex_branch ex_name
             if parse_repo_url "$ex_url" ex_host ex_owner ex_repo; then
                 # Store canonical ID: host/owner/repo
