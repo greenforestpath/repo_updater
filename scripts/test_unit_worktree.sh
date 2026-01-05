@@ -20,6 +20,8 @@ source "$SCRIPT_DIR/test_framework.sh"
 # Source helper functions from ru
 source_ru_function "_is_valid_var_name"
 source_ru_function "_set_out_var"
+source_ru_function "_is_safe_path_segment"
+source_ru_function "_is_path_under_base"
 source_ru_function "is_git_repo"
 source_ru_function "ensure_dir"
 source_ru_function "get_worktrees_dir"
@@ -30,6 +32,7 @@ source_ru_function "get_worktree_mapping"
 source_ru_function "list_review_worktrees"
 source_ru_function "worktree_exists"
 source_ru_function "get_main_repo_path_from_worktree"
+source_ru_function "cleanup_review_worktrees"
 
 # Mock log functions for testing
 log_warn() { :; }
@@ -324,6 +327,29 @@ test_get_main_repo_path_from_worktree_multiple_worktrees() {
     log_test_pass "$test_name"
 }
 
+test_cleanup_review_worktrees_refuses_outside_mapping_paths() {
+    local test_name="cleanup_review_worktrees: refuses to rm -rf outside base when mapping.json is corrupt"
+    log_test_start "$test_name"
+    setup_worktree_test
+
+    local base
+    base=$(get_worktrees_dir)
+    mkdir -p "$base"
+
+    local outside="$TEST_DIR/outside-target"
+    mkdir -p "$outside"
+
+    # Seed a corrupt mapping.json that points outside the run directory.
+    cat > "$base/mapping.json" <<EOF
+{"owner/repo":{"path":"$outside","branch":"branch","created_at":"2026-01-01T00:00:00Z"}}
+EOF
+
+    cleanup_review_worktrees "$REVIEW_RUN_ID" 2>/dev/null || true
+
+    assert_dir_exists "$outside" "Should not delete directories outside the run base"
+    log_test_pass "$test_name"
+}
+
 #==============================================================================
 # Run All Tests
 #==============================================================================
@@ -360,6 +386,7 @@ run_test test_get_main_repo_path_from_worktree_actual_worktree
 run_test test_get_main_repo_path_from_worktree_main_repo
 run_test test_get_main_repo_path_from_worktree_not_git
 run_test test_get_main_repo_path_from_worktree_multiple_worktrees
+run_test test_cleanup_review_worktrees_refuses_outside_mapping_paths
 
 # Print results
 print_results

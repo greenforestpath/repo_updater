@@ -1179,6 +1179,39 @@ _is_safe_path_segment() {
     return 0
 }
 
+# Check that a candidate absolute path is safely under a base directory (lexical).
+# This is used to guard any rm -rf operations that use paths sourced from state files.
+# Notes:
+# - We intentionally do NOT resolve symlinks (rm -rf on a symlink removes the link, not the target).
+# - We reject paths containing dot segments to prevent traversal tricks.
+_is_path_under_base() {
+    local path="$1"
+    local base="$2"
+
+    [[ -n "$path" && -n "$base" ]] || return 1
+
+    # Require absolute paths (macOS/Linux support); refuse to operate on relative paths.
+    [[ "$path" == /* && "$base" == /* ]] || return 1
+
+    # Normalize trailing slashes
+    base="${base%/}"
+    path="${path%/}"
+
+    # Refuse empty/base root
+    [[ -n "$base" && "$base" != "/" ]] || return 1
+    [[ -n "$path" && "$path" != "/" ]] || return 1
+
+    # Refuse path traversal/dot segments
+    case "$path" in
+        *"/./"*|*"/../"*|*"/."|*"/..") return 1 ;;
+    esac
+    case "$base" in
+        *"/./"*|*"/../"*|*"/."|*"/..") return 1 ;;
+    esac
+
+    [[ "$path" == "$base" || "$path" == "$base/"* ]]
+}
+
 # Parse all GitHub URL formats and extract components
 # Supports: https://github.com/owner/repo, git@github.com:owner/repo.git,
 #           github.com/owner/repo, owner/repo (assumes github.com)
@@ -9594,7 +9627,14 @@ cleanup_review_worktrees() {
         return 1
     fi
 
-    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/$run_id"
+    # Guard against traversal/malformed run ids (this affects filesystem deletion paths).
+    if ! _is_safe_path_segment "$run_id"; then
+        log_error "Unsafe review run ID: $run_id"
+        return 1
+    fi
+
+    local worktrees_root="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    local base="${worktrees_root}/$run_id"
 
     [[ ! -d "$base" ]] && return 0
 
@@ -9611,6 +9651,12 @@ cleanup_review_worktrees() {
             wt_branch=$(jq -r --arg repo "$repo_id" '.[$repo].branch // ""' "$mapping_file")
 
             if [[ -d "$wt_path" ]]; then
+                # Safety: never delete paths outside the run directory, even if mapping.json is corrupt.
+                if ! _is_path_under_base "$wt_path" "$base"; then
+                    log_error "Refusing to remove worktree outside run dir: $wt_path"
+                    continue
+                fi
+
                 # Try to find main repo from worktree
                 local main_repo
                 main_repo=$(git -C "$wt_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's/\.git$//')
@@ -9642,7 +9688,12 @@ cleanup_review_worktrees() {
     fi
 
     # Remove the run directory
-    rm -rf "$base"
+    if _is_path_under_base "$base" "$worktrees_root"; then
+        rm -rf "$base"
+    else
+        log_error "Refusing to remove unsafe worktrees base: $base"
+        return 1
+    fi
 
     log_info "Cleanup: $removed worktrees removed"
     return 0
