@@ -27,7 +27,8 @@
 <p align="center">
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
+# You can omit the `?ru_cb=...` once installed; it's just a cache-buster for the installer fetch.
 ```
 
 </p>
@@ -251,7 +252,7 @@ Keep your projects directory clean:
 
 **One-liner (recommended):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 ```
 
 <details>
