@@ -18,8 +18,6 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 source "$SCRIPT_DIR/test_framework.sh"
 
 # Source helper functions from ru
-source_ru_function "_is_valid_var_name"
-source_ru_function "_set_out_var"
 source_ru_function "is_git_repo"
 source_ru_function "ensure_dir"
 source_ru_function "get_worktrees_dir"
@@ -29,7 +27,6 @@ source_ru_function "get_worktree_path"
 source_ru_function "get_worktree_mapping"
 source_ru_function "list_review_worktrees"
 source_ru_function "worktree_exists"
-source_ru_function "get_main_repo_path_from_worktree"
 
 # Mock log functions for testing
 log_warn() { :; }
@@ -47,8 +44,7 @@ setup_worktree_test() {
     export RU_STATE_DIR="$TEST_DIR/state"
     export PROJECTS_DIR="$TEST_DIR/projects"
     export LAYOUT="flat"
-    REVIEW_RUN_ID="test-run-$(date +%s)"
-    export REVIEW_RUN_ID
+    export REVIEW_RUN_ID="test-run-$(date +%s)"
     mkdir -p "$RU_STATE_DIR" "$PROJECTS_DIR"
 }
 
@@ -164,7 +160,7 @@ test_get_worktree_path_not_found() {
     setup_worktree_test
 
     local wt_path=""
-    assert_fails "Nonexistent repo should return failure" get_worktree_path "nonexistent/repo" wt_path
+    assert_fails 'get_worktree_path "nonexistent/repo" wt_path 2>/dev/null' "Nonexistent repo should return failure"
 }
 
 #==============================================================================
@@ -220,7 +216,7 @@ test_list_review_worktrees_with_entries() {
 test_worktree_exists_not_found() {
     setup_worktree_test
 
-    assert_fails "Nonexistent worktree should return false" worktree_exists "nonexistent/repo"
+    assert_fails 'worktree_exists "nonexistent/repo" 2>/dev/null' "Nonexistent worktree should return false"
 }
 
 test_worktree_exists_recorded_but_no_dir() {
@@ -229,99 +225,7 @@ test_worktree_exists_recorded_but_no_dir() {
     # Record a mapping to a path that doesn't exist
     record_worktree_mapping "owner/repo" "/nonexistent/path" "branch" 2>/dev/null
 
-    assert_fails "Recorded but non-existent worktree should return false" worktree_exists "owner/repo"
-}
-
-#==============================================================================
-# Tests: get_main_repo_path_from_worktree
-#==============================================================================
-
-test_get_main_repo_path_from_worktree_actual_worktree() {
-    local test_name="get_main_repo_path_from_worktree: returns main repo from worktree"
-    log_test_start "$test_name"
-    setup_worktree_test
-
-    # Create main repo
-    local main_repo
-    main_repo=$(create_test_repo "main-repo")
-
-    # Create a worktree
-    local worktree_dir="$TEST_DIR/worktrees/feature-branch"
-    mkdir -p "$(dirname "$worktree_dir")"
-    git -C "$main_repo" worktree add "$worktree_dir" -b feature-branch 2>/dev/null
-
-    # Get main repo from worktree
-    local result
-    result=$(get_main_repo_path_from_worktree "$worktree_dir")
-
-    assert_equals "$main_repo" "$result" "Should return main repo path from worktree"
-
-    # Cleanup worktree
-    git -C "$main_repo" worktree remove "$worktree_dir" 2>/dev/null || true
-
-    log_test_pass "$test_name"
-}
-
-test_get_main_repo_path_from_worktree_main_repo() {
-    local test_name="get_main_repo_path_from_worktree: returns self from main repo"
-    log_test_start "$test_name"
-    setup_worktree_test
-
-    # Create main repo
-    local main_repo
-    main_repo=$(create_test_repo "standalone-repo")
-
-    # Get main repo from itself (not a worktree)
-    local result
-    result=$(get_main_repo_path_from_worktree "$main_repo")
-
-    assert_equals "$main_repo" "$result" "Should return repo path when called on main repo"
-
-    log_test_pass "$test_name"
-}
-
-test_get_main_repo_path_from_worktree_not_git() {
-    local test_name="get_main_repo_path_from_worktree: fails for non-git directory"
-    log_test_start "$test_name"
-    setup_worktree_test
-
-    local not_git="$TEST_DIR/not-a-git-repo"
-    mkdir -p "$not_git"
-
-    assert_fails "Should fail for non-git directory" get_main_repo_path_from_worktree "$not_git"
-
-    log_test_pass "$test_name"
-}
-
-test_get_main_repo_path_from_worktree_multiple_worktrees() {
-    local test_name="get_main_repo_path_from_worktree: works with multiple worktrees"
-    log_test_start "$test_name"
-    setup_worktree_test
-
-    # Create main repo
-    local main_repo
-    main_repo=$(create_test_repo "multi-wt-repo")
-
-    # Create multiple worktrees
-    local wt1="$TEST_DIR/worktrees/wt1"
-    local wt2="$TEST_DIR/worktrees/wt2"
-    mkdir -p "$(dirname "$wt1")"
-    git -C "$main_repo" worktree add "$wt1" -b branch1 2>/dev/null
-    git -C "$main_repo" worktree add "$wt2" -b branch2 2>/dev/null
-
-    # Both worktrees should point to same main repo
-    local result1 result2
-    result1=$(get_main_repo_path_from_worktree "$wt1")
-    result2=$(get_main_repo_path_from_worktree "$wt2")
-
-    assert_equals "$main_repo" "$result1" "First worktree should return main repo"
-    assert_equals "$main_repo" "$result2" "Second worktree should return main repo"
-
-    # Cleanup
-    git -C "$main_repo" worktree remove "$wt1" 2>/dev/null || true
-    git -C "$main_repo" worktree remove "$wt2" 2>/dev/null || true
-
-    log_test_pass "$test_name"
+    assert_fails 'worktree_exists "owner/repo" 2>/dev/null' "Recorded but non-existent worktree should return false"
 }
 
 #==============================================================================
@@ -354,12 +258,6 @@ run_test test_list_review_worktrees_with_entries
 # worktree_exists tests
 run_test test_worktree_exists_not_found
 run_test test_worktree_exists_recorded_but_no_dir
-
-# get_main_repo_path_from_worktree tests
-run_test test_get_main_repo_path_from_worktree_actual_worktree
-run_test test_get_main_repo_path_from_worktree_main_repo
-run_test test_get_main_repo_path_from_worktree_not_git
-run_test test_get_main_repo_path_from_worktree_multiple_worktrees
 
 # Print results
 print_results
