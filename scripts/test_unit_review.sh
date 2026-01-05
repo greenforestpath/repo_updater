@@ -341,8 +341,8 @@ TSV_EOF
     log_test_pass "$test_name"
 }
 
-test_validate_review_plan_rejects_unanswered_questions() {
-    local test_name="validate_review_plan: flags unanswered questions"
+test_validate_review_plan_unanswered_questions_structurally_valid() {
+    local test_name="validate_review_plan: unanswered questions structurally valid"
     log_test_start "$test_name"
 
     require_jq_or_skip || return 0
@@ -537,7 +537,7 @@ run_test test_get_priority_level_thresholds
 run_test test_passes_priority_thresholds
 run_test test_score_and_sort_work_items_orders_and_filters
 run_test test_score_and_sort_draft_pr_ranked_lower
-run_test test_validate_review_plan_rejects_unanswered_questions
+run_test test_validate_review_plan_unanswered_questions_structurally_valid
 run_test test_validate_review_plan_accepts_valid
 run_test test_validate_review_plan_rejects_missing_fields
 run_test test_validate_review_plan_rejects_invalid_decision
