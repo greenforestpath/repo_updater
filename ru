@@ -1538,32 +1538,33 @@ resolve_repo_spec() {
     fi
 
     # Validate custom name if provided
-    local resolved_path=""
+    # Use _rrs_ prefix to avoid shadowing caller's output variable names
+    local _rrs_path=""
     if [[ -n "$spec_custom" ]]; then
         _is_safe_path_segment "$spec_custom" || return 1
-        resolved_path="${projects_dir}/${spec_custom}"
+        _rrs_path="${projects_dir}/${spec_custom}"
     else
         case "$layout" in
-            flat)       resolved_path="${projects_dir}/${spec_repo}" ;;
-            owner-repo) resolved_path="${projects_dir}/${spec_owner}/${spec_repo}" ;;
-            full)       resolved_path="${projects_dir}/${spec_host}/${spec_owner}/${spec_repo}" ;;
+            flat)       _rrs_path="${projects_dir}/${spec_repo}" ;;
+            owner-repo) _rrs_path="${projects_dir}/${spec_owner}/${spec_repo}" ;;
+            full)       _rrs_path="${projects_dir}/${spec_host}/${spec_owner}/${spec_repo}" ;;
             *)          return 1 ;;
         esac
     fi
 
     # Build canonical repo ID for display/reporting
-    local resolved_repo_id=""
+    local _rrs_repo_id=""
     if [[ "$spec_host" == "github.com" ]]; then
-        resolved_repo_id="${spec_owner}/${spec_repo}"
+        _rrs_repo_id="${spec_owner}/${spec_repo}"
     else
-        resolved_repo_id="${spec_host}/${spec_owner}/${spec_repo}"
+        _rrs_repo_id="${spec_host}/${spec_owner}/${spec_repo}"
     fi
 
     _set_out_var "$url_var" "$spec_url" || return 1
     _set_out_var "$branch_var" "$spec_branch" || return 1
     _set_out_var "$custom_var" "$spec_custom" || return 1
-    _set_out_var "$path_var" "$resolved_path" || return 1
-    _set_out_var "$repo_id_var" "$resolved_repo_id" || return 1
+    _set_out_var "$path_var" "$_rrs_path" || return 1
+    _set_out_var "$repo_id_var" "$_rrs_repo_id" || return 1
 
     return 0
 }
@@ -5165,9 +5166,9 @@ parse_stream_json_event() {
 
     case "$_pse_event_type" in
         system)
-            local subtype
-            subtype=$(echo "$line" | jq -r '.subtype // ""')
-            if [[ "$subtype" == "init" ]]; then
+            local _pse_subtype
+            _pse_subtype=$(echo "$line" | jq -r '.subtype // ""')
+            if [[ "$_pse_subtype" == "init" ]]; then
                 _pse_event_data=$(echo "$line" | jq -c '{session_id, tools, cwd}')
             else
                 _pse_event_data=$(echo "$line" | jq -c '.')
