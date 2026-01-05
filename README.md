@@ -704,8 +704,8 @@ export RU_PARALLEL=4
 ```
 
 **Requirements:**
-- Parallel sync uses `flock` for coordination (Linux: usually available via `util-linux`; macOS: `brew install flock`)
-- If `flock` is missing, ru offers to install it (interactive) or falls back to serial execution
+- Parallel sync uses `flock` for coordination (Linux: usually available via `util-linux`; macOS: `brew install flock` or `brew install util-linux`)
+- If `flock` is missing, ru will prompt to install it (interactive) or fall back to serial execution
 
 ### Network Timeout Tuning
 
@@ -1541,6 +1541,7 @@ All checks passed!
 | `RU_AUTO_INSTALL_DEPS` | Auto-install optional deps (currently: `flock`) | unset |
 | `RU_TIMEOUT` | Network timeout in seconds | `30` |
 | `RU_AUTOSTASH` | Auto-stash before pull | `false` |
+| `RU_AUTO_INSTALL_DEPS` | Auto-install optional deps when missing (currently: `flock`) | unset |
 | `RU_UPDATE_STRATEGY` | Pull strategy (ff-only/rebase/merge) | `ff-only` |
 | `RU_CONFIG_DIR` | Configuration directory | `~/.config/ru` |
 | `RU_LOG_DIR` | Log directory | `~/.local/state/ru/logs` |
@@ -1583,7 +1584,7 @@ All checks passed!
 |------------|---------|
 | gum | Beautiful terminal UI |
 | jq | JSON processing (for scripts) |
-| flock | Required for `ru review` and parallel sync (Linux: `util-linux`; macOS: `brew install flock`) |
+| flock | Locking + parallel sync coordination (Linux: `util-linux`; macOS: `brew install flock` or `brew install util-linux`) |
 
 ### System Requirements
 

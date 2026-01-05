@@ -281,6 +281,134 @@ _set_out_array() {
     eval "$out_name=(\"\${tmp[@]}\")"
 }
 
+detect_package_manager() {
+    if command -v brew &>/dev/null; then
+        printf '%s\n' "brew"
+    elif command -v apt-get &>/dev/null; then
+        printf '%s\n' "apt-get"
+    elif command -v apt &>/dev/null; then
+        printf '%s\n' "apt"
+    elif command -v dnf &>/dev/null; then
+        printf '%s\n' "dnf"
+    elif command -v yum &>/dev/null; then
+        printf '%s\n' "yum"
+    elif command -v pacman &>/dev/null; then
+        printf '%s\n' "pacman"
+    elif command -v zypper &>/dev/null; then
+        printf '%s\n' "zypper"
+    elif command -v apk &>/dev/null; then
+        printf '%s\n' "apk"
+    else
+        printf '%s\n' ""
+    fi
+}
+
+can_use_sudo() {
+    if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
+        return 0
+    fi
+    command -v sudo &>/dev/null
+}
+
+print_flock_install_hints() {
+    log_info "Install flock:"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        log_info "  brew install flock"
+        log_info "  brew install util-linux   # Alternative (provides flock)"
+    else
+        log_info "  sudo apt install util-linux   # Debian/Ubuntu"
+        log_info "  sudo dnf install util-linux   # Fedora/RHEL"
+    fi
+}
+
+maybe_install_flock() {
+    # Installs flock if missing.
+    # - Prompts by default (interactive only)
+    # - RU_AUTO_INSTALL_DEPS=1 opts into auto-install (may work in --non-interactive if root or passwordless sudo)
+    if command -v flock &>/dev/null; then
+        return 0
+    fi
+
+    local auto_install="${RU_AUTO_INSTALL_DEPS:-0}"
+    if [[ "$auto_install" != "1" ]]; then
+        if ! can_prompt; then
+            return 1
+        fi
+
+        echo "" >&2
+        if ! gum_confirm "flock is missing. Install it now?" "true"; then
+            return 1
+        fi
+    fi
+
+    local pm
+    pm=$(detect_package_manager)
+    if [[ -z "$pm" ]]; then
+        log_error "Cannot auto-install flock: no supported package manager detected"
+        return 1
+    fi
+
+    log_step "Installing flock..."
+
+    local -a install_cmd=()
+    local -a fallback_cmd=()
+    case "$pm" in
+        brew)
+            install_cmd=(brew install flock)
+            fallback_cmd=(brew install util-linux)
+            ;;
+        apt-get) install_cmd=(apt-get install -y util-linux) ;;
+        apt) install_cmd=(apt install -y util-linux) ;;
+        dnf) install_cmd=(dnf install -y util-linux) ;;
+        yum) install_cmd=(yum install -y util-linux) ;;
+        pacman) install_cmd=(pacman -S --noconfirm util-linux) ;;
+        zypper) install_cmd=(zypper --non-interactive install util-linux) ;;
+        apk) install_cmd=(apk add util-linux) ;;
+        *) return 1 ;;
+    esac
+
+    if [[ "$pm" != "brew" ]] && [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
+        if ! can_use_sudo; then
+            log_error "Cannot auto-install flock without sudo/root privileges"
+            return 1
+        fi
+
+        # If we're in an automation context, avoid hanging on a sudo password prompt.
+        if [[ "$auto_install" == "1" ]] && ! can_prompt; then
+            if sudo -n true 2>/dev/null; then
+                install_cmd=(sudo -n "${install_cmd[@]}")
+            else
+                log_error "Cannot auto-install flock: sudo requires a password (non-interactive)"
+                return 1
+            fi
+        else
+            install_cmd=(sudo "${install_cmd[@]}")
+        fi
+    fi
+
+    local output exit_code
+    if output=$("${install_cmd[@]}" 2>&1); then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    if [[ "$exit_code" -ne 0 ]] && [[ "${#fallback_cmd[@]}" -gt 0 ]]; then
+        log_warn "Primary install command failed; trying alternative..."
+        if output=$("${fallback_cmd[@]}" 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+    fi
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        log_error "Failed to install flock (exit $exit_code): $output"
+        return 1
+    fi
+
+    command -v flock &>/dev/null
+}
 # Ensure a directory exists
 ensure_dir() {
     local dir="$1"
@@ -2981,11 +3109,15 @@ cmd_sync() {
     # Check for flock availability before entering parallel mode
     if [[ -n "$PARALLEL" && "$parallel_count" -gt 1 ]]; then
         if ! command -v flock &>/dev/null; then
-            log_warn "Parallel sync requires 'flock' which is not installed"
-            log_warn "Falling back to sequential sync"
-            log_info "To enable parallel sync on macOS: brew install flock"
-            PARALLEL=""
-            parallel_count="1"
+            if maybe_install_flock; then
+                :
+            else
+                log_warn "Parallel sync requires 'flock' which is not installed"
+                log_warn "Falling back to sequential sync"
+                print_flock_install_hints
+                PARALLEL=""
+                parallel_count="1"
+            fi
         fi
     fi
 
@@ -4505,6 +4637,17 @@ check_review_prerequisites() {
         has_errors=true
     fi
 
+    # Check for flock (required for locking)
+    if ! command -v flock &>/dev/null; then
+        if maybe_install_flock; then
+            :
+        else
+            log_error "flock is required for review command (locking)"
+            print_flock_install_hints
+            has_errors=true
+        fi
+    fi
+
     # Check for Claude Code (claude command)
     if ! command -v claude &>/dev/null; then
         log_warn "Claude Code CLI not found. Review sessions will not work."
@@ -4570,14 +4713,11 @@ acquire_review_lock() {
     ensure_dir "$(dirname "$lock_file")"
 
     if ! command -v flock &>/dev/null; then
-        log_error "flock is required to run ru review (for locking)"
-        log_info "Install flock and try again."
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            log_info "  brew install flock"
-        else
-            log_info "  sudo apt install util-linux   # Debian/Ubuntu"
+        if ! maybe_install_flock; then
+            log_error "flock is required to run ru review (for locking)"
+            print_flock_install_hints
+            return 1
         fi
-        return 1
     fi
 
     # Check for stale locks first and clean up if needed
@@ -8442,22 +8582,25 @@ get_review_state_dir() {
 acquire_state_lock() {
     local state_dir
     state_dir=$(get_review_state_dir)
-    ensure_dir "$state_dir"
-    local lock_file="$state_dir/state.lock"
-
     if ! command -v flock &>/dev/null; then
-        log_error "flock is required to run ru review (for state locking)"
-        log_info "Install flock and try again."
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            log_info "  brew install flock"
-        else
-            log_info "  sudo apt install util-linux   # Debian/Ubuntu"
+        if ! maybe_install_flock; then
+            log_error "flock is required to run ru review (for state locking)"
+            print_flock_install_hints
+            return 1
         fi
-        return 1
     fi
 
+    if ! ensure_dir "$state_dir"; then
+        log_error "Failed to create state directory: $state_dir"
+        return 1
+    fi
+    local lock_file="$state_dir/state.lock"
+
     # Open fd for locking (no eval)
-    exec 201>"$lock_file"
+    if ! exec 201>"$lock_file"; then
+        log_error "Failed to open state lock file: $lock_file"
+        return 1
+    fi
 
     # Get exclusive lock (blocking)
     if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
