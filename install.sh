@@ -13,6 +13,8 @@
 #   RU_SYSTEM=1            Install to /usr/local/bin (requires sudo)
 #   RU_VERSION=x.y.z       Install specific version (default: latest release)
 #   RU_UNSAFE_MAIN=1       Install from main branch (NOT RECOMMENDED)
+#   RU_CACHE_BUST=1        Append cache-busting query params to GitHub downloads (default: 1)
+#   RU_CACHE_BUST_TOKEN=... Cache-bust token override (default: current epoch seconds)
 #
 # Examples:
 #   # Standard installation (recommended)
@@ -47,6 +49,10 @@ REPO_NAME="repo_updater"
 SCRIPT_NAME="ru"
 GITHUB_API="https://api.github.com"
 GITHUB_RAW="https://raw.githubusercontent.com"
+GITHUB_RELEASE_HOST="https://github.com"
+
+# Cache-bust token used for GitHub downloads (reduces stale CDN caching)
+RU_CACHE_BUST_TOKEN="${RU_CACHE_BUST_TOKEN:-$(date +%s)}"
 
 #==============================================================================
 # COLORS (disabled if stderr is not a terminal or NO_COLOR is set)
@@ -95,6 +101,90 @@ log_step() {
 # Check if a command exists
 command_exists() {
     command -v "$1" &>/dev/null
+}
+
+append_query_param() {
+    local url="$1"
+    local key="$2"
+    local value="$3"
+
+    local sep='?'
+    [[ "$url" == *\?* ]] && sep='&'
+    printf '%s%s%s=%s' "$url" "$sep" "$key" "$value"
+}
+
+maybe_cache_bust_url() {
+    local url="$1"
+
+    if [[ "${RU_CACHE_BUST:-1}" != "1" ]]; then
+        printf '%s' "$url"
+        return 0
+    fi
+
+    case "$url" in
+        "$GITHUB_RAW"/*|"$GITHUB_RELEASE_HOST"/*)
+            append_query_param "$url" "ru_cb" "$RU_CACHE_BUST_TOKEN"
+            ;;
+        *)
+            printf '%s' "$url"
+            ;;
+    esac
+}
+
+github_api_get() {
+    local url="$1"
+    local body=""
+
+    if command_exists curl; then
+        local response status
+        if ! response=$(curl -sS \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Cache-Control: no-cache" \
+            -H "Pragma: no-cache" \
+            -H "User-Agent: ru-installer" \
+            -w $'\n%{http_code}' \
+            "$url" 2>/dev/null); then
+            log_error "Failed to fetch GitHub API: $url"
+            return 1
+        fi
+        status="${response##*$'\n'}"
+        body="${response%$'\n'*}"
+
+        case "$status" in
+            200|201|202|204)
+                printf '%s' "$body"
+                return 0
+                ;;
+            404)
+                printf '%s' "$body"
+                return 2
+                ;;
+            *)
+                printf '%s' "$body"
+                return 1
+                ;;
+        esac
+    fi
+
+    if command_exists wget; then
+        if ! body=$(wget -qO- "$url" 2>/dev/null); then
+            log_error "Failed to fetch GitHub API: $url"
+            return 1
+        fi
+
+        # Best-effort status detection from JSON body
+        if printf '%s\n' "$body" | grep -q '"status"[[:space:]]*:[[:space:]]*"404"'; then
+            printf '%s' "$body"
+            return 2
+        fi
+
+        printf '%s' "$body"
+        return 0
+    fi
+
+    log_error "Neither curl nor wget found. Please install one of them."
+    return 1
 }
 
 # Get the default shell config file
@@ -152,62 +242,30 @@ in_path() {
 #   2 - API error (rate limit, network, etc.)
 get_latest_release() {
     local url="$GITHUB_API/repos/$REPO_OWNER/$REPO_NAME/releases/latest"
-    local response http_code
+    local response
 
-    if command_exists curl; then
-        # Capture both response body and HTTP status code
-        response=$(curl -sS -w '\n%{http_code}' "$url" 2>/dev/null) || {
-            log_error "Failed to connect to GitHub API"
-            return 2
-        }
-        http_code=$(echo "$response" | tail -1)
-        response=$(echo "$response" | sed '$d')
-    elif command_exists wget; then
-        response=$(wget -qO- "$url" 2>/dev/null)
-        local wget_exit=$?
-        if [[ $wget_exit -ne 0 ]]; then
-            # wget returns 8 for server errors (4xx/5xx)
-            if [[ $wget_exit -eq 8 ]]; then
-                # Try to detect if it's a 404 by checking response content
-                if echo "$response" | grep -q '"message"[[:space:]]*:[[:space:]]*"Not Found"'; then
-                    return 1
-                fi
-            fi
-            log_error "Failed to connect to GitHub API"
-            return 2
+    response=$(github_api_get "$url")
+    local api_rc=$?
+    if [[ "$api_rc" -eq 2 ]]; then
+        # No releases exist - caller should fall back to main.
+        return 1
+    fi
+    if [[ "$api_rc" -ne 0 ]]; then
+        if printf '%s\n' "$response" | grep -qi "rate limit"; then
+            log_error "GitHub API rate limit exceeded. Try again later or set RU_UNSAFE_MAIN=1 to install from main branch."
+        else
+            log_error "Failed to fetch latest release from GitHub"
         fi
-        http_code="200"
-    else
-        log_error "Neither curl nor wget found. Please install one of them."
         return 2
     fi
 
-    # Handle HTTP status codes
-    case "$http_code" in
-        200)
-            ;;
-        404)
-            # No releases exist - caller should fall back to main
-            return 1
-            ;;
-        403)
-            # Rate limited or forbidden
-            if echo "$response" | grep -qi "rate limit"; then
-                log_error "GitHub API rate limit exceeded. Try again later or set RU_UNSAFE_MAIN=1 to install from main branch."
-            else
-                log_error "GitHub API access forbidden (403). Check your network or try RU_UNSAFE_MAIN=1."
-            fi
-            return 2
-            ;;
-        *)
-            log_error "GitHub API returned HTTP $http_code"
-            return 2
-            ;;
-    esac
-
     # Extract tag_name from JSON (simple grep approach for portability)
     local version
-    version=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    if command_exists jq; then
+        version=$(printf '%s\n' "$response" | jq -r '.tag_name // empty' 2>/dev/null | head -1)
+    else
+        version=$(printf '%s\n' "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
 
     if [[ -z "$version" ]]; then
         log_error "Could not parse version from GitHub API response"
@@ -215,7 +273,7 @@ get_latest_release() {
     fi
 
     # Remove 'v' prefix if present
-    echo "${version#v}"
+    printf '%s\n' "${version#v}"
 }
 
 # Download a file with cache-busting
@@ -223,20 +281,13 @@ get_latest_release() {
 download_file() {
     local url="$1"
     local dest="$2"
-    local cache_bust
-
-    # Add cache-busting query parameter
-    cache_bust=$(date +%s 2>/dev/null || echo "$$")
-    if [[ "$url" == *"?"* ]]; then
-        url="${url}&_cb=${cache_bust}"
-    else
-        url="${url}?_cb=${cache_bust}"
-    fi
+    local final_url
+    final_url=$(maybe_cache_bust_url "$url")
 
     if command_exists curl; then
-        curl -fsSL "$url" -o "$dest"
+        curl -fsSL "$final_url" -o "$dest"
     elif command_exists wget; then
-        wget -q "$url" -O "$dest"
+        wget -q "$final_url" -O "$dest"
     else
         log_error "Neither curl nor wget found"
         return 1
@@ -461,6 +512,7 @@ main() {
         if [[ -n "${RU_VERSION:-}" ]]; then
             version="$RU_VERSION"
             log_info "Installing version: $version"
+            install_from_release "$version" "$install_dir" || exit 1
         else
             log_step "Fetching latest release version..."
             version=$(get_latest_release) || get_release_exit=$?
@@ -474,6 +526,7 @@ main() {
                     log_warn "No releases found for this repository."
                     log_warn "Falling back to installation from main branch."
                     log_warn "This is equivalent to RU_UNSAFE_MAIN=1."
+                    log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
                     printf '\n' >&2
                     install_from_main "$install_dir" || exit 1
                     version=""  # Skip release installation below

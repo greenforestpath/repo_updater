@@ -28,6 +28,8 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+# Cache-buster if you suspect CDN caching:
+# curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 ```
 
 </p>
@@ -252,6 +254,11 @@ Keep your projects directory clean:
 **One-liner (recommended):**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh | bash
+```
+
+**If you suspect CDN caching (stale installer):**
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh?ru_cb=$(date +%s)" | bash
 ```
 
 <details>
