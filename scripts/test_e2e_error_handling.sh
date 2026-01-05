@@ -349,9 +349,10 @@ test_concurrent_access_conflicts() {
 
     # Write lock info with fake PID (pretend another process holds the lock)
     local fake_pid=99999
-    echo "$fake_pid" > "$lock_dir/pid"
-    echo "test-lock-holder" > "$lock_dir/holder"
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$lock_dir/acquired"
+    local info_file="$state_dir/review.lock.info"
+    cat > "$info_file" <<EOF
+{"run_id":"test-lock-holder","started_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","pid":$fake_pid,"mode":"plan"}
+EOF
 
     # Run review --status - should detect lock
     run_ru review --status
@@ -374,7 +375,8 @@ test_concurrent_access_conflicts() {
     fi
 
     # Clean up lock
-    rm -rf "$lock_dir"
+    rm -f "$info_file" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
 
     e2e_cleanup
     log_test_pass "$test_name"
