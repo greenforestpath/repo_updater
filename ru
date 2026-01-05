@@ -5566,6 +5566,266 @@ EOF
 }
 
 #------------------------------------------------------------------------------
+# RATE-LIMIT GOVERNOR (bd-gptu)
+# Dynamically adjust parallelism based on real rate limit data
+#------------------------------------------------------------------------------
+
+# Governor state (global for background loop access)
+declare -gA GOVERNOR_STATE=(
+    [github_remaining]=5000
+    [github_reset]=0
+    [model_in_backoff]="false"
+    [model_backoff_until]=0
+    [effective_parallelism]=4
+    [target_parallelism]=4
+    [circuit_breaker_open]="false"
+    [error_count_window]=0
+    [window_start]=0
+    [governor_pid]=0
+)
+
+# Get the target parallelism from config (default 4)
+get_target_parallelism() {
+    echo "${REVIEW_PARALLEL:-4}"
+}
+
+# Update GitHub rate limit from API
+# Queries: gh api rate_limit
+# Sets: GOVERNOR_STATE[github_remaining], GOVERNOR_STATE[github_reset]
+update_github_rate_limit() {
+    if ! command -v gh &>/dev/null; then
+        return 0
+    fi
+
+    local rate_info
+    rate_info=$(gh api rate_limit 2>/dev/null) || return 0
+
+    if command -v jq &>/dev/null && [[ -n "$rate_info" ]]; then
+        local remaining reset_epoch
+        remaining=$(echo "$rate_info" | jq -r '.resources.core.remaining // 5000' 2>/dev/null)
+        reset_epoch=$(echo "$rate_info" | jq -r '.resources.core.reset // 0' 2>/dev/null)
+
+        GOVERNOR_STATE[github_remaining]="${remaining:-5000}"
+        GOVERNOR_STATE[github_reset]="${reset_epoch:-0}"
+
+        if [[ "$remaining" -lt 500 ]]; then
+            log_warn "GitHub API rate limit low: $remaining remaining"
+        fi
+    fi
+}
+
+# Check for model rate limits in session logs
+# Scans recent logs for 429/rate limit patterns
+# Sets: GOVERNOR_STATE[model_in_backoff], GOVERNOR_STATE[model_backoff_until]
+check_model_rate_limit() {
+    local state_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"
+    local log_dir="$state_dir/logs/$(date +%Y-%m-%d)"
+
+    if [[ ! -d "$log_dir" ]]; then
+        return 0
+    fi
+
+    # Look for 429 responses in recent log files (last 5 minutes)
+    local recent_429s=0
+    local now
+    now=$(date +%s)
+    local five_min_ago=$((now - 300))
+
+    # Find log files modified in last 5 minutes and grep for rate limit patterns
+    while IFS= read -r log_file; do
+        if [[ -f "$log_file" ]]; then
+            local mtime
+            mtime=$(stat -c %Y "$log_file" 2>/dev/null || stat -f %m "$log_file" 2>/dev/null || echo 0)
+            if [[ "$mtime" -gt "$five_min_ago" ]]; then
+                if grep -q -i "rate.limit\|429\|overloaded" "$log_file" 2>/dev/null; then
+                    ((recent_429s++))
+                fi
+            fi
+        fi
+    done < <(find "$log_dir" -name "*.log" -type f 2>/dev/null)
+
+    if [[ "$recent_429s" -gt 0 ]]; then
+        local backoff_until=$((now + 60))
+        GOVERNOR_STATE[model_in_backoff]="true"
+        GOVERNOR_STATE[model_backoff_until]="$backoff_until"
+        log_warn "Model rate limit detected ($recent_429s hits), backing off until $(date -d "@$backoff_until" +%H:%M:%S 2>/dev/null || date -r "$backoff_until" +%H:%M:%S 2>/dev/null || echo 'soon')"
+    else
+        # Check if backoff period has expired
+        if [[ "${GOVERNOR_STATE[model_in_backoff]}" == "true" ]]; then
+            if [[ "$now" -ge "${GOVERNOR_STATE[model_backoff_until]}" ]]; then
+                GOVERNOR_STATE[model_in_backoff]="false"
+                log_info "Model rate limit backoff expired, resuming normal operation"
+            fi
+        fi
+    fi
+}
+
+# Record an error for circuit breaker tracking
+# Args: error_type (optional, for future categorization)
+governor_record_error() {
+    local now
+    now=$(date +%s)
+
+    # Reset window if older than 5 minutes
+    local window_start="${GOVERNOR_STATE[window_start]}"
+    if [[ "$window_start" -eq 0 ]] || [[ $((now - window_start)) -gt 300 ]]; then
+        GOVERNOR_STATE[window_start]="$now"
+        GOVERNOR_STATE[error_count_window]=1
+    else
+        GOVERNOR_STATE[error_count_window]=$((GOVERNOR_STATE[error_count_window] + 1))
+    fi
+}
+
+# Adjust parallelism based on current rate limit state
+# Sets: GOVERNOR_STATE[effective_parallelism]
+adjust_parallelism() {
+    local target
+    target=$(get_target_parallelism)
+    GOVERNOR_STATE[target_parallelism]="$target"
+
+    local effective="$target"
+    local now
+    now=$(date +%s)
+
+    # Reduce if GitHub rate limit is low
+    local github_remaining="${GOVERNOR_STATE[github_remaining]}"
+    if [[ "$github_remaining" -lt 500 ]]; then
+        effective=1
+        log_verbose "Parallelism reduced to 1 (GitHub remaining: $github_remaining)"
+    elif [[ "$github_remaining" -lt 1000 ]]; then
+        effective=$((target / 2))
+        [[ "$effective" -lt 1 ]] && effective=1
+        log_verbose "Parallelism halved to $effective (GitHub remaining: $github_remaining)"
+    fi
+
+    # Reduce to 1 if model is in backoff
+    if [[ "${GOVERNOR_STATE[model_in_backoff]}" == "true" ]]; then
+        effective=1
+        log_verbose "Parallelism reduced to 1 (model backoff active)"
+    fi
+
+    # Circuit breaker check
+    local error_count="${GOVERNOR_STATE[error_count_window]}"
+    local window_start="${GOVERNOR_STATE[window_start]}"
+    if [[ "$error_count" -ge 5 ]] && [[ $((now - window_start)) -le 300 ]]; then
+        GOVERNOR_STATE[circuit_breaker_open]="true"
+        effective=0
+        log_error "Circuit breaker OPEN: $error_count errors in last 5 minutes - pausing all sessions"
+    elif [[ "${GOVERNOR_STATE[circuit_breaker_open]}" == "true" ]]; then
+        # Try half-open after 60 seconds with no new errors
+        if [[ "$error_count" -lt 5 ]] || [[ $((now - window_start)) -gt 300 ]]; then
+            GOVERNOR_STATE[circuit_breaker_open]="false"
+            GOVERNOR_STATE[error_count_window]=0
+            log_info "Circuit breaker CLOSED: resuming normal operation"
+        else
+            effective=0
+        fi
+    fi
+
+    GOVERNOR_STATE[effective_parallelism]="$effective"
+}
+
+# Check if we can start a new session based on governor state
+# Args: current_active_sessions
+# Returns: 0 if allowed, 1 if not
+can_start_new_session() {
+    local active_sessions="${1:-0}"
+
+    # Circuit breaker open = no new sessions
+    if [[ "${GOVERNOR_STATE[circuit_breaker_open]}" == "true" ]]; then
+        log_verbose "Cannot start session: circuit breaker open"
+        return 1
+    fi
+
+    # Model in backoff = no new sessions
+    if [[ "${GOVERNOR_STATE[model_in_backoff]}" == "true" ]]; then
+        log_verbose "Cannot start session: model in backoff"
+        return 1
+    fi
+
+    # Check effective parallelism
+    local effective="${GOVERNOR_STATE[effective_parallelism]}"
+    if [[ "$active_sessions" -ge "$effective" ]]; then
+        log_verbose "Cannot start session: at capacity ($active_sessions >= $effective)"
+        return 1
+    fi
+
+    return 0
+}
+
+# Get governor status as JSON for TUI display
+get_governor_status() {
+    cat <<EOF
+{
+  "github_remaining": ${GOVERNOR_STATE[github_remaining]},
+  "github_reset": ${GOVERNOR_STATE[github_reset]},
+  "model_in_backoff": ${GOVERNOR_STATE[model_in_backoff]},
+  "model_backoff_until": ${GOVERNOR_STATE[model_backoff_until]},
+  "effective_parallelism": ${GOVERNOR_STATE[effective_parallelism]},
+  "target_parallelism": ${GOVERNOR_STATE[target_parallelism]},
+  "circuit_breaker_open": ${GOVERNOR_STATE[circuit_breaker_open]},
+  "error_count": ${GOVERNOR_STATE[error_count_window]}
+}
+EOF
+}
+
+# Background loop that continuously monitors and adjusts rate limits
+# Args: lock_file (optional, stops when lock is released)
+start_rate_limit_governor() {
+    local lock_file="${1:-}"
+    local interval="${2:-30}"
+
+    log_verbose "Starting rate-limit governor (interval: ${interval}s)"
+
+    while true; do
+        # Check if we should stop (lock file removed or parent process gone)
+        if [[ -n "$lock_file" ]] && [[ ! -f "$lock_file" ]]; then
+            log_verbose "Governor stopping: lock file removed"
+            break
+        fi
+
+        # Update rate limits
+        update_github_rate_limit
+        check_model_rate_limit
+
+        # Adjust parallelism based on current state
+        adjust_parallelism
+
+        # Log status periodically
+        log_verbose "Governor status: effective_parallelism=${GOVERNOR_STATE[effective_parallelism]}, github_remaining=${GOVERNOR_STATE[github_remaining]}, model_backoff=${GOVERNOR_STATE[model_in_backoff]}"
+
+        sleep "$interval"
+    done
+}
+
+# Start governor in background
+# Args: lock_file (governor stops when this file is removed)
+# Sets: GOVERNOR_STATE[governor_pid]
+start_governor_background() {
+    local lock_file="${1:-}"
+
+    # Create lock file if path provided
+    if [[ -n "$lock_file" ]]; then
+        touch "$lock_file"
+    fi
+
+    start_rate_limit_governor "$lock_file" 30 &
+    GOVERNOR_STATE[governor_pid]=$!
+    log_verbose "Governor started in background (PID: ${GOVERNOR_STATE[governor_pid]})"
+}
+
+# Stop background governor
+stop_governor_background() {
+    local pid="${GOVERNOR_STATE[governor_pid]}"
+    if [[ "$pid" -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        log_verbose "Governor stopped (PID: $pid)"
+    fi
+    GOVERNOR_STATE[governor_pid]=0
+}
+
+#------------------------------------------------------------------------------
 # DASHBOARD VIEW FOR NTM MODE (bd-9j92)
 # Full-screen TUI showing pending questions, active sessions, and summary stats
 #------------------------------------------------------------------------------
