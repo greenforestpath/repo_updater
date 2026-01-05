@@ -47,7 +47,6 @@ set -uo pipefail
 REPO_OWNER="Dicklesworthstone"
 REPO_NAME="repo_updater"
 SCRIPT_NAME="ru"
-GITHUB_API="https://api.github.com"
 GITHUB_RAW="https://raw.githubusercontent.com"
 GITHUB_RELEASE_HOST="https://github.com"
 
@@ -166,62 +165,6 @@ maybe_cache_bust_url() {
     esac
 }
 
-github_api_get() {
-    local url="$1"
-    local body=""
-
-    if command_exists curl; then
-        local response status
-        if ! response=$(curl -sS \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "Cache-Control: no-cache" \
-            -H "Pragma: no-cache" \
-            -H "User-Agent: ru-installer" \
-            -w $'\n%{http_code}' \
-            "$url" 2>/dev/null); then
-            log_error "Failed to fetch GitHub API: $url"
-            return 1
-        fi
-        status="${response##*$'\n'}"
-        body="${response%$'\n'*}"
-
-        case "$status" in
-            200|201|202|204)
-                printf '%s' "$body"
-                return 0
-                ;;
-            404)
-                printf '%s' "$body"
-                return 2
-                ;;
-            *)
-                printf '%s' "$body"
-                return 1
-                ;;
-        esac
-    fi
-
-    if command_exists wget; then
-        if ! body=$(wget -qO- "$url" 2>/dev/null); then
-            log_error "Failed to fetch GitHub API: $url"
-            return 1
-        fi
-
-        # Best-effort status detection from JSON body
-        if printf '%s\n' "$body" | grep -q '"status"[[:space:]]*:[[:space:]]*"404"'; then
-            printf '%s' "$body"
-            return 2
-        fi
-
-        printf '%s' "$body"
-        return 0
-    fi
-
-    log_error "Neither curl nor wget found. Please install one of them."
-    return 1
-}
-
 # Attempt to detect the latest release tag without GitHub's API (avoids rate limits/proxies).
 # Returns:
 #   0 with version on stdout - success
@@ -258,21 +201,6 @@ get_latest_release_from_redirect() {
     local tag="${effective_url##*/tag/}"
     tag="${tag%%\?*}"
     printf '%s\n' "${tag#v}"
-}
-
-extract_json_string_field() {
-    local json="$1"
-    local key="$2"
-
-    if command_exists jq; then
-        printf '%s\n' "$json" | jq -r --arg k "$key" '.[$k] // empty' 2>/dev/null | head -1
-        return 0
-    fi
-
-    printf '%s\n' "$json" \
-        | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
-        | head -1 \
-        | cut -d'"' -f4
 }
 
 # Get the default shell config file
@@ -321,85 +249,6 @@ get_install_dir() {
 in_path() {
     local dir="$1"
     [[ ":$PATH:" == *":$dir:"* ]]
-}
-
-# Get latest release version from GitHub
-# Returns:
-#   0 with version on stdout - success
-#   1 - no releases exist (caller should fall back to main)
-#   2 - API error (rate limit, network, etc.)
-get_latest_release() {
-    local url="$GITHUB_API/repos/$REPO_OWNER/$REPO_NAME/releases/latest"
-    local response api_rc
-
-    response=$(github_api_get "$url")
-    api_rc=$?
-    if [[ "$api_rc" -eq 2 ]]; then
-        # No releases exist - caller should fall back to main.
-        return 1
-    fi
-    if [[ "$api_rc" -ne 0 ]]; then
-        # Try a non-API method before failing (avoids API rate limits / weird proxies).
-        local redirect_version=""
-        if redirect_version=$(get_latest_release_from_redirect); then
-            log_warn "GitHub API unavailable; detected latest release via redirect."
-            printf '%s\n' "$redirect_version"
-            return 0
-        else
-            local redirect_rc=$?
-            if [[ "$redirect_rc" -eq 1 ]]; then
-                return 1
-            fi
-
-            local msg
-            msg=$(extract_json_string_field "$response" "message")
-            if [[ -n "$msg" ]]; then
-                log_error "GitHub API error while fetching latest release: $msg"
-            elif printf '%s\n' "$response" | grep -qi "rate limit"; then
-                log_error "GitHub API rate limit exceeded while fetching latest release."
-            else
-                log_error "Failed to fetch latest release from GitHub."
-            fi
-            log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
-            return 2
-        fi
-    fi
-
-    # Extract tag_name from JSON (simple approach for portability)
-    local version=""
-    if command_exists jq; then
-        version=$(printf '%s\n' "$response" | jq -r '.tag_name // empty' 2>/dev/null | head -1)
-    else
-        version=$(printf '%s\n' "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
-    fi
-
-    if [[ -z "$version" ]]; then
-        # Unexpected response shape; try redirect method as a fallback.
-        local redirect_version=""
-        if redirect_version=$(get_latest_release_from_redirect); then
-            log_warn "GitHub API returned unexpected payload; detected latest release via redirect."
-            printf '%s\n' "$redirect_version"
-            return 0
-        fi
-
-        local redirect_rc=$?
-        if [[ "$redirect_rc" -eq 1 ]]; then
-            return 1
-        fi
-
-        local msg
-        msg=$(extract_json_string_field "$response" "message")
-        if [[ -n "$msg" ]]; then
-            log_error "Could not determine latest release version (GitHub API message: $msg)"
-        else
-            log_error "Could not parse version from GitHub API response"
-        fi
-        log_info "Tip: If you suspect caching, run: curl -fsSL \"$GITHUB_RAW/$REPO_OWNER/$REPO_NAME/main/install.sh?ru_cb=$RU_CACHE_BUST_TOKEN\" | bash"
-        return 2
-    fi
-
-    # Remove 'v' prefix if present
-    printf '%s\n' "${version#v}"
 }
 
 # Download a file with cache-busting

@@ -226,7 +226,7 @@ Actionable commands for every issue:
 ### Parallel & Resumable Syncs
 Efficient handling of large repo collections:
 - `--parallel N` for concurrent operations
-- Worker pool with flock-based coordination
+- Worker pool with portable coordination
 - `--resume` to continue interrupted syncs
 - State tracking for reliable restarts
 
@@ -668,7 +668,7 @@ ru sync -j 8
 
 1. **Worker pool** — ru spawns N worker processes (specified by `--parallel` or `-j`)
 2. **Job queue** — Repositories are distributed among workers as they become available
-3. **flock coordination** — File-based locking prevents race conditions in shared resources
+3. **Portable coordination** — Directory-based locking prevents race conditions in shared resources
 4. **Aggregated results** — All worker results are collected and reported in a unified summary
 
 ```
@@ -704,8 +704,7 @@ export RU_PARALLEL=4
 ```
 
 **Requirements:**
-- Parallel sync uses `flock` for coordination (Linux: usually available via `util-linux`; macOS: `brew install flock` or `brew install util-linux`)
-- If `flock` is missing, ru will prompt to install it (interactive) or fall back to serial execution
+- None (portable locking is built in)
 
 ### Network Timeout Tuning
 
@@ -1507,7 +1506,6 @@ ru doctor
 | Repo count | Number of repositories configured |
 | Projects directory | Existence and write permissions |
 | gum (optional) | Availability for prettier terminal UI |
-| flock (optional) | Availability for parallel sync |
 
 **Example output:**
 ```
@@ -1520,7 +1518,6 @@ ru doctor
 ✓ Config: ~/.config/ru/ (47 repos configured)
 ✓ Projects: /data/projects (writable)
 ✓ gum: 0.13.0 (optional)
-✓ flock: available (optional)
 
 All checks passed!
 ```
@@ -1538,7 +1535,6 @@ All checks passed!
 | `RU_PROJECTS_DIR` | Base directory for repos | `/data/projects` |
 | `RU_LAYOUT` | Path layout (flat/owner-repo/full) | `flat` |
 | `RU_PARALLEL` | Number of parallel workers | `1` |
-| `RU_AUTO_INSTALL_DEPS` | Auto-install optional deps when missing (currently: `flock`) | unset |
 | `RU_TIMEOUT` | Network timeout in seconds | `30` |
 | `RU_AUTOSTASH` | Auto-stash before pull | `false` |
 | `RU_UPDATE_STRATEGY` | Pull strategy (ff-only/rebase/merge) | `ff-only` |
@@ -1583,7 +1579,6 @@ All checks passed!
 |------------|---------|
 | gum | Beautiful terminal UI |
 | jq | JSON processing (for scripts) |
-| flock | Locking + parallel sync coordination (Linux: `util-linux`; macOS: `brew install flock` or `brew install util-linux`) |
 
 ### System Requirements
 
@@ -1601,7 +1596,7 @@ All checks passed!
 - **Checksum verification:** Installer verifies SHA256 before installation
 - **Release downloads:** Default installation from GitHub Releases, not main
 - **No credential storage:** Uses gh CLI's secure credential storage
-- **Prompted installation:** Never auto-installs without user confirmation (unless you explicitly set `RU_AUTO_INSTALL_DEPS=1`)
+- **Prompted installation:** Never auto-installs without user confirmation
 
 ### Privacy
 

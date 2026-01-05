@@ -223,7 +223,7 @@ FETCH_REMOTES="true"
 
 # Results tracking (NDJSON temp file)
 RESULTS_FILE=""
-RESULTS_LOCK_FILE=""
+RESULTS_LOCK_DIR=""
 
 # Resume support
 RESUME="false"
@@ -281,133 +281,43 @@ _set_out_array() {
     eval "$out_name=(\"\${tmp[@]}\")"
 }
 
-detect_package_manager() {
-    if command -v brew &>/dev/null; then
-        printf '%s\n' "brew"
-    elif command -v apt-get &>/dev/null; then
-        printf '%s\n' "apt-get"
-    elif command -v apt &>/dev/null; then
-        printf '%s\n' "apt"
-    elif command -v dnf &>/dev/null; then
-        printf '%s\n' "dnf"
-    elif command -v yum &>/dev/null; then
-        printf '%s\n' "yum"
-    elif command -v pacman &>/dev/null; then
-        printf '%s\n' "pacman"
-    elif command -v zypper &>/dev/null; then
-        printf '%s\n' "zypper"
-    elif command -v apk &>/dev/null; then
-        printf '%s\n' "apk"
-    else
-        printf '%s\n' ""
-    fi
+#------------------------------------------------------------------------------
+# PORTABLE LOCKS (directory-based)
+#
+# We avoid hard-depending on external `flock` for cross-platform reliability.
+# A lock is represented by an on-filesystem directory created via `mkdir`,
+# which is atomic on POSIX filesystems.
+#------------------------------------------------------------------------------
+
+dir_lock_try_acquire() {
+    local lock_dir="$1"
+    mkdir "$lock_dir" 2>/dev/null
 }
 
-can_use_sudo() {
-    if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
-        return 0
-    fi
-    command -v sudo &>/dev/null
+dir_lock_release() {
+    local lock_dir="$1"
+    rmdir "$lock_dir" 2>/dev/null || true
 }
 
-print_flock_install_hints() {
-    log_info "Install flock:"
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        log_info "  brew install flock"
-        log_info "  brew install util-linux   # Alternative (provides flock)"
-    else
-        log_info "  sudo apt install util-linux   # Debian/Ubuntu"
-        log_info "  sudo dnf install util-linux   # Fedora/RHEL"
-    fi
-}
+# Blocking acquire with timeout (seconds). Returns 0 if acquired.
+dir_lock_acquire() {
+    local lock_dir="$1"
+    local timeout_secs="${2:-30}"
+    local start now
+    start=$(date +%s)
 
-maybe_install_flock() {
-    # Installs flock if missing.
-    # - Prompts by default (interactive only)
-    # - RU_AUTO_INSTALL_DEPS=1 opts into auto-install (may work in --non-interactive if root or passwordless sudo)
-    if command -v flock &>/dev/null; then
-        return 0
-    fi
+    while true; do
+        if dir_lock_try_acquire "$lock_dir"; then
+            return 0
+        fi
 
-    local auto_install="${RU_AUTO_INSTALL_DEPS:-0}"
-    if [[ "$auto_install" != "1" ]]; then
-        if ! can_prompt; then
+        now=$(date +%s)
+        if [[ "$timeout_secs" =~ ^[0-9]+$ ]] && (( now - start >= timeout_secs )); then
             return 1
         fi
 
-        echo "" >&2
-        if ! gum_confirm "flock is missing. Install it now?" "true"; then
-            return 1
-        fi
-    fi
-
-    local pm
-    pm=$(detect_package_manager)
-    if [[ -z "$pm" ]]; then
-        log_error "Cannot auto-install flock: no supported package manager detected"
-        return 1
-    fi
-
-    log_step "Installing flock..."
-
-    local -a install_cmd=()
-    local -a fallback_cmd=()
-    case "$pm" in
-        brew)
-            install_cmd=(brew install flock)
-            fallback_cmd=(brew install util-linux)
-            ;;
-        apt-get) install_cmd=(apt-get install -y util-linux) ;;
-        apt) install_cmd=(apt install -y util-linux) ;;
-        dnf) install_cmd=(dnf install -y util-linux) ;;
-        yum) install_cmd=(yum install -y util-linux) ;;
-        pacman) install_cmd=(pacman -S --noconfirm util-linux) ;;
-        zypper) install_cmd=(zypper --non-interactive install util-linux) ;;
-        apk) install_cmd=(apk add util-linux) ;;
-        *) return 1 ;;
-    esac
-
-    if [[ "$pm" != "brew" ]] && [[ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]]; then
-        if ! can_use_sudo; then
-            log_error "Cannot auto-install flock without sudo/root privileges"
-            return 1
-        fi
-
-        # If we're in an automation context, avoid hanging on a sudo password prompt.
-        if [[ "$auto_install" == "1" ]] && ! can_prompt; then
-            if sudo -n true 2>/dev/null; then
-                install_cmd=(sudo -n "${install_cmd[@]}")
-            else
-                log_error "Cannot auto-install flock: sudo requires a password (non-interactive)"
-                return 1
-            fi
-        else
-            install_cmd=(sudo "${install_cmd[@]}")
-        fi
-    fi
-
-    local output exit_code
-    if output=$("${install_cmd[@]}" 2>&1); then
-        exit_code=0
-    else
-        exit_code=$?
-    fi
-
-    if [[ "$exit_code" -ne 0 ]] && [[ "${#fallback_cmd[@]}" -gt 0 ]]; then
-        log_warn "Primary install command failed; trying alternative..."
-        if output=$("${fallback_cmd[@]}" 2>&1); then
-            exit_code=0
-        else
-            exit_code=$?
-        fi
-    fi
-
-    if [[ "$exit_code" -ne 0 ]]; then
-        log_error "Failed to install flock (exit $exit_code): $output"
-        return 1
-    fi
-
-    command -v flock &>/dev/null
+        sleep 0.1
+    done
 }
 # Ensure a directory exists
 ensure_dir() {
@@ -582,9 +492,15 @@ write_result() {
         printf -v line '{"repo":"%s","path":"%s","action":"%s","status":"%s","duration":%s,"message":"%s","timestamp":"%s"}\n' \
             "$safe_repo" "$safe_path" "$safe_action" "$safe_status" "$duration_num" "$safe_message" "$ts"
 
-        # In parallel mode multiple processes append concurrently; lock if flock is available
-        if [[ -n "${RESULTS_LOCK_FILE:-}" ]] && command -v flock &>/dev/null; then
-            { flock -x 200; printf '%s' "$line" >> "$RESULTS_FILE"; } 200>"$RESULTS_LOCK_FILE"
+        # Multiple processes may append concurrently (parallel sync); guard writes.
+        if [[ -n "${RESULTS_LOCK_DIR:-}" ]]; then
+            if dir_lock_acquire "$RESULTS_LOCK_DIR" 30; then
+                printf '%s' "$line" >> "$RESULTS_FILE"
+                dir_lock_release "$RESULTS_LOCK_DIR"
+            else
+                # Best-effort fallback: write without lock if the lock can't be acquired.
+                printf '%s' "$line" >> "$RESULTS_FILE"
+            fi
         else
             printf '%s' "$line" >> "$RESULTS_FILE"
         fi
@@ -2286,11 +2202,14 @@ run_parallel_sync() {
     echo "" >&2
 
     # Create temporary files for work queue and results
-    local work_queue results_file lock_file progress_file
+    local work_queue results_file lock_base progress_file
     work_queue=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
     results_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
-    lock_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    lock_base=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
     progress_file=$(mktemp_file) || { log_error "Failed to create temp file"; return 3; }
+    local queue_lock_dir="${lock_base}.queue.lock"
+    local results_lock_dir="${lock_base}.results.lock"
+    local progress_lock_dir="${lock_base}.progress.lock"
 
     # Write repos to work queue
     printf '%s\n' "${repos[@]}" > "$work_queue"
@@ -2305,15 +2224,17 @@ run_parallel_sync() {
             while true; do
                 # Atomically get next repo from queue
                 local repo_spec
-                {
-                    flock -x 200
+                if dir_lock_acquire "$queue_lock_dir" 60; then
                     repo_spec=$(head -1 "$work_queue" 2>/dev/null)
                     if [[ -n "$repo_spec" ]]; then
-                        # Remove from queue (portable sed)
+                        # Remove from queue (portable)
                         tail -n +2 "$work_queue" > "${work_queue}.tmp" 2>/dev/null
                         mv "${work_queue}.tmp" "$work_queue" 2>/dev/null
                     fi
-                } 200>"$lock_file"
+                    dir_lock_release "$queue_lock_dir"
+                else
+                    repo_spec=""
+                fi
 
                 # Exit if no more work
                 [[ -z "$repo_spec" ]] && break
@@ -2324,20 +2245,21 @@ run_parallel_sync() {
                     "$UPDATE_STRATEGY" "$AUTOSTASH" "$CLONE_ONLY" "$PULL_ONLY" "$FETCH_REMOTES")
 
                 # Append result atomically
-                {
-                    flock -x 202
+                if dir_lock_acquire "$results_lock_dir" 60; then
                     printf '%s\n' "$result" >> "$results_file"
-                } 202>"$lock_file"
+                    dir_lock_release "$results_lock_dir"
+                else
+                    printf '%s\n' "$result" >> "$results_file"
+                fi
 
                 # Update progress atomically
-                {
-                    flock -x 201
+                if dir_lock_acquire "$progress_lock_dir" 60; then
                     local current
                     current=$(cat "$progress_file")
                     echo $((current + 1)) > "$progress_file"
-                    # Print progress
                     printf '\r→ Progress: %d/%d' "$((current + 1))" "$total" >&2
-                } 201>"${lock_file}.progress"
+                    dir_lock_release "$progress_lock_dir"
+                fi
             done
         ) &
         worker_pids+=($!)
@@ -2368,7 +2290,7 @@ run_parallel_sync() {
     done < "$results_file"
 
     # Cleanup temp files
-    rm -f "$work_queue" "$results_file" "$lock_file" "${lock_file}.progress" "$progress_file" 2>/dev/null
+    rm -f "$work_queue" "$results_file" "$lock_base" "$progress_file" 2>/dev/null
 
     # Return results via global variables (for summary)
     PARALLEL_CLONED=$cloned
@@ -3171,21 +3093,7 @@ cmd_sync() {
 
     # Check for parallel mode
     local parallel_count="${PARALLEL:-1}"
-
-    # Check for flock availability before entering parallel mode
-    if [[ -n "$PARALLEL" && "$parallel_count" -gt 1 ]]; then
-        if ! command -v flock &>/dev/null; then
-            if maybe_install_flock; then
-                :
-            else
-                log_warn "Parallel sync requires 'flock' which is not installed"
-                log_warn "Falling back to sequential sync"
-                print_flock_install_hints
-                PARALLEL=""
-                parallel_count="1"
-            fi
-        fi
-    fi
+    # Parallel mode uses portable directory locks (no external deps).
 
     if [[ -n "$PARALLEL" && "$parallel_count" -gt 1 ]]; then
         # Parallel mode: use worker pool
@@ -4654,17 +4562,7 @@ cmd_prune() {
 check_review_prerequisites() {
     local has_errors=false
 
-    # Review requires flock for locking/state safety.
-    if ! command -v flock &>/dev/null; then
-        log_error "flock is required for review command"
-        log_info "Install flock:"
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            log_info "  brew install flock"
-        else
-            log_info "  sudo apt install util-linux   # Debian/Ubuntu"
-        fi
-        has_errors=true
-    fi
+    # Portable locking is built in; no external `flock` required.
 
     # Check for gh CLI
     if ! check_gh_installed; then
@@ -4687,16 +4585,7 @@ check_review_prerequisites() {
         has_errors=true
     fi
 
-    # Check for flock (required for locking)
-    if ! command -v flock &>/dev/null; then
-        if maybe_install_flock; then
-            :
-        else
-            log_error "flock is required for review command (locking)"
-            print_flock_install_hints
-            has_errors=true
-        fi
-    fi
+    # Portable locking is built in; no external `flock` required.
 
     # Check for Claude Code (claude command)
     if ! command -v claude &>/dev/null; then
@@ -4722,8 +4611,10 @@ get_review_lock_info_file() {
 # Check for and clean up stale locks from crashed processes
 # Returns 0 if lock was stale (and cleaned up), 1 if lock is valid or doesn't exist
 check_stale_lock() {
-    local info_file
+    local info_file lock_file lock_dir
     info_file=$(get_review_lock_info_file)
+    lock_file=$(get_review_lock_file)
+    lock_dir="${lock_file}.d"
 
     if [[ ! -f "$info_file" ]]; then
         return 1  # No info file, can't determine staleness
@@ -4748,6 +4639,7 @@ check_stale_lock() {
         started_at=$(jq -r '.started_at // "unknown"' "$info_file" 2>/dev/null)
         log_warn "Found stale lock from dead process $lock_pid (run_id: $run_id, started: $started_at)"
         rm -f "$info_file"
+        dir_lock_release "$lock_dir"
         return 0  # Lock is stale
     fi
 
@@ -4755,29 +4647,19 @@ check_stale_lock() {
 }
 
 # Acquire review lock (prevents concurrent reviews)
-# Uses flock for atomic lock acquisition and JSON info file for metadata
+# Uses a portable directory lock + JSON info file for metadata
 acquire_review_lock() {
     local lock_file info_file
     lock_file=$(get_review_lock_file)
     info_file=$(get_review_lock_info_file)
     ensure_dir "$(dirname "$lock_file")"
-
-    if ! command -v flock &>/dev/null; then
-        if ! maybe_install_flock; then
-            log_error "flock is required to run ru review (for locking)"
-            print_flock_install_hints
-            return 1
-        fi
-    fi
+    local lock_dir="${lock_file}.d"
 
     # Check for stale locks first and clean up if needed
     check_stale_lock
 
-    # Open fd 9 for locking (survives subshell)
-    exec 9>"$lock_file"
-
     # Try non-blocking lock
-    if ! flock -n 9 2>/dev/null; then
+    if ! dir_lock_try_acquire "$lock_dir"; then
         # Lock held by another process - read info
         if [[ -f "$info_file" ]]; then
             local holder_run_id holder_started holder_pid holder_mode
@@ -4795,7 +4677,6 @@ acquire_review_lock() {
             log_error "Another review is running (no info available)"
         fi
         log_info "Use 'ru review --status' to check, or wait for completion"
-        exec 9>&-
         return 1
     fi
 
@@ -4803,14 +4684,8 @@ acquire_review_lock() {
     local run_id="${REVIEW_RUN_ID:-$$}"
     local mode="${REVIEW_MODE:-plan}"
 
-    cat > "$info_file" << EOF
-{
-  "run_id": "$run_id",
-  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "pid": $$,
-  "mode": "$mode"
-}
-EOF
+    printf '{"run_id":"%s","started_at":"%s","pid":%s,"mode":"%s"}\n' \
+        "$run_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$mode" > "$info_file"
 
     return 0
 }
@@ -4820,12 +4695,11 @@ release_review_lock() {
     local lock_file info_file
     lock_file=$(get_review_lock_file)
     info_file=$(get_review_lock_info_file)
+    local lock_dir="${lock_file}.d"
 
     # Remove info file
     rm -f "$info_file"
-
-    # Release the flock (closing fd 9)
-    exec 9>&- 2>/dev/null || true
+    dir_lock_release "$lock_dir"
 }
 
 # Detect which review driver to use
@@ -8630,11 +8504,11 @@ summarize_non_interactive_questions() {
 
 #------------------------------------------------------------------------------
 # STATE PERSISTENCE FUNCTIONS
-# Atomic JSON operations with flock-based locking
+# Atomic JSON operations with portable locking
 #------------------------------------------------------------------------------
 
-# File descriptor for state lock (separate from review session lock)
-STATE_LOCK_FD=201
+STATE_LOCK_DIR=""
+STATE_LOCK_INFO_FILE=""
 
 # Get path to review state directory
 get_review_state_dir() {
@@ -8646,37 +8520,38 @@ get_review_state_dir() {
 acquire_state_lock() {
     local state_dir
     state_dir=$(get_review_state_dir)
-    if ! command -v flock &>/dev/null; then
-        if ! maybe_install_flock; then
-            log_error "flock is required for state locking"
-            print_flock_install_hints
-            return 1
-        fi
-    fi
 
     if ! ensure_dir "$state_dir"; then
         log_error "Failed to create state directory: $state_dir"
         return 1
     fi
-    local lock_file="$state_dir/state.lock"
+    STATE_LOCK_DIR="$state_dir/state.lock.d"
+    STATE_LOCK_INFO_FILE="$state_dir/state.lock.info"
 
-    # Open fd for locking (no eval)
-    if ! exec 201>"$lock_file"; then
-        log_error "Failed to open state lock file: $lock_file"
-        return 1
+    # If a stale lock exists (crashed process), clean it up.
+    if [[ -d "$STATE_LOCK_DIR" && -f "$STATE_LOCK_INFO_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(jq -r '.pid // empty' "$STATE_LOCK_INFO_FILE" 2>/dev/null)
+        if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$STATE_LOCK_INFO_FILE" 2>/dev/null || true
+            dir_lock_release "$STATE_LOCK_DIR"
+        fi
     fi
 
-    # Get exclusive lock (blocking)
-    if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
+    if ! dir_lock_acquire "$STATE_LOCK_DIR" 60; then
         log_error "Failed to acquire state lock"
         return 1
     fi
+
+    printf '{"pid":%s,"started_at":"%s"}\n' \
+        "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_LOCK_INFO_FILE"
     return 0
 }
 
 # Release state lock
 release_state_lock() {
-    flock -u "$STATE_LOCK_FD" 2>/dev/null || true
+    rm -f "$STATE_LOCK_INFO_FILE" 2>/dev/null || true
+    dir_lock_release "$STATE_LOCK_DIR"
 }
 
 # Execute a function while holding the state lock
@@ -10729,17 +10604,13 @@ cmd_review_status() {
 
     ensure_dir "$(dirname "$lock_file")"
 
-    local lock_supported="false"
+    local lock_supported="true"
     local lock_held="unknown"
-
-    if command -v flock &>/dev/null; then
-        lock_supported="true"
-        # Use flock with -o to test lock without keeping it held
-        if flock -n "$lock_file" -c 'true' 2>/dev/null; then
-            lock_held="false"
-        else
-            lock_held="true"
-        fi
+    local lock_dir="${lock_file}.d"
+    if [[ -d "$lock_dir" ]]; then
+        lock_held="true"
+    else
+        lock_held="false"
     fi
 
     local lock_held_json="null"
@@ -10821,15 +10692,11 @@ cmd_review_status() {
 
     log_step "Review status"
 
-    if [[ "$lock_supported" != "true" ]]; then
-        log_warn "flock not available; lock status unknown"
-    else
-        case "$lock_held" in
-            true) log_info "Review lock: held" ;;
-            false) log_info "Review lock: free" ;;
-            *) log_info "Review lock: unknown" ;;
-        esac
-    fi
+    case "$lock_held" in
+        true) log_info "Review lock: held" ;;
+        false) log_info "Review lock: free" ;;
+        *) log_info "Review lock: unknown" ;;
+    esac
 
     if [[ "$info_exists" == "true" ]]; then
         if command -v jq &>/dev/null; then
@@ -13072,7 +12939,7 @@ main() {
 
     # Create results file for this run
     RESULTS_FILE=$(mktemp_file) || { log_error "Failed to create temp file"; exit 3; }
-    RESULTS_LOCK_FILE="${RESULTS_FILE}.lock"
+    RESULTS_LOCK_DIR="${RESULTS_FILE}.lock.d"
 
     # Dispatch to command
     case "$COMMAND" in
