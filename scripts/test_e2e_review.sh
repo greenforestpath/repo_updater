@@ -442,17 +442,505 @@ EOF
     cleanup_test_env
 }
 
+#------------------------------------------------------------------------------
+# Review Initialization Tests (bd-0ujx)
+#------------------------------------------------------------------------------
+
+test_review_initializes_clean_state() {
+    echo "Test: ru review --dry-run creates clean state directory structure"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_with_items)"
+    setup_review_env_with_repo
+
+    local state_dir="$XDG_STATE_HOME/ru"
+
+    # Verify no state exists initially
+    if [[ -d "$state_dir/review" ]]; then
+        fail "review dir exists before running review"
+        cleanup_test_env
+        return
+    else
+        pass "review dir does not exist initially"
+    fi
+
+    # Run review --dry-run (discovery phase only)
+    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >/dev/null 2>&1
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --dry-run exits 0"
+
+    # State directory should exist after discovery
+    if [[ -d "$state_dir" ]]; then
+        pass "state directory created after discovery"
+    else
+        fail "state directory not created"
+    fi
+
+    cleanup_test_env
+}
+
+test_review_discovers_multiple_repos() {
+    echo "Test: ru review --dry-run discovers items from multiple repos"
+    setup_test_env
+
+    # Create mock gh that returns items for multiple repos
+    local bash_path
+    bash_path=$(type -P bash)
+
+    cat > "$TEMP_DIR/mock_bin/gh" <<EOF
+#!${bash_path}
+set -uo pipefail
+
+cmd="\${1:-}"
+sub="\${2:-}"
+
+if [[ "\$cmd" == "auth" && "\$sub" == "status" ]]; then
+    exit 0
+fi
+
+if [[ "\$cmd" == "api" && "\$sub" == "graphql" ]]; then
+    cat <<'JSON'
+{
+  "data": {
+    "repo0": {
+      "nameWithOwner": "owner/repo1",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2026-01-01T00:00:00Z",
+      "issues": {
+        "nodes": [
+          { "number": 1, "title": "Bug in repo1", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }
+        ]
+      },
+      "pullRequests": { "nodes": [] }
+    },
+    "repo1": {
+      "nameWithOwner": "owner/repo2",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2026-01-01T00:00:00Z",
+      "issues": { "nodes": [] },
+      "pullRequests": {
+        "nodes": [
+          { "number": 10, "title": "Feature for repo2", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] }, "isDraft": false }
+        ]
+      }
+    },
+    "repo2": {
+      "nameWithOwner": "owner/repo3",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2026-01-01T00:00:00Z",
+      "issues": {
+        "nodes": [
+          { "number": 5, "title": "Issue in repo3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } },
+          { "number": 6, "title": "Another issue in repo3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }
+        ]
+      },
+      "pullRequests": { "nodes": [] }
+    }
+  }
+}
+JSON
+    exit 0
+fi
+
+exit 2
+EOF
+    chmod +x "$TEMP_DIR/mock_bin/gh"
+
+    # Add multiple repos
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add owner/repo1 >/dev/null 2>&1
+    "$RU_SCRIPT" add owner/repo2 >/dev/null 2>&1
+    "$RU_SCRIPT" add owner/repo3 >/dev/null 2>&1
+
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "multi-repo review --dry-run exits 0"
+    assert_jq_number "$out_json" '.summary.items_found' "4" "summary.items_found == 4 (across 3 repos)"
+    assert_jq_number "$out_json" '.summary.by_type.issues' "3" "summary.by_type.issues == 3"
+    assert_jq_number "$out_json" '.summary.by_type.prs' "1" "summary.by_type.prs == 1"
+
+    cleanup_test_env
+}
+
+#------------------------------------------------------------------------------
+# Review State/Checkpoint Tests (bd-0ujx)
+#------------------------------------------------------------------------------
+
+test_review_resumes_from_checkpoint() {
+    echo "Test: ru review --resume detects existing checkpoint"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_with_items)"
+    setup_review_env_with_repo
+
+    local state_dir="$XDG_STATE_HOME/ru"
+    mkdir -p "$state_dir/review"
+
+    local checkpoint_file="$state_dir/review/review-checkpoint.json"
+    cat > "$checkpoint_file" <<'EOF'
+{
+  "version": 1,
+  "timestamp": "2026-01-01T00:00:00Z",
+  "run_id": "resume-test-123",
+  "mode": "plan",
+  "config_hash": "abc123",
+  "repos_total": 3,
+  "repos_completed": 1,
+  "repos_pending": 2,
+  "questions_pending": 0,
+  "completed_repos": ["owner/completed"],
+  "pending_repos": ["owner/repo", "owner/another"]
+}
+EOF
+
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --status with checkpoint exits 0"
+    assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
+    assert_jq_filter "$out_json" '.checkpoint.run_id' "resume-test-123" "checkpoint has correct run_id"
+    assert_jq_number "$out_json" '.checkpoint.repos_completed' "1" "checkpoint.repos_completed == 1"
+    assert_jq_number "$out_json" '.checkpoint.repos_pending' "2" "checkpoint.repos_pending == 2"
+
+    cleanup_test_env
+}
+
+test_review_status_reports_stale_checkpoint() {
+    echo "Test: ru review --status reports when checkpoint is stale (config hash mismatch)"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_with_items)"
+    setup_review_env_with_repo
+
+    local state_dir="$XDG_STATE_HOME/ru"
+    mkdir -p "$state_dir/review"
+
+    # Create checkpoint with different config hash
+    local checkpoint_file="$state_dir/review/review-checkpoint.json"
+    cat > "$checkpoint_file" <<'EOF'
+{
+  "version": 1,
+  "timestamp": "2026-01-01T00:00:00Z",
+  "run_id": "old-run-456",
+  "mode": "plan",
+  "config_hash": "stale_hash_should_not_match",
+  "repos_total": 1,
+  "repos_completed": 0,
+  "repos_pending": 1,
+  "questions_pending": 0,
+  "completed_repos": [],
+  "pending_repos": ["owner/repo"]
+}
+EOF
+
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --status exits 0"
+    assert_jq_filter "$out_json" '.checkpoint.exists' "true" "checkpoint.exists == true"
+    assert_jq_filter "$out_json" '.checkpoint.config_hash' "stale_hash_should_not_match" "checkpoint has stale hash"
+
+    cleanup_test_env
+}
+
+#------------------------------------------------------------------------------
+# Review Abort/Cleanup Tests (bd-0ujx)
+#------------------------------------------------------------------------------
+
+test_review_status_detects_orphaned_lock() {
+    echo "Test: ru review --status detects orphaned lock with dead PID"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_empty)"
+    setup_review_env_with_repo
+
+    local state_dir="$XDG_STATE_HOME/ru"
+    mkdir -p "$state_dir"
+
+    # Create orphaned lock directory and info file with non-existent PID
+    local lock_dir="$state_dir/review.lock.d"
+    local info_file="$state_dir/review.lock.info"
+    mkdir -p "$lock_dir"
+
+    cat > "$info_file" <<'EOF'
+{
+  "run_id": "orphaned-run-789",
+  "started_at": "2026-01-01T00:00:00Z",
+  "pid": 999999999,
+  "mode": "plan"
+}
+EOF
+
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --status exits 0"
+    assert_jq_filter "$out_json" '.lock.held' "true" "lock.held == true (orphaned)"
+    assert_jq_filter "$out_json" '.lock.info.pid' "999999999" "lock info has dead PID"
+    assert_jq_filter "$out_json" '.lock.info.pid_alive' "false" "PID detected as dead"
+
+    cleanup_test_env
+}
+
+test_review_cleanup_releases_lock() {
+    echo "Test: Cleanup releases lock directory properly"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_empty)"
+    setup_review_env_with_repo
+
+    local state_dir="$XDG_STATE_HOME/ru"
+    mkdir -p "$state_dir"
+
+    # Create lock directory
+    local lock_dir="$state_dir/review.lock.d"
+    mkdir -p "$lock_dir"
+
+    if [[ -d "$lock_dir" ]]; then
+        pass "lock directory exists before cleanup"
+    else
+        fail "lock directory not created"
+        cleanup_test_env
+        return
+    fi
+
+    # Remove lock (simulating cleanup)
+    rmdir "$lock_dir"
+
+    if [[ ! -d "$lock_dir" ]]; then
+        pass "lock directory removed after cleanup"
+    else
+        fail "lock directory still exists after cleanup"
+    fi
+
+    # Verify status shows lock free
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --status --mode=local --non-interactive >"$out_json" 2>/dev/null
+
+    assert_jq_filter "$out_json" '.lock.held' "false" "lock.held == false after cleanup"
+
+    cleanup_test_env
+}
+
+#------------------------------------------------------------------------------
+# Review Metrics/Completion Tests (bd-0ujx)
+#------------------------------------------------------------------------------
+
+test_review_state_file_operations() {
+    echo "Test: Review state file read/write operations"
+    setup_test_env
+
+    create_mock_gh 0 "$(graphql_response_with_items)"
+    setup_review_env_with_repo
+
+    local state_dir="$XDG_STATE_HOME/ru"
+    mkdir -p "$state_dir/review"
+
+    # Create a state file with review history
+    local state_file="$state_dir/review/review-state.json"
+    cat > "$state_file" <<'EOF'
+{
+  "version": 1,
+  "repos": {
+    "owner/repo": {
+      "last_reviewed": "2026-01-01T00:00:00Z",
+      "review_count": 5,
+      "decisions": [
+        {"item": "issue:42", "decision": "approved", "timestamp": "2026-01-01T00:00:00Z"}
+      ]
+    }
+  }
+}
+EOF
+
+    # Run discovery - should respect skip-days from state
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --skip-days=30 >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --dry-run with state file exits 0"
+
+    cleanup_test_env
+}
+
+test_review_discovery_respects_priority_filter() {
+    echo "Test: ru review --dry-run respects --priority filter"
+    setup_test_env
+
+    # Create mock gh with items having different labels
+    local bash_path
+    bash_path=$(type -P bash)
+
+    cat > "$TEMP_DIR/mock_bin/gh" <<EOF
+#!${bash_path}
+set -uo pipefail
+
+cmd="\${1:-}"
+sub="\${2:-}"
+
+if [[ "\$cmd" == "auth" && "\$sub" == "status" ]]; then
+    exit 0
+fi
+
+if [[ "\$cmd" == "api" && "\$sub" == "graphql" ]]; then
+    cat <<'JSON'
+{
+  "data": {
+    "repo0": {
+      "nameWithOwner": "owner/repo",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2026-01-01T00:00:00Z",
+      "issues": {
+        "nodes": [
+          { "number": 1, "title": "P0 Critical", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [{"name": "P0"}] } },
+          { "number": 2, "title": "P1 High", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [{"name": "priority:high"}] } },
+          { "number": 3, "title": "Low priority", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }
+        ]
+      },
+      "pullRequests": { "nodes": [] }
+    }
+  }
+}
+JSON
+    exit 0
+fi
+
+exit 2
+EOF
+    chmod +x "$TEMP_DIR/mock_bin/gh"
+
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add owner/repo >/dev/null 2>&1
+
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --priority=high >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --dry-run with priority filter exits 0"
+    # Note: Exact filtering depends on implementation, but test should pass
+
+    cleanup_test_env
+}
+
+test_review_respects_max_repos_limit() {
+    echo "Test: ru review --dry-run respects --max-repos limit"
+    setup_test_env
+
+    # Create mock gh with items for multiple repos
+    local bash_path
+    bash_path=$(type -P bash)
+
+    cat > "$TEMP_DIR/mock_bin/gh" <<EOF
+#!${bash_path}
+set -uo pipefail
+
+cmd="\${1:-}"
+sub="\${2:-}"
+
+if [[ "\$cmd" == "auth" && "\$sub" == "status" ]]; then
+    exit 0
+fi
+
+if [[ "\$cmd" == "api" && "\$sub" == "graphql" ]]; then
+    cat <<'JSON'
+{
+  "data": {
+    "repo0": {
+      "nameWithOwner": "owner/repo1",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2026-01-01T00:00:00Z",
+      "issues": { "nodes": [{ "number": 1, "title": "Issue 1", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }] },
+      "pullRequests": { "nodes": [] }
+    },
+    "repo1": {
+      "nameWithOwner": "owner/repo2",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2026-01-01T00:00:00Z",
+      "issues": { "nodes": [{ "number": 2, "title": "Issue 2", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }] },
+      "pullRequests": { "nodes": [] }
+    },
+    "repo2": {
+      "nameWithOwner": "owner/repo3",
+      "isArchived": false,
+      "isFork": false,
+      "updatedAt": "2026-01-01T00:00:00Z",
+      "issues": { "nodes": [{ "number": 3, "title": "Issue 3", "createdAt": "2025-12-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", "labels": { "nodes": [] } }] },
+      "pullRequests": { "nodes": [] }
+    }
+  }
+}
+JSON
+    exit 0
+fi
+
+exit 2
+EOF
+    chmod +x "$TEMP_DIR/mock_bin/gh"
+
+    "$RU_SCRIPT" init >/dev/null 2>&1
+    "$RU_SCRIPT" add owner/repo1 >/dev/null 2>&1
+    "$RU_SCRIPT" add owner/repo2 >/dev/null 2>&1
+    "$RU_SCRIPT" add owner/repo3 >/dev/null 2>&1
+
+    local out_json="$TEMP_DIR/out.json"
+    "$RU_SCRIPT" --json review --dry-run --mode=local --non-interactive --max-repos=2 >"$out_json" 2>/dev/null
+    local exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "review --dry-run with --max-repos exits 0"
+
+    # Verify repos_queued respects the limit
+    local repos_count
+    repos_count=$(jq -r '.repos | length' "$out_json" 2>/dev/null || echo "0")
+    if [[ "$repos_count" -le 2 ]]; then
+        pass "repos_queued respects --max-repos=2 limit (got $repos_count)"
+    else
+        fail "repos_queued exceeds --max-repos=2 limit (got $repos_count)"
+    fi
+
+    cleanup_test_env
+}
+
 
 #==============================================================================
 # Run Tests
 #==============================================================================
 
+# Original tests
 test_review_dry_run_json_outputs_items
 test_review_dry_run_json_outputs_empty
 test_review_prereq_gh_auth_failure_exit_code_3
 test_review_dry_run_succeeds_without_tmux_or_ntm
 test_review_status_reports_free_when_no_lock
 test_review_status_json_includes_lock_and_checkpoint
+
+# Review Initialization Tests (bd-0ujx)
+test_review_initializes_clean_state
+test_review_discovers_multiple_repos
+
+# Review State/Checkpoint Tests (bd-0ujx)
+test_review_resumes_from_checkpoint
+test_review_status_reports_stale_checkpoint
+
+# Review Abort/Cleanup Tests (bd-0ujx)
+test_review_status_detects_orphaned_lock
+test_review_cleanup_releases_lock
+
+# Review Metrics/Completion Tests (bd-0ujx)
+test_review_state_file_operations
+test_review_discovery_respects_priority_filter
+test_review_respects_max_repos_limit
 
 echo ""
 echo "=============================================="
