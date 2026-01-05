@@ -9346,10 +9346,11 @@ get_worktree_path() {
     fi
 
     if command -v jq &>/dev/null; then
-        local path
-        path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
-        _set_out_var "$path_var" "$path" || return 1
-        [[ -n "$path" ]] && return 0
+        # Use _gwp_ prefix to avoid shadowing caller's output variable name
+        local _gwp_path
+        _gwp_path=$(jq -r --arg repo "$repo_id" '.[$repo].path // ""' "$mapping_file")
+        _set_out_var "$path_var" "$_gwp_path" || return 1
+        [[ -n "$_gwp_path" ]] && return 0
     fi
 
     return 1
