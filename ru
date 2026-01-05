@@ -165,15 +165,6 @@ RU_STATE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_STATE_DIR:-}" "$XDG_S
 RU_CACHE_DIR="$(resolve_abs_or_tilde_path_or_default "${RU_CACHE_DIR:-}" "$XDG_CACHE_HOME/ru")"
 RU_LOG_DIR="$RU_STATE_DIR/logs"
 
-# Harden state directory paths against relative values
-if [[ "$XDG_STATE_HOME" != /* ]]; then
-    XDG_STATE_HOME="$HOME/$XDG_STATE_HOME"
-fi
-if [[ "$RU_STATE_DIR" != /* ]]; then
-    RU_STATE_DIR="$HOME/$RU_STATE_DIR"
-fi
-RU_LOG_DIR="$RU_STATE_DIR/logs"
-
 # Default configuration values
 DEFAULT_PROJECTS_DIR="${RU_PROJECTS_DIR:-$HOME/projects}"
 DEFAULT_LAYOUT="flat"           # flat | owner-repo | full
@@ -5867,7 +5858,7 @@ update_github_rate_limit() {
 # Scans recent logs for 429/rate limit patterns
 # Sets: GOVERNOR_STATE[model_in_backoff], GOVERNOR_STATE[model_backoff_until]
 check_model_rate_limit() {
-    local state_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}"
+    local state_dir="$RU_STATE_DIR"
     local log_dir
     log_dir="$state_dir/logs/$(date +%Y-%m-%d)"
 
@@ -7772,7 +7763,7 @@ parse_review_args() {
 #------------------------------------------------------------------------------
 
 get_skipped_questions_log_file() {
-    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/skipped-questions-${REVIEW_RUN_ID:-unknown}.jsonl"
+    printf '%s\n' "${RU_STATE_DIR}/skipped-questions-${REVIEW_RUN_ID:-unknown}.jsonl"
 }
 
 check_interactive_capability() {
@@ -7879,11 +7870,11 @@ summarize_non_interactive_questions() {
 #------------------------------------------------------------------------------
 
 # File descriptor for state lock (separate from review session lock)
-STATE_LOCK_FD=201
+STATE_LOCK_FD=""
 
 # Get path to review state directory
 get_review_state_dir() {
-    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/review"
+    printf '%s\n' "${RU_STATE_DIR}/review"
 }
 
 # Acquire exclusive lock on state files
@@ -7891,11 +7882,23 @@ get_review_state_dir() {
 acquire_state_lock() {
     local state_dir
     state_dir=$(get_review_state_dir)
-    ensure_dir "$state_dir"
+    if ! command -v flock &>/dev/null; then
+        log_error "flock is required for state locking"
+        return 1
+    fi
+
+    if ! ensure_dir "$state_dir"; then
+        log_error "Failed to create state directory: $state_dir"
+        return 1
+    fi
     local lock_file="$state_dir/state.lock"
 
-    # Open fd for locking (no eval)
-    exec 201>"$lock_file"
+    # Open fd for locking (avoid eval; quoting is sufficient)
+    if ! exec {STATE_LOCK_FD}>"$lock_file"; then
+        log_error "Failed to open state lock file: $lock_file"
+        return 1
+    fi
+ 
 
     # Get exclusive lock (blocking)
     if ! flock -x "$STATE_LOCK_FD" 2>/dev/null; then
@@ -7907,7 +7910,11 @@ acquire_state_lock() {
 
 # Release state lock
 release_state_lock() {
-    flock -u "$STATE_LOCK_FD" 2>/dev/null || true
+    if [[ -n "${STATE_LOCK_FD:-}" ]]; then
+        flock -u "$STATE_LOCK_FD" 2>/dev/null || true
+        exec {STATE_LOCK_FD}>&- 2>/dev/null || true
+        STATE_LOCK_FD=""
+    fi
 }
 
 # Execute a function while holding the state lock
@@ -8246,7 +8253,7 @@ cleanup_old_review_state() {
     state_dir=$(get_review_state_dir)
 
     # Clean old worktrees if they exist
-    local worktrees_dir="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    local worktrees_dir="$RU_STATE_DIR/worktrees"
     if [[ -d "$worktrees_dir" ]]; then
         find "$worktrees_dir" -maxdepth 1 -type d -mtime "+$max_age_days" \
             -exec rm -rf {} \; 2>/dev/null || true
@@ -8281,7 +8288,7 @@ cleanup_old_review_state() {
 
 # Get digest cache directory
 get_digest_cache_dir() {
-    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/repo-digests"
+    printf '%s\n' "$RU_STATE_DIR/repo-digests"
 }
 
 # Load cached digest into a worktree and append delta since last review
@@ -8705,7 +8712,7 @@ cmd_review_analytics() {
 
 # Get the worktrees directory for current review run
 get_worktrees_dir() {
-    echo "${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/${REVIEW_RUN_ID:-unknown}"
+    printf '%s\n' "${RU_STATE_DIR}/worktrees/${REVIEW_RUN_ID:-unknown}"
 }
 
 # Check if a repository is clean (no uncommitted changes)
@@ -8921,7 +8928,7 @@ cleanup_review_worktrees() {
         return 1
     fi
 
-    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/$run_id"
+    local base="${RU_STATE_DIR}/worktrees/$run_id"
 
     [[ ! -d "$base" ]] && return 0
 
@@ -8980,7 +8987,7 @@ cleanup_review_worktrees() {
 # Output: JSON array of worktree info
 list_review_worktrees() {
     local run_id="${1:-${REVIEW_RUN_ID:-}}"
-    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees/$run_id"
+    local base="${RU_STATE_DIR}/worktrees/$run_id"
     local mapping_file="$base/mapping.json"
 
     if [[ -f "$mapping_file" ]]; then
@@ -10198,7 +10205,7 @@ resolve_review_apply_run_id() {
         return 0
     fi
 
-    local base="${RU_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ru}/worktrees"
+    local base="${RU_STATE_DIR}/worktrees"
     if [[ ! -d "$base" ]]; then
         log_error "No review worktrees directory found: $base"
         return 1
