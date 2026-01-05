@@ -13,6 +13,7 @@
 #
 # shellcheck disable=SC1091  # Sourced files checked separately
 # shellcheck disable=SC2317  # Test functions invoked indirectly via run_test
+# shellcheck disable=SC2120  # Wrapper functions pass "$@" even if not all callers use args
 
 set -uo pipefail
 
