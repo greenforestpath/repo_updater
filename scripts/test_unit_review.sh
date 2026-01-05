@@ -24,7 +24,11 @@ source_ru_function "get_priority_level"
 source_ru_function "passes_priority_threshold"
 source_ru_function "score_and_sort_work_items"
 source_ru_function "validate_review_plan"
+source_ru_function "summarize_review_plan"
+source_ru_function "get_review_plan_json_summary"
+source_ru_function "archive_review_plan"
 source_ru_function "ensure_dir"
+source_ru_function "json_escape"
 source_ru_function "acquire_state_lock"
 source_ru_function "release_state_lock"
 source_ru_function "with_state_lock"
@@ -38,6 +42,7 @@ STATE_LOCK_FD=201
 log_error() { :; }
 log_warn() { :; }
 log_info() { :; }
+log_verbose() { :; }
 
 require_jq_or_skip() {
     if ! command -v jq &>/dev/null; then
@@ -346,21 +351,8 @@ test_validate_review_plan_unanswered_questions_structurally_valid() {
     log_test_start "$test_name"
 
     require_jq_or_skip || return 0
-
-    local env_root
-    env_root=$(create_test_env)
-
-    local plan_file="$env_root/unanswered.json"
-    cat > "$plan_file" <<'PLAN_EOF'
-{
-  "schema_version": 1,
-  "repo": "octo/repo1",
-  "items": [],
-  "questions": [
-    {"id": "q1", "prompt": "Apply fix?", "answered": false}
-  ]
-}
-PLAN_EOF
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/unanswered-questions.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
 
     local result
     result=$(validate_review_plan "$plan_file")
@@ -381,26 +373,8 @@ test_validate_review_plan_accepts_valid() {
     log_test_start "$test_name"
 
     require_jq_or_skip || return 0
-
-    local env_root
-    env_root=$(create_test_env)
-
-    local plan_file="$env_root/valid-plan.json"
-    cat > "$plan_file" <<'PLAN_EOF'
-{
-  "schema_version": 1,
-  "repo": "octo/repo1",
-  "items": [
-    {"type": "issue", "number": 42, "decision": "fix"}
-  ],
-  "questions": [
-    {"id": "q1", "prompt": "Apply?", "answered": false}
-  ],
-  "gh_actions": [
-    {"op": "comment", "target": "issue#42"}
-  ]
-}
-PLAN_EOF
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/valid-plan.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
 
     local result
     result=$(validate_review_plan "$plan_file")
@@ -414,17 +388,8 @@ test_validate_review_plan_rejects_missing_fields() {
     log_test_start "$test_name"
 
     require_jq_or_skip || return 0
-
-    local env_root
-    env_root=$(create_test_env)
-
-    local plan_file="$env_root/invalid-plan.json"
-    cat > "$plan_file" <<'PLAN_EOF'
-{
-  "schema_version": 1,
-  "items": []
-}
-PLAN_EOF
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/missing-fields.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
 
     local result
     result=$(validate_review_plan "$plan_file")
@@ -439,20 +404,8 @@ test_validate_review_plan_rejects_invalid_decision() {
     log_test_start "$test_name"
 
     require_jq_or_skip || return 0
-
-    local env_root
-    env_root=$(create_test_env)
-
-    local plan_file="$env_root/invalid-decision.json"
-    cat > "$plan_file" <<'PLAN_EOF'
-{
-  "schema_version": 1,
-  "repo": "octo/repo1",
-  "items": [
-    {"type": "issue", "number": 42, "decision": "maybe"}
-  ]
-}
-PLAN_EOF
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/invalid-decision.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
 
     local result
     result=$(validate_review_plan "$plan_file")
@@ -467,28 +420,134 @@ test_validate_review_plan_rejects_invalid_gh_target() {
     log_test_start "$test_name"
 
     require_jq_or_skip || return 0
-
-    local env_root
-    env_root=$(create_test_env)
-
-    local plan_file="$env_root/invalid-gh-target.json"
-    cat > "$plan_file" <<'PLAN_EOF'
-{
-  "schema_version": 1,
-  "repo": "octo/repo1",
-  "items": [
-    {"type": "issue", "number": 42, "decision": "fix"}
-  ],
-  "gh_actions": [
-    {"op": "comment", "target": "issue#abc"}
-  ]
-}
-PLAN_EOF
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/invalid-gh-target.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
 
     local result
     result=$(validate_review_plan "$plan_file")
 
     assert_contains "$result" "Invalid gh_action target format" "Invalid gh target should be rejected"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_review_plan_rejects_invalid_schema_version() {
+    local test_name="validate_review_plan: rejects unsupported schema_version"
+    log_test_start "$test_name"
+
+    require_jq_or_skip || return 0
+
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/invalid-schema-version.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+
+    assert_contains "$result" "Unsupported schema version" "Invalid schema version should be rejected"
+
+    log_test_pass "$test_name"
+}
+
+test_validate_review_plan_accepts_large_plan() {
+    local test_name="validate_review_plan: accepts large plan"
+    log_test_start "$test_name"
+
+    require_jq_or_skip || return 0
+
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/large-plan.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
+
+    local result
+    result=$(validate_review_plan "$plan_file")
+    assert_equals "Valid" "$result" "Large plan should validate"
+
+    log_test_pass "$test_name"
+}
+
+#------------------------------------------------------------------------------
+# summarize_review_plan + get_review_plan_json_summary
+#------------------------------------------------------------------------------
+
+test_summarize_review_plan_prints_counts() {
+    local test_name="summarize_review_plan: prints totals"
+    log_test_start "$test_name"
+
+    require_jq_or_skip || return 0
+
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/valid-plan.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
+
+    local output
+    output=$(summarize_review_plan "$plan_file")
+
+    assert_contains "$output" "Repository: octo/repo1" "Should include repo"
+    assert_contains "$output" "Items reviewed: 2" "Should count items"
+    assert_contains "$output" "gh_actions pending: 1" "Should count gh_actions"
+
+    log_test_pass "$test_name"
+}
+
+test_get_review_plan_json_summary_is_parseable() {
+    local test_name="get_review_plan_json_summary: parseable JSON"
+    log_test_start "$test_name"
+
+    require_jq_or_skip || return 0
+
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/valid-plan.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
+
+    local output
+    output=$(get_review_plan_json_summary "$plan_file")
+
+    assert_exit_code 0 "Summary JSON should parse" jq -e '.' <<<"$output"
+    assert_equals "2" "$(jq -r '.summary.total_items' <<<"$output")" "Should include total_items"
+    assert_equals "1" "$(jq -r '.gh_actions_count' <<<"$output")" "Should include gh_actions_count"
+
+    log_test_pass "$test_name"
+}
+
+test_get_review_plan_json_summary_reports_error_for_invalid_plan() {
+    local test_name="get_review_plan_json_summary: error object for invalid plan"
+    log_test_start "$test_name"
+
+    require_jq_or_skip || return 0
+
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/missing-fields.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
+
+    local output
+    output=$(get_review_plan_json_summary "$plan_file")
+
+    assert_exit_code 0 "Error JSON should parse" jq -e '.' <<<"$output"
+    assert_contains "$output" "\"error\"" "Should emit error field"
+
+    log_test_pass "$test_name"
+}
+
+#------------------------------------------------------------------------------
+# archive_review_plan
+#------------------------------------------------------------------------------
+
+test_archive_review_plan_copies_into_state_dir() {
+    local test_name="archive_review_plan: copies plan into review state"
+    log_test_start "$test_name"
+
+    local env_root
+    env_root=$(create_test_env)
+    export RU_STATE_DIR="$env_root/state/ru"
+    export REVIEW_RUN_ID="run-arch-1"
+
+    local plan_file="$PROJECT_DIR/test/fixtures/plans/valid-plan.json"
+    assert_file_exists "$plan_file" "Fixture should exist"
+
+    local repo_id="octo/repo1"
+    assert_exit_code 0 "archive_review_plan should succeed" archive_review_plan "$repo_id" "$plan_file"
+
+    local state_dir
+    state_dir=$(get_review_state_dir)
+    local archived="$state_dir/applied-plans/$REVIEW_RUN_ID/octo_repo1.json"
+    assert_file_exists "$archived" "Archived plan should exist"
+    assert_equals "octo/repo1" "$(jq -r '.repo' "$archived")" "Archived plan should match content"
 
     log_test_pass "$test_name"
 }
@@ -542,6 +601,12 @@ run_test test_validate_review_plan_accepts_valid
 run_test test_validate_review_plan_rejects_missing_fields
 run_test test_validate_review_plan_rejects_invalid_decision
 run_test test_validate_review_plan_rejects_invalid_gh_target
+run_test test_validate_review_plan_rejects_invalid_schema_version
+run_test test_validate_review_plan_accepts_large_plan
+run_test test_summarize_review_plan_prints_counts
+run_test test_get_review_plan_json_summary_is_parseable
+run_test test_get_review_plan_json_summary_reports_error_for_invalid_plan
+run_test test_archive_review_plan_copies_into_state_dir
 run_test test_write_json_atomic_with_lock
 
 print_results
