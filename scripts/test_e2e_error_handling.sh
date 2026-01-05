@@ -347,7 +347,7 @@ test_concurrent_access_conflicts() {
     local lock_dir="$state_dir/review.lock.d"
     mkdir -p "$lock_dir"
 
-    # Write lock info with current PID (pretend another process)
+    # Write lock info with fake PID (pretend another process holds the lock)
     local fake_pid=99999
     echo "$fake_pid" > "$lock_dir/pid"
     echo "test-lock-holder" > "$lock_dir/holder"
