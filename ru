@@ -2324,8 +2324,9 @@ run_parallel_sync() {
         esac
     done < "$results_file"
 
-    # Cleanup temp files
-    rm -f "$work_queue" "$results_file" "$lock_base" "$progress_file" 2>/dev/null
+    # Cleanup temp files and lock directories
+    rm -f "$work_queue" "${work_queue}.tmp" "$results_file" "$lock_base" "$progress_file" 2>/dev/null
+    rmdir "$queue_lock_dir" "$results_lock_dir" "$progress_lock_dir" 2>/dev/null || true
 
     # Return results via global variables (for summary)
     PARALLEL_CLONED=$cloned
@@ -2348,9 +2349,12 @@ cleanup() {
         return
     fi
 
-    # Remove temp files
+    # Remove temp files and lock directories
     if [[ -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" ]]; then
         rm -f "$RESULTS_FILE"
+    fi
+    if [[ -n "${RESULTS_LOCK_DIR:-}" && -d "$RESULTS_LOCK_DIR" ]]; then
+        rmdir "$RESULTS_LOCK_DIR" 2>/dev/null || true
     fi
 }
 
