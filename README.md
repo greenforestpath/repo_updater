@@ -2889,6 +2889,37 @@ for f in scripts/test_e2e_*.sh; do "$f"; done
 ./scripts/test_coverage.sh
 ```
 
+### Test Tiers and Requirements
+
+**Unit tests** use extracted `ru` functions and avoid external network dependencies.  
+**Integration tests** use local git repos under `/tmp` (no network).  
+**E2E tests** run full CLI flows in isolated XDG roots and capture detailed logs.
+
+**Required tools:**
+- `bash` 4.0+, `git`
+- `jq` for JSON-oriented tests (skips when missing)
+- `gh` for tests that exercise GitHub auth behavior (skips when missing or unauthenticated)
+- `ntm`/`tmux` only for agent-sweep tests (mocked by default in E2E)
+
+### Logging and Artifacts
+
+The test frameworks support structured logs and artifact capture:
+
+- `TF_LOG_LEVEL=debug|info|warn|error|none` controls verbosity.
+- `TF_LOG_FILE=/path/to/test.log` writes human-readable logs.
+- `TF_JSON_LOG_FILE=/path/to/test.jsonl` writes machine-readable JSON lines.
+- E2E runs create `$E2E_TEMP_DIR/test_logs/` with per-test stdout/stderr captures.
+- Failed-test artifacts can be preserved under `TF_FAILED_ARTIFACTS_DIR` (default: `/tmp/ru-test-failures`).
+
+### Gated Tests (gh/ntm)
+
+Some tests require external tooling and will skip gracefully:
+
+- **GitHub auth**: use `require_gh_auth` (from `scripts/test_framework.sh`) in tests that need authenticated `gh`.
+  - Force-skip with `TF_SKIP_GH_AUTH=1|true|yes`.
+- **ntm/tmux**: E2E tests use mocks via `e2e_create_mock_ntm`; you can control behavior with
+  `NTM_MOCK_SCENARIO` (see `scripts/test_bin/ntm`).
+
 ### Test Categories
 
 **Unit Tests** — Test individual functions in isolation:
