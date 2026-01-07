@@ -26,6 +26,7 @@ log_verbose() { :; }
 log_info() { :; }
 log_warn() { :; }
 log_error() { :; }
+log_debug() { :; }
 
 require_function() {
     local func_name="$1"
