@@ -16955,7 +16955,8 @@ run_single_agent_workflow() {
 
     # Spawn session
     progress_update_phase "spawn"
-    local session_name="ru_sweep_$(sanitize_session_name "$rn")_$$"
+    local session_name
+    session_name="ru_sweep_$(sanitize_session_name "$rn")_$$"
     local spawn_result spawn_exit
     if spawn_result=$(ntm_spawn_session "$session_name" "$rp"); then
         spawn_exit=0

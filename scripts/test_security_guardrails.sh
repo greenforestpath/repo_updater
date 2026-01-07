@@ -26,6 +26,8 @@ source "$SCRIPT_DIR/test_framework.sh"
 # Source the denylist array and functions
 # shellcheck disable=SC1090
 eval "$(sed -n '/^declare -a AGENT_SWEEP_DENYLIST_PATTERNS=/,/^)/p' "$PROJECT_DIR/ru")"
+# Initialize AGENT_SWEEP_DENYLIST_EXTRA_LOCAL (used by is_file_denied, normally loaded from config)
+declare -ga AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
 source_ru_function "is_file_denied"
 source_ru_function "filter_files_denylist"
 source_ru_function "get_denylist_patterns"
@@ -181,6 +183,30 @@ test_denylist_extra_patterns() {
     else
         unset AGENT_SWEEP_DENYLIST_EXTRA
     fi
+}
+
+test_denylist_nested_directories() {
+    log_test_start "Denylist: nested directory pattern matching"
+
+    # Files in node_modules at any nesting depth should be denied (bd-omo4)
+    assert_true "is_file_denied 'node_modules/pkg/a.js'" "node_modules/pkg/a.js should be denied"
+    assert_true "is_file_denied 'frontend/node_modules/pkg/a.js'" "frontend/node_modules/pkg/a.js should be denied"
+    assert_true "is_file_denied 'deep/nested/path/node_modules/pkg/a.js'" "deeply nested node_modules should be denied"
+
+    # Same for __pycache__
+    assert_true "is_file_denied '__pycache__/module.pyc'" "__pycache__/module.pyc should be denied"
+    assert_true "is_file_denied 'src/__pycache__/module.pyc'" "nested __pycache__ should be denied"
+
+    # Same for dist (build artifacts)
+    assert_true "is_file_denied 'dist/bundle.js'" "dist/bundle.js should be denied"
+    assert_true "is_file_denied 'frontend/dist/bundle.js'" "nested dist should be denied"
+
+    # Same for build directory
+    assert_true "is_file_denied 'build/output.js'" "build/output.js should be denied"
+    assert_true "is_file_denied 'packages/core/build/index.js'" "nested build should be denied"
+
+    # Regular files should still be allowed
+    assert_false "is_file_denied 'src/components/Button.tsx'" "Regular source file should be allowed"
 }
 
 test_filter_files_denylist() {
@@ -672,6 +698,7 @@ main() {
     run_test test_denylist_allowed_files
     run_test test_denylist_path_normalization
     run_test test_denylist_extra_patterns
+    run_test test_denylist_nested_directories
     run_test test_filter_files_denylist
     run_test test_get_denylist_patterns
 
