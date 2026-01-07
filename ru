@@ -571,6 +571,132 @@ get_effective_phase_prompt() {
     esac
 }
 
+#------------------------------------------------------------------------------
+# AGENT-SWEEP PLAN EXTRACTION
+# Functions to extract structured JSON plans from agent pane output.
+#------------------------------------------------------------------------------
+
+# Validate JSON structure
+# Reads JSON from stdin and validates it
+# Returns: 0 if valid JSON, 1 otherwise
+json_validate() {
+    if command -v jq &>/dev/null; then
+        jq empty 2>/dev/null
+    elif command -v python3 &>/dev/null; then
+        python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null
+    else
+        # Best effort: check for opening { and closing }
+        local content
+        content=$(cat)
+        [[ "$content" =~ ^\{.*\}$ ]]
+    fi
+}
+
+# Extract JSON between markers from pane output
+# Usage: extract_plan_json "$pane_output" "COMMIT_PLAN"
+# Args:
+#   $1: pane_output - raw output from agent pane
+#   $2: marker_name - one of: UNDERSTANDING, COMMIT_PLAN, RELEASE_PLAN
+# Returns: JSON string on stdout, or empty if not found
+# Exit: 0 if valid JSON extracted, 1 if not found or invalid
+extract_plan_json() {
+    local pane_output="$1"
+    local marker="${2:-}"
+
+    [[ -z "$marker" ]] && return 1
+
+    local begin_marker="RU_${marker}_JSON_BEGIN"
+    local end_marker="RU_${marker}_JSON_END"
+
+    # Strip ANSI escape codes before processing
+    local clean_output
+    clean_output=$(echo "$pane_output" | sed 's/\x1b\[[0-9;]*m//g')
+
+    # Extract content between markers (excluding the marker lines)
+    local json
+    json=$(echo "$clean_output" | sed -n "/${begin_marker}/,/${end_marker}/p" | \
+           sed "1d;\$d")
+
+    # Check if we got anything
+    if [[ -z "$json" ]]; then
+        return 1  # Markers not found
+    fi
+
+    # Validate it's valid JSON
+    if echo "$json" | json_validate; then
+        echo "$json"
+        return 0
+    else
+        # Log warning but don't fail - preserve raw output for debugging
+        log_warn "Extracted content between ${begin_marker}...${end_marker} is not valid JSON"
+        return 1
+    fi
+}
+
+# Capture output from a tmux pane
+# Usage: capture_pane_output "session_name" [lines]
+# Args:
+#   $1: session - tmux session name
+#   $2: lines - number of lines to capture (default: 10000)
+# Returns: pane content on stdout
+# Exit: 0 on success, 1 on failure
+capture_pane_output() {
+    local session="$1"
+    local lines="${2:-10000}"
+
+    [[ -z "$session" ]] && return 1
+
+    # Check if session exists
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        log_warn "Session '$session' not found"
+        return 1
+    fi
+
+    # Capture pane output (pane 1 is the agent pane in our layout)
+    # -p: print to stdout, -S: start line (negative = from scrollback)
+    tmux capture-pane -t "${session}:0.1" -p -S -"$lines" 2>/dev/null
+}
+
+# Extract all plans from pane output
+# Usage: extract_all_plans "$pane_output" "$artifacts_dir"
+# Args:
+#   $1: pane_output - raw output from agent pane
+#   $2: artifacts_dir - directory to save extracted plans
+# Returns: 0 if at least one plan extracted, 1 if none found
+extract_all_plans() {
+    local pane_output="$1"
+    local artifacts_dir="$2"
+    local found=0
+
+    [[ -z "$pane_output" || -z "$artifacts_dir" ]] && return 1
+
+    ensure_dir "$artifacts_dir"
+
+    # Try to extract each plan type
+    local plan_json
+
+    # Understanding plan (Phase 1)
+    if plan_json=$(extract_plan_json "$pane_output" "UNDERSTANDING"); then
+        echo "$plan_json" > "$artifacts_dir/understanding.json"
+        found=1
+    fi
+
+    # Commit plan (Phase 2)
+    if plan_json=$(extract_plan_json "$pane_output" "COMMIT_PLAN"); then
+        echo "$plan_json" > "$artifacts_dir/commit_plan.json"
+        found=1
+    fi
+
+    # Release plan (Phase 3)
+    if plan_json=$(extract_plan_json "$pane_output" "RELEASE_PLAN"); then
+        echo "$plan_json" > "$artifacts_dir/release_plan.json"
+        found=1
+    fi
+
+    [[ $found -eq 1 ]] && return 0
+    return 1
+}
+
 # Load per-repo agent-sweep configuration.
 # Usage: load_repo_agent_config /path/to/repo
 # Returns: 0 on success (uses defaults if no config found), 1 on invalid args
