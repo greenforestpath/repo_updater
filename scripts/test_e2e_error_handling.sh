@@ -678,4 +678,4 @@ run_test test_graceful_signal_handling
 run_test test_partial_state_write_recovery
 
 print_results
-exit $?
+exit "$(get_exit_code)"

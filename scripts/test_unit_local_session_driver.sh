@@ -421,4 +421,4 @@ run_test test_interrupt_session_returns_error_for_nonexistent
 run_test test_interrupt_session_sends_ctrl_c
 
 print_results
-exit $?
+exit "$(get_exit_code)"

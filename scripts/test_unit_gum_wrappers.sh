@@ -411,4 +411,4 @@ run_test test_gum_functions_respect_quiet_mode
 run_test test_gum_available_false_uses_fallback
 
 print_results
-exit $?
+exit "$(get_exit_code)"

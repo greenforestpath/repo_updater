@@ -213,4 +213,4 @@ run_test test_init_respects_xdg_config_home
 run_test test_init_example_flag
 
 print_results
-exit $?
+exit "$(get_exit_code)"

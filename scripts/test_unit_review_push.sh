@@ -166,4 +166,4 @@ run_test test_verify_push_safe_rejects_unanswered_questions
 run_test test_push_worktree_changes_ff_only_and_records_state
 
 print_results
-exit $?
+exit "$(get_exit_code)"

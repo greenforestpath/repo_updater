@@ -233,4 +233,4 @@ run_test test_legacy_create_mock_gh
 run_test test_e2e_logging_functions
 
 print_results
-exit $?
+exit "$(get_exit_code)"

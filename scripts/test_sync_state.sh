@@ -711,4 +711,4 @@ run_test test_is_repo_completed_last_item
 
 # Print results
 print_results
-exit $?
+exit "$(get_exit_code)"

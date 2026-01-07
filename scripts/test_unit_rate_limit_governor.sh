@@ -651,4 +651,4 @@ run_test test_check_model_rate_limit_clears_expired_backoff
 run_test test_check_model_rate_limit_no_log_dir
 
 print_results
-exit $?
+exit "$(get_exit_code)"

@@ -604,4 +604,4 @@ run_test test_canonicalize_gh_action_sorts_keys
 run_test test_canonicalize_gh_action_compact
 
 print_results
-exit $?
+exit "$(get_exit_code)"

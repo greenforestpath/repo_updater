@@ -417,4 +417,4 @@ run_test test_config_affects_sync
 run_test test_state_dir_creation
 
 print_results
-exit $?
+exit "$(get_exit_code)"

@@ -366,5 +366,5 @@ run_test test_worktree_skips_corrupted_repo
 run_test test_worktree_mapping_concurrent_updates
 
 print_results
-exit $?
+exit "$(get_exit_code)"
 

@@ -441,4 +441,4 @@ run_test test_unified_list_sessions_works
 run_test test_unified_send_to_session_works
 
 print_results
-exit $?
+exit "$(get_exit_code)"

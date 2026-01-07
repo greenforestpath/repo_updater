@@ -733,7 +733,7 @@ main() {
 
     # Print results
     print_results
-    return $?
+    return "$(get_exit_code)"
 }
 
 main "$@"

@@ -741,4 +741,4 @@ run_test test_sync_clone_dry_run_paths
 run_test test_sync_clone_parallel
 
 print_results
-exit $?
+exit "$(get_exit_code)"

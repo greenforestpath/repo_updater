@@ -679,4 +679,4 @@ run_test test_archive_review_plan_copies_into_state_dir
 run_test test_write_json_atomic_with_lock
 
 print_results
-exit $?
+exit "$(get_exit_code)"

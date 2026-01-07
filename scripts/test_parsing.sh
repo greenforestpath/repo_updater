@@ -833,4 +833,4 @@ run_test test_clone_target_same_name
 
 # Print results
 print_results
-exit $?
+exit "$(get_exit_code)"
