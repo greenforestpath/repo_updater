@@ -1852,6 +1852,196 @@ output_json() {
     fi
 }
 
+#------------------------------------------------------------------------------
+# AGENT-SWEEP ERROR FORMATTING
+#
+# User-friendly, actionable error messages for agent-sweep failures.
+# These functions produce consistent, helpful messages with fix suggestions.
+#------------------------------------------------------------------------------
+
+# Format a structured error message with reason and fix suggestion.
+# Args:
+#   $1: category - brief error category (e.g., "Cannot run agent-sweep on owner/repo")
+#   $2: reason - why the error occurred
+#   $3: fix - optional multiline fix suggestion
+# All output goes to stderr
+format_agent_sweep_error() {
+    local category="${1:-Unknown error}"
+    local reason="${2:-}"
+    local fix="${3:-}"
+
+    echo "" >&2
+    printf '%b\n' "${RED}ERROR:${RESET} $category" >&2
+    if [[ -n "$reason" ]]; then
+        printf '%b\n' "  ${DIM}Reason:${RESET} $reason" >&2
+    fi
+    if [[ -n "$fix" ]]; then
+        echo "" >&2
+        printf '%b\n' "  ${CYAN}To fix:${RESET}" >&2
+        echo "$fix" | sed 's/^/    /' >&2
+    fi
+    echo "" >&2
+}
+
+# Format a warning message (non-fatal but needs attention)
+format_agent_sweep_warning() {
+    local category="${1:-Warning}"
+    local message="${2:-}"
+    local options="${3:-}"
+
+    echo "" >&2
+    printf '%b\n' "${YELLOW}WARNING:${RESET} $category" >&2
+    if [[ -n "$message" ]]; then
+        printf '%b\n' "  $message" >&2
+    fi
+    if [[ -n "$options" ]]; then
+        echo "" >&2
+        printf '%b\n' "  ${CYAN}Options:${RESET}" >&2
+        echo "$options" | sed 's/^/    /' >&2
+    fi
+    echo "" >&2
+}
+
+# Preflight failure error
+error_preflight_uncommitted() {
+    local repo_path="$1"
+    format_agent_sweep_error \
+        "Cannot run agent-sweep on $(basename "$repo_path")" \
+        "Repository has uncommitted changes" \
+        "cd $repo_path
+git stash       # Save changes temporarily
+ru agent-sweep  # Run sweep
+git stash pop   # Restore changes"
+}
+
+error_preflight_conflicts() {
+    local repo_path="$1"
+    format_agent_sweep_error \
+        "Cannot run agent-sweep on $(basename "$repo_path")" \
+        "Repository has unresolved merge conflicts" \
+        "cd $repo_path
+git status      # See conflicting files
+# Resolve conflicts manually, then:
+git add .
+git commit"
+}
+
+error_preflight_detached() {
+    local repo_path="$1"
+    format_agent_sweep_error \
+        "Cannot run agent-sweep on $(basename "$repo_path")" \
+        "Repository is in detached HEAD state" \
+        "cd $repo_path
+git checkout main    # Or your default branch
+ru agent-sweep"
+}
+
+# NTM errors
+error_ntm_not_found() {
+    format_agent_sweep_error \
+        "ntm (Named Tmux Manager) not found" \
+        "agent-sweep requires ntm to spawn and manage AI agent sessions" \
+        "Install ntm from: https://github.com/dicklesworthstone/ntm
+Or check your PATH"
+}
+
+error_ntm_spawn_failed() {
+    local reason="$1"
+    format_agent_sweep_error \
+        "Failed to start AI agent session" \
+        "$reason" \
+        "Ensure ANTHROPIC_API_KEY or OPENAI_API_KEY is set
+Run: ntm doctor
+Check: ntm list (to see running sessions)"
+}
+
+error_ntm_no_api_key() {
+    format_agent_sweep_error \
+        "No API key configured for AI agent" \
+        "ntm requires an API key to communicate with AI providers" \
+        "Set one of:
+  export ANTHROPIC_API_KEY=sk-...
+  export OPENAI_API_KEY=sk-..."
+}
+
+# Agent timeout/failure
+warning_agent_timeout() {
+    local repo_name="$1"
+    local phase="$2"
+    local timeout_secs="$3"
+    format_agent_sweep_warning \
+        "Agent timed out during Phase $phase for $repo_name" \
+        "The agent did not complete within $timeout_secs seconds." \
+        "--timeout $((timeout_secs * 2))    # Increase timeout
+--retry          # Retry failed repos
+--skip $repo_name  # Skip this repo"
+}
+
+warning_agent_error() {
+    local repo_name="$1"
+    local error="$2"
+    format_agent_sweep_warning \
+        "Agent reported error for $repo_name" \
+        "$error" \
+        "--retry          # Retry failed repos
+--verbose        # See detailed output"
+}
+
+# Validation failures
+error_validation_denylist() {
+    local repo_name="$1"
+    local file="$2"
+    format_agent_sweep_error \
+        "Commit plan validation failed for $repo_name" \
+        "File matches denylist: $file" \
+        "The agent proposed a file that violates security rules.
+This file will not be committed.
+Edit .ru/agent-sweep.conf to allow if needed."
+}
+
+error_validation_size() {
+    local repo_name="$1"
+    local file="$2"
+    local size="$3"
+    local limit="$4"
+    format_agent_sweep_error \
+        "Commit plan validation failed for $repo_name" \
+        "File exceeds size limit: $file (${size}MB > ${limit}MB)" \
+        "Use --max-file-mb=$size to increase limit
+Or exclude this file from the commit plan."
+}
+
+error_validation_secrets() {
+    local repo_name="$1"
+    local details="$2"
+    format_agent_sweep_error \
+        "Secrets detected in changes for $repo_name" \
+        "$details" \
+        "Remove secrets before committing.
+Use --secret-scan=off to disable (not recommended).
+Check: gitleaks detect --source=$repo_name"
+}
+
+# Rate limit
+warning_rate_limit() {
+    local wait_secs="$1"
+    format_agent_sweep_warning \
+        "API rate limit reached" \
+        "Backing off for $wait_secs seconds before retry..." \
+        "Progress will resume automatically.
+Press Ctrl+C to interrupt (state will be saved)."
+}
+
+# Resume/restart hints
+info_resume_available() {
+    echo "" >&2
+    printf '%b\n' "${BLUE}ℹ${RESET} Interrupted sweep can be resumed:" >&2
+    printf '%b\n' "    ru agent-sweep --resume" >&2
+    printf '%b\n' "  Or start fresh:" >&2
+    printf '%b\n' "    ru agent-sweep --restart" >&2
+    echo "" >&2
+}
+
 #==============================================================================
 # SECTION 6: HELP AND VERSION
 #==============================================================================
