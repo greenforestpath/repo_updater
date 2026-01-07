@@ -955,6 +955,7 @@ run_test test_is_valid_config_key_invalid_with_space
 # resolve_config tests
 run_test test_resolve_config_uses_defaults
 run_test test_resolve_config_uses_config_file
+run_test test_resolve_config_expands_tilde
 run_test test_resolve_config_uses_env_vars
 run_test test_resolve_config_uses_cli_args
 run_test test_resolve_config_partial_config
