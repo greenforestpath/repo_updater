@@ -430,6 +430,168 @@ get_repo_name() {
 }
 
 #------------------------------------------------------------------------------
+# AGENT-SWEEP PER-REPO CONFIGURATION
+# Load per-repository agent-sweep configuration from .ru-agent.yml/.json
+#------------------------------------------------------------------------------
+
+# Default agent-sweep per-repo config values
+declare -g AGENT_SWEEP_ENABLED="true"
+declare -g AGENT_SWEEP_MAX_FILE_SIZE="5242880"
+declare -ga AGENT_SWEEP_SKIP_PHASES=()
+declare -g AGENT_SWEEP_EXTRA_CONTEXT=""
+declare -g AGENT_SWEEP_PRE_HOOK=""
+declare -g AGENT_SWEEP_POST_HOOK=""
+declare -ga AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
+
+# Load per-repo agent-sweep configuration.
+# Usage: load_repo_agent_config /path/to/repo
+# Returns: 0 on success (uses defaults if no config found), 1 on invalid args
+# Side effects: Sets AGENT_SWEEP_* globals based on config file
+load_repo_agent_config() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && return 1
+
+    # Reset to defaults before loading
+    AGENT_SWEEP_ENABLED="true"
+    AGENT_SWEEP_MAX_FILE_SIZE="5242880"
+    AGENT_SWEEP_SKIP_PHASES=()
+    AGENT_SWEEP_EXTRA_CONTEXT=""
+    AGENT_SWEEP_PRE_HOOK=""
+    AGENT_SWEEP_POST_HOOK=""
+    AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
+
+    # Find config file (YAML preferred, then JSON)
+    local config_file=""
+    for cfg in "$repo_path/.ru-agent.yml" "$repo_path/.ru-agent.yaml" "$repo_path/.ru-agent.json"; do
+        [[ -f "$cfg" ]] && { config_file="$cfg"; break; }
+    done
+    [[ -z "$config_file" ]] && return 0  # No config = use defaults
+
+    # Parse config with layered fallbacks: yq > python3 > jq (JSON only)
+    local is_yaml=false
+    [[ "$config_file" == *.yml || "$config_file" == *.yaml ]] && is_yaml=true
+
+    if $is_yaml && command -v yq &>/dev/null; then
+        # yq for YAML (preferred)
+        AGENT_SWEEP_ENABLED=$(yq -r '.agent_sweep.enabled // "true"' "$config_file" 2>/dev/null || echo "true")
+        AGENT_SWEEP_MAX_FILE_SIZE=$(yq -r '.agent_sweep.max_file_size // 5242880' "$config_file" 2>/dev/null || echo "5242880")
+        AGENT_SWEEP_EXTRA_CONTEXT=$(yq -r '.agent_sweep.extra_context // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_PRE_HOOK=$(yq -r '.agent_sweep.pre_hook // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_POST_HOOK=$(yq -r '.agent_sweep.post_hook // ""' "$config_file" 2>/dev/null || echo "")
+        local skip_json denylist_json
+        skip_json=$(yq -r '.agent_sweep.skip_phases // []' "$config_file" 2>/dev/null)
+        denylist_json=$(yq -r '.agent_sweep.denylist_extra // []' "$config_file" 2>/dev/null)
+        if [[ -n "$skip_json" && "$skip_json" != "null" && "$skip_json" != "[]" ]]; then
+            mapfile -t AGENT_SWEEP_SKIP_PHASES < <(echo "$skip_json" | yq -r '.[]' 2>/dev/null)
+        fi
+        if [[ -n "$denylist_json" && "$denylist_json" != "null" && "$denylist_json" != "[]" ]]; then
+            mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL < <(echo "$denylist_json" | yq -r '.[]' 2>/dev/null)
+        fi
+    elif $is_yaml && command -v python3 &>/dev/null; then
+        # python3 fallback for YAML
+        local py_output
+        py_output=$(python3 -c "
+import sys, yaml, json
+try:
+    with open(sys.argv[1]) as f:
+        data = yaml.safe_load(f) or {}
+    cfg = data.get('agent_sweep', {})
+    print(json.dumps({
+        'enabled': str(cfg.get('enabled', True)).lower(),
+        'max_file_size': cfg.get('max_file_size', 5242880),
+        'extra_context': cfg.get('extra_context', ''),
+        'pre_hook': cfg.get('pre_hook', ''),
+        'post_hook': cfg.get('post_hook', ''),
+        'skip_phases': cfg.get('skip_phases', []),
+        'denylist_extra': cfg.get('denylist_extra', [])
+    }))
+except Exception as e:
+    print('{\"error\": \"' + str(e) + '\"}', file=sys.stderr)
+    sys.exit(1)
+" "$config_file" 2>/dev/null)
+        if [[ $? -eq 0 && -n "$py_output" ]]; then
+            AGENT_SWEEP_ENABLED=$(json_get_field "$py_output" "enabled" || echo "true")
+            AGENT_SWEEP_MAX_FILE_SIZE=$(json_get_field "$py_output" "max_file_size" || echo "5242880")
+            AGENT_SWEEP_EXTRA_CONTEXT=$(json_get_field "$py_output" "extra_context" || echo "")
+            AGENT_SWEEP_PRE_HOOK=$(json_get_field "$py_output" "pre_hook" || echo "")
+            AGENT_SWEEP_POST_HOOK=$(json_get_field "$py_output" "post_hook" || echo "")
+            local skip_arr deny_arr
+            skip_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('skip_phases',[])))" 2>/dev/null)
+            deny_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('denylist_extra',[])))" 2>/dev/null)
+            [[ -n "$skip_arr" ]] && mapfile -t AGENT_SWEEP_SKIP_PHASES <<< "$skip_arr"
+            [[ -n "$deny_arr" ]] && mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL <<< "$deny_arr"
+        fi
+    elif ! $is_yaml && command -v jq &>/dev/null; then
+        # jq for JSON
+        AGENT_SWEEP_ENABLED=$(jq -r '.agent_sweep.enabled // true' "$config_file" 2>/dev/null || echo "true")
+        AGENT_SWEEP_MAX_FILE_SIZE=$(jq -r '.agent_sweep.max_file_size // 5242880' "$config_file" 2>/dev/null || echo "5242880")
+        AGENT_SWEEP_EXTRA_CONTEXT=$(jq -r '.agent_sweep.extra_context // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_PRE_HOOK=$(jq -r '.agent_sweep.pre_hook // ""' "$config_file" 2>/dev/null || echo "")
+        AGENT_SWEEP_POST_HOOK=$(jq -r '.agent_sweep.post_hook // ""' "$config_file" 2>/dev/null || echo "")
+        mapfile -t AGENT_SWEEP_SKIP_PHASES < <(jq -r '.agent_sweep.skip_phases // [] | .[]' "$config_file" 2>/dev/null)
+        mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL < <(jq -r '.agent_sweep.denylist_extra // [] | .[]' "$config_file" 2>/dev/null)
+    elif ! $is_yaml && command -v python3 &>/dev/null; then
+        # python3 fallback for JSON
+        local py_output
+        py_output=$(python3 -c "
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    cfg = data.get('agent_sweep', {})
+    print(json.dumps({
+        'enabled': str(cfg.get('enabled', True)).lower(),
+        'max_file_size': cfg.get('max_file_size', 5242880),
+        'extra_context': cfg.get('extra_context', ''),
+        'pre_hook': cfg.get('pre_hook', ''),
+        'post_hook': cfg.get('post_hook', ''),
+        'skip_phases': cfg.get('skip_phases', []),
+        'denylist_extra': cfg.get('denylist_extra', [])
+    }))
+except Exception as e:
+    print('{\"error\": \"' + str(e) + '\"}', file=sys.stderr)
+    sys.exit(1)
+" "$config_file" 2>/dev/null)
+        if [[ $? -eq 0 && -n "$py_output" ]]; then
+            AGENT_SWEEP_ENABLED=$(json_get_field "$py_output" "enabled" || echo "true")
+            AGENT_SWEEP_MAX_FILE_SIZE=$(json_get_field "$py_output" "max_file_size" || echo "5242880")
+            AGENT_SWEEP_EXTRA_CONTEXT=$(json_get_field "$py_output" "extra_context" || echo "")
+            AGENT_SWEEP_PRE_HOOK=$(json_get_field "$py_output" "pre_hook" || echo "")
+            AGENT_SWEEP_POST_HOOK=$(json_get_field "$py_output" "post_hook" || echo "")
+            local skip_arr deny_arr
+            skip_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('skip_phases',[])))" 2>/dev/null)
+            deny_arr=$(echo "$py_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(d.get('denylist_extra',[])))" 2>/dev/null)
+            [[ -n "$skip_arr" ]] && mapfile -t AGENT_SWEEP_SKIP_PHASES <<< "$skip_arr"
+            [[ -n "$deny_arr" ]] && mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL <<< "$deny_arr"
+        fi
+    fi
+    # If no parser available, stay with defaults (already set)
+    return 0
+}
+
+# Check if a phase should be skipped based on per-repo config.
+# Usage: should_skip_phase "phase_name"
+# Returns: 0 if phase should be skipped, 1 otherwise
+should_skip_phase() {
+    local phase="${1:-}"
+    [[ -z "$phase" ]] && return 1
+    local p
+    for p in "${AGENT_SWEEP_SKIP_PHASES[@]}"; do
+        [[ "$p" == "$phase" ]] && return 0
+    done
+    return 1
+}
+
+# Get combined denylist (global + per-repo local additions).
+# Outputs: newline-separated list of patterns
+get_combined_denylist() {
+    # Output global denylist
+    printf '%s\n' "${AGENT_SWEEP_DENYLIST[@]:-}"
+    # Append local additions
+    printf '%s\n' "${AGENT_SWEEP_DENYLIST_EXTRA_LOCAL[@]:-}"
+}
+
+#------------------------------------------------------------------------------
 # AGENT-SWEEP RESULT TRACKING
 # Functions for tracking per-repo results during sweep execution.
 #------------------------------------------------------------------------------
@@ -13253,8 +13415,8 @@ run_secret_scan() {
 
         for pattern in "${patterns[@]}"; do
             # Use -e to explicitly pass pattern (handles patterns starting with -)
-            # Use case-sensitive matching for token patterns
-            if echo "$diff_output" | grep -qE -e "$pattern"; then
+            # Use case-insensitive matching to catch PASSWORD=, Password=, etc.
+            if echo "$diff_output" | grep -qiE -e "$pattern"; then
                 exit_code=2  # Warning
                 findings+=("Potential secret pattern: $pattern")
             fi
