@@ -533,16 +533,16 @@ test_status_json_revlist_failure() {
 
     # Should still exit cleanly (exit code 0 or 2 for diverged)
     if [[ "$exit_code" -le 2 ]]; then
-        pass "status --json exits cleanly even with rev-list failure"
+        pass "status --json exits cleanly with diverged history"
     else
         fail "status --json exit code $exit_code (expected 0-2)"
     fi
 
     # Check if valid JSON
     if printf '%s\n' "$json_output" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
-        pass "JSON output is valid despite rev-list failure"
+        pass "JSON output is valid with diverged history"
     else
-        fail "JSON output is invalid when rev-list fails"
+        fail "JSON output is invalid with diverged history"
     fi
 
     # Check that ahead/behind are numeric (not "?")
