@@ -4987,6 +4987,11 @@ process_single_repo_worker() {
             echo "CONFLICT:diverged:$repo_label"
             return 0
         fi
+        if [[ "$status" == "no_upstream" ]]; then
+            write_result "$repo_label" "pull" "no_upstream" "0" "" "$local_path"
+            echo "CONFLICT:no_upstream:$repo_label"
+            return 0
+        fi
 
         if do_pull "$local_path" "$repo_label" "$update_strategy" "$autostash" "$branch" >/dev/null 2>&1; then
             echo "OK:updated:$repo_label"
@@ -6061,6 +6066,12 @@ cmd_sync() {
                 log_warn "Diverged: $repo_label"
                 ((conflicts++))
                 write_result "$repo_label" "pull" "diverged" "0" "" "$local_path"
+                continue
+            fi
+            if [[ "$status" == "no_upstream" ]]; then
+                log_warn "No upstream: $repo_label"
+                ((conflicts++))
+                write_result "$repo_label" "pull" "no_upstream" "0" "" "$local_path"
                 continue
             fi
 
@@ -12045,7 +12056,10 @@ update_review_state() {
             release_state_lock
             return 1
         fi
-        write_json_atomic "$state_file" "$updated"
+        if ! write_json_atomic "$state_file" "$updated"; then
+            release_state_lock
+            return 1
+        fi
     else
         # Without jq, we can't do complex updates
         log_warn "jq not available, state update skipped"
