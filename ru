@@ -971,6 +971,170 @@ filter_sweep_completed_repos() {
 }
 
 #------------------------------------------------------------------------------
+# AGENT-SWEEP ARTIFACT CAPTURE
+# Functions for capturing debugging artifacts (git state, pane output, etc.)
+# Artifacts are stored under: $RUN_ARTIFACTS_DIR/<repo_name>/
+#------------------------------------------------------------------------------
+
+# Set up artifact directory for a specific repo.
+# Usage: setup_repo_artifact_dir repo_path
+# Returns: Path to repo artifact directory (creates if needed)
+# Sets: CURRENT_REPO_ARTIFACT_DIR global
+declare -g CURRENT_REPO_ARTIFACT_DIR=""
+
+setup_repo_artifact_dir() {
+    local repo_path="${1:-}"
+    [[ -z "$repo_path" ]] && return 1
+    [[ -z "$RUN_ARTIFACTS_DIR" ]] && {
+        log_warn "setup_repo_artifact_dir: RUN_ARTIFACTS_DIR not set"
+        return 1
+    }
+
+    # Derive repo name from path (last component)
+    local repo_name
+    repo_name=$(basename "$repo_path")
+
+    CURRENT_REPO_ARTIFACT_DIR="${RUN_ARTIFACTS_DIR}/${repo_name}"
+    ensure_dir "$CURRENT_REPO_ARTIFACT_DIR"
+    echo "$CURRENT_REPO_ARTIFACT_DIR"
+}
+
+# Capture git state to a file for debugging.
+# Usage: capture_git_state repo_path output_file
+# Captures: status, recent log, branch info, HEAD, stash
+capture_git_state() {
+    local repo_path="${1:-}"
+    local output_file="${2:-}"
+
+    [[ -z "$repo_path" || ! -d "$repo_path" ]] && return 1
+    [[ -z "$output_file" ]] && return 1
+
+    {
+        echo "=== Captured at: $(date -Iseconds 2>/dev/null || date) ==="
+        echo ""
+        echo "=== git status ==="
+        git -C "$repo_path" status 2>&1
+        echo ""
+        echo "=== git log -5 --oneline ==="
+        git -C "$repo_path" log -5 --oneline 2>&1 || echo "(no commits)"
+        echo ""
+        echo "=== git branch -vv ==="
+        git -C "$repo_path" branch -vv 2>&1
+        echo ""
+        echo "=== HEAD ==="
+        git -C "$repo_path" rev-parse HEAD 2>&1 || echo "(no HEAD)"
+        echo ""
+        echo "=== git stash list ==="
+        git -C "$repo_path" stash list 2>&1 || echo "(no stash)"
+        echo ""
+        echo "=== git diff --stat ==="
+        git -C "$repo_path" diff --stat 2>&1 || echo "(no diff)"
+    } > "$output_file" 2>&1
+}
+
+# Capture last N lines from tmux pane to file.
+# Usage: capture_pane_tail session_name output_file [lines]
+# Args:
+#   session_name: tmux session name
+#   output_file: where to write captured output
+#   lines: number of lines to capture (default 400)
+capture_pane_tail() {
+    local session="${1:-}"
+    local output_file="${2:-}"
+    local lines="${3:-400}"
+
+    [[ -z "$session" || -z "$output_file" ]] && return 1
+
+    # Capture pane content - pane 1 is typically the agent workspace
+    # Use negative -S value to scroll back from current position
+    if tmux has-session -t "$session" 2>/dev/null; then
+        tmux capture-pane -t "${session}:0.1" -p -S -"$lines" > "$output_file" 2>/dev/null || {
+            # Fallback: try pane 0 if pane 1 doesn't exist
+            tmux capture-pane -t "${session}:0.0" -p -S -"$lines" > "$output_file" 2>/dev/null || true
+        }
+    else
+        echo "(session not found: $session)" > "$output_file"
+    fi
+}
+
+# Capture spawn response JSON to artifact file.
+# Usage: capture_spawn_response repo_path spawn_json
+capture_spawn_response() {
+    local repo_path="${1:-}"
+    local spawn_json="${2:-}"
+
+    [[ -z "$repo_path" || -z "$spawn_json" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+    echo "$spawn_json" > "${artifact_dir}/spawn.json"
+}
+
+# Capture plan JSON (commit or release) to artifact file.
+# Usage: capture_plan_json repo_path plan_type plan_json
+# Args:
+#   plan_type: "commit" or "release"
+capture_plan_json() {
+    local repo_path="${1:-}"
+    local plan_type="${2:-}"
+    local plan_json="${3:-}"
+
+    [[ -z "$repo_path" || -z "$plan_type" || -z "$plan_json" ]] && return 1
+    [[ "$plan_type" != "commit" && "$plan_type" != "release" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+    echo "$plan_json" > "${artifact_dir}/${plan_type}_plan.json"
+}
+
+# Append activity snapshot to NDJSON log.
+# Usage: log_activity_snapshot repo_path phase status [extra_json]
+log_activity_snapshot() {
+    local repo_path="${1:-}"
+    local phase="${2:-}"
+    local status="${3:-}"
+    local extra="${4:-}"
+
+    [[ -z "$repo_path" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+
+    local ts
+    ts=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local json="{\"ts\":\"$ts\",\"phase\":\"$phase\",\"status\":\"$status\""
+    [[ -n "$extra" ]] && json="${json},${extra}"
+    json="${json}}"
+
+    echo "$json" >> "${artifact_dir}/activity.ndjson"
+}
+
+# Capture full artifact set before killing session.
+# Usage: capture_final_artifacts repo_path session_name
+# Should be called BEFORE ntm_kill_session
+capture_final_artifacts() {
+    local repo_path="${1:-}"
+    local session_name="${2:-}"
+
+    [[ -z "$repo_path" ]] && return 1
+
+    local artifact_dir
+    artifact_dir=$(setup_repo_artifact_dir "$repo_path") || return 1
+
+    # Capture pane output before session is killed (CRITICAL)
+    if [[ -n "$session_name" ]]; then
+        capture_pane_tail "$session_name" "${artifact_dir}/pane_tail.txt" 400
+    fi
+
+    # Capture final git state
+    capture_git_state "$repo_path" "${artifact_dir}/git_after.txt"
+
+    # Log final activity
+    log_activity_snapshot "$repo_path" "complete" "captured"
+}
+
+#------------------------------------------------------------------------------
 # AGENT-SWEEP STATE PERSISTENCE
 #
 # Save/load/cleanup state for --resume and --restart functionality.
@@ -1129,6 +1293,124 @@ cleanup_agent_sweep_state() {
     local state_file="${AGENT_SWEEP_STATE_DIR}/state.json"
     rm -f "$state_file"
     log_verbose "Cleaned up agent-sweep state"
+}
+
+#------------------------------------------------------------------------------
+# AGENT-SWEEP RATE LIMIT BACKOFF
+#
+# Coordinate global pause across all parallel workers when rate limited.
+# Uses exponential backoff with jitter to avoid thundering herd.
+#------------------------------------------------------------------------------
+
+# Trigger global rate limit backoff.
+# All workers will pause until pause_until timestamp.
+# Args:
+#   $1: reason - description of why backoff triggered
+#   $2: current_delay - initial delay in seconds (default: 30)
+# Behavior:
+#   - Uses exponential backoff (doubles on repeated triggers)
+#   - Adds ±25% jitter to prevent thundering herd
+#   - Caps at 10 minutes max delay
+agent_sweep_backoff_trigger() {
+    local reason="${1:-rate_limited}"
+    local current_delay="${2:-30}"
+    local max_delay=600  # 10 minutes cap
+
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 1
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+    local backoff_lock="${AGENT_SWEEP_STATE_DIR}/locks/backoff.lock"
+
+    # Try to acquire lock with 10 second timeout
+    if dir_lock_acquire "$backoff_lock" 10; then
+        local now pause_until new_delay
+
+        # Check if already in backoff and extend with exponential increase
+        if [[ -f "$backoff_state_file" ]]; then
+            local current_pause
+            current_pause=$(json_get_field "$(cat "$backoff_state_file")" "pause_until" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            if [[ "$current_pause" -gt "$now" ]]; then
+                # Already paused, double the delay (exponential backoff)
+                new_delay=$((current_delay * 2))
+                [[ "$new_delay" -gt "$max_delay" ]] && new_delay=$max_delay
+            else
+                new_delay=$current_delay
+            fi
+        else
+            new_delay=$current_delay
+        fi
+
+        # Add jitter (±25%) to prevent thundering herd
+        # RANDOM is 0-32767, scale to ±25% of delay
+        local jitter_range=$((new_delay / 2))
+        local jitter=0
+        if [[ $jitter_range -gt 0 ]]; then
+            jitter=$(( (RANDOM % jitter_range) - (jitter_range / 2) ))
+        fi
+        new_delay=$((new_delay + jitter))
+        [[ "$new_delay" -lt 5 ]] && new_delay=5  # Minimum 5 seconds
+
+        pause_until=$(($(date +%s) + new_delay))
+
+        # Write state atomically
+        local escaped_reason
+        escaped_reason=$(json_escape "$reason")
+        echo "{\"reason\":\"$escaped_reason\",\"pause_until\":$pause_until,\"delay\":$new_delay}" > "$backoff_state_file"
+
+        log_warn "Rate limit detected ($reason), global pause for ${new_delay}s"
+        dir_lock_release "$backoff_lock"
+        return 0
+    else
+        log_warn "Could not acquire backoff lock"
+        return 1
+    fi
+}
+
+# Wait if global backoff is active.
+# Should be called before starting work on a repo.
+# Returns: 0 after wait completes or no wait needed, 1 on error
+agent_sweep_backoff_wait_if_needed() {
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 0
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+
+    [[ ! -f "$backoff_state_file" ]] && return 0
+
+    local pause_until now
+    pause_until=$(json_get_field "$(cat "$backoff_state_file")" "pause_until" 2>/dev/null || echo 0)
+    now=$(date +%s)
+
+    if [[ "$pause_until" -gt "$now" ]]; then
+        local wait_secs=$((pause_until - now))
+        log_warn "Global backoff active, waiting ${wait_secs}s..."
+        sleep "$wait_secs"
+    fi
+    return 0
+}
+
+# Clear backoff state (call on successful completion).
+agent_sweep_backoff_clear() {
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 0
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+    rm -f "$backoff_state_file"
+    log_verbose "Cleared rate limit backoff state"
+}
+
+# Check if currently in backoff (non-blocking check).
+# Returns: 0 if in backoff, 1 if not
+agent_sweep_backoff_active() {
+    [[ -z "$AGENT_SWEEP_STATE_DIR" ]] && return 1
+
+    local backoff_state_file="${AGENT_SWEEP_STATE_DIR}/backoff.state"
+    [[ ! -f "$backoff_state_file" ]] && return 1
+
+    local pause_until now
+    pause_until=$(json_get_field "$(cat "$backoff_state_file")" "pause_until" 2>/dev/null || echo 0)
+    now=$(date +%s)
+
+    [[ "$pause_until" -gt "$now" ]]
 }
 
 # mktemp compatibility: BSD (macOS) mktemp requires a template or -t.
