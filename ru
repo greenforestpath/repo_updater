@@ -9119,12 +9119,15 @@ cleanup_agent_sweep_sessions() {
     sessions=$(ntm --robot-status 2>/dev/null | \
         grep -oE '"name":"ru_sweep_[^"]*"' | cut -d'"' -f4) || true
 
+    # Disable glob expansion for safe iteration over session names
+    set -f
     for session in $sessions; do
         # Only kill sessions from this PID (pattern: ru_sweep_*_$$)
         if [[ "$session" == *"_$$"* ]] || [[ "$session" == *"_$$_"* ]]; then
             ntm_kill_session "$session"
         fi
     done
+    set +f
 }
 
 # Release agent-sweep instance lock (if held).
@@ -14291,8 +14294,11 @@ cmd_review() {
                 fi
             done < <(get_all_repos)
         else
+            # Use IFS+read to safely split without glob expansion
+            local -a tokens
+            IFS=' ' read -ra tokens <<< "$REVIEW_INVALIDATE_CACHE"
             local token
-            for token in $REVIEW_INVALIDATE_CACHE; do
+            for token in "${tokens[@]}"; do
                 invalidate_repos+=("$token")
             done
         fi
