@@ -773,15 +773,20 @@ print(json.dumps(repos))
     local fail_count="${SWEEP_FAIL_COUNT:-0}"
     local skip_count="${SWEEP_SKIP_COUNT:-0}"
 
+    # Escape string values for JSON safety
+    local run_id_escaped current_repo_escaped
+    run_id_escaped=$(json_escape "$RUN_ID")
+    current_repo_escaped=$(json_escape "$SWEEP_CURRENT_REPO")
+
     # Write state atomically
     cat > "$tmp_file" <<EOF
 {
-  "run_id": "$RUN_ID",
+  "run_id": "$run_id_escaped",
   "status": "$status",
   "started_at": "$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)",
   "with_release": $with_release_json,
   "repos_completed": $completed_json,
-  "current_repo": "$SWEEP_CURRENT_REPO",
+  "current_repo": "$current_repo_escaped",
   "current_phase": $current_phase,
   "success_count": $success_count,
   "fail_count": $fail_count,
