@@ -1223,6 +1223,7 @@ log_activity_snapshot() {
     local ts
     ts=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
 
+    # Build JSON - phase/status are controlled strings (no special chars expected)
     local json="{\"ts\":\"$ts\",\"phase\":\"$phase\",\"status\":\"$status\""
     [[ -n "$extra" ]] && json="${json},${extra}"
     json="${json}}"
@@ -15354,6 +15355,10 @@ cmd_agent_sweep() {
 
     # Concurrent instance lock
     local lock_dir="$state_dir/instance.lock"
+
+    # Helper to release lock (removes pid file then directory)
+    release_lock() { rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null || true; }
+
     if ! mkdir "$lock_dir" 2>/dev/null; then
         local existing_pid
         existing_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "unknown")
@@ -15362,7 +15367,7 @@ cmd_agent_sweep() {
         return 1
     fi
     echo $$ > "$lock_dir/pid"
-    trap 'rmdir "$lock_dir" 2>/dev/null; rm -f "$lock_dir/pid" 2>/dev/null' EXIT
+    trap 'release_lock' EXIT
 
     # Check ntm availability
     if ! ntm_check_available; then
@@ -15598,19 +15603,19 @@ print_agent_sweep_summary() {
             --arg art "${RUN_ARTIFACTS_DIR:-}" \
             '{timestamp:$ts,run_id:$rid,duration_seconds:$dur,summary:{total:$t,succeeded:$s,failed:$f,skipped:$k},artifacts_dir:$art,repos:$repos}'
     else
-        # Human-readable box output
-        cat >&2 <<EOF
-
-╭─────────────────────────────────────────────────────────────╮
-│                   Agent Sweep Complete                       │
-│                                                             │
-│  Processed: $t repos
-│  Succeeded: $s
-│  Failed:    $f
-│  Skipped:   $k
-│  Total time: $duration_str
-╰─────────────────────────────────────────────────────────────╯
-EOF
+        # Human-readable box output (63 chars wide)
+        {
+            echo ""
+            echo "╭─────────────────────────────────────────────────────────────╮"
+            echo "│                   Agent Sweep Complete                       │"
+            echo "│                                                             │"
+            printf "│  Processed: %-48s │\n" "$t repos"
+            printf "│  Succeeded: %-48s │\n" "$s"
+            printf "│  Failed:    %-48s │\n" "$f"
+            printf "│  Skipped:   %-48s │\n" "$k"
+            printf "│  Total time: %-47s │\n" "$duration_str"
+            echo "╰─────────────────────────────────────────────────────────────╯"
+        } >&2
 
         # Show failed repos if any
         if (( f > 0 )); then
