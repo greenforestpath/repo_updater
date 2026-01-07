@@ -133,6 +133,58 @@ test_backoff_trigger_creates_state() {
     log_test_pass "$test_name"
 }
 
+test_backoff_trigger_writes_reason() {
+    local test_name="agent_sweep_backoff_trigger: writes reason field"
+    log_test_start "$test_name"
+
+    if ! require_function "agent_sweep_backoff_trigger"; then
+        return 0
+    fi
+    if ! require_function "json_get_field"; then
+        return 0
+    fi
+
+    setup_parallel_env
+
+    agent_sweep_backoff_trigger "rate_limited" 1
+
+    local state_file="$AGENT_SWEEP_STATE_DIR/backoff.state"
+    local reason
+    reason=$(json_get_field "$(cat "$state_file")" "reason" 2>/dev/null || echo "")
+    assert_equals "rate_limited" "$reason" "backoff reason recorded"
+
+    log_test_pass "$test_name"
+}
+
+test_backoff_trigger_extends_when_active() {
+    local test_name="agent_sweep_backoff_trigger: extends active backoff"
+    log_test_start "$test_name"
+
+    if ! require_function "agent_sweep_backoff_trigger"; then
+        return 0
+    fi
+    if ! require_function "json_get_field"; then
+        return 0
+    fi
+
+    setup_parallel_env
+
+    local state_file="$AGENT_SWEEP_STATE_DIR/backoff.state"
+    local now
+    now=$(date +%s)
+    cat > "$state_file" <<STATE_EOF
+{"reason":"rate_limited","pause_until":$((now + 5))}
+STATE_EOF
+
+    agent_sweep_backoff_trigger "rate_limited" 1
+
+    local pause_until
+    pause_until=$(json_get_field "$(cat "$state_file")" "pause_until" 2>/dev/null || echo 0)
+    assert_true "pause_until extended" "[[ \"$pause_until\" -ge $((now + 2)) ]]"
+
+    log_test_pass "$test_name"
+}
+
 test_backoff_wait_skips_when_expired() {
     local test_name="agent_sweep_backoff_wait_if_needed: no sleep when expired"
     log_test_start "$test_name"
@@ -179,6 +231,8 @@ run_test test_dir_lock_acquire_release
 run_test test_dir_lock_contention_timeout
 run_test test_dir_lock_stale_cleanup
 run_test test_backoff_trigger_creates_state
+run_test test_backoff_trigger_writes_reason
+run_test test_backoff_trigger_extends_when_active
 run_test test_backoff_wait_skips_when_expired
 run_test test_parallel_agent_sweep_requires_function
 print_results
