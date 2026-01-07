@@ -350,14 +350,19 @@ repo_spec_to_path() {
     local repo_spec="${1:-}"
     [[ -z "$repo_spec" ]] && return 1
 
-    # Strip optional @branch suffix
-    local repo="${repo_spec%%@*}"
-    # Extract repo name (last component)
-    local repo_name="${repo##*/}"
     # Use resolved config first, then env override, then default
     local projects_dir="${PROJECTS_DIR:-${RU_PROJECTS_DIR:-/data/projects}}"
+    local layout="${LAYOUT:-flat}"
 
-    echo "${projects_dir}/${repo_name}"
+    # Prefer full repo spec resolution (handles custom names + layouts)
+    local url branch custom_name path repo_id
+    if resolve_repo_spec "$repo_spec" "$projects_dir" "$layout" \
+        url branch custom_name path repo_id 2>/dev/null; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+
+    return 1
 }
 
 # Load all repos from config files into an array
@@ -368,7 +373,7 @@ load_all_repos() {
     local -n repos_ref=$1
     repos_ref=()
 
-    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ru"
+    local config_dir="${RU_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ru}"
     local repos_d="${config_dir}/repos.d"
 
     # Load from each file in repos.d
