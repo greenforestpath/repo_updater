@@ -21,6 +21,8 @@
 # Also tests run_parallel_preflight() function.
 #
 # shellcheck disable=SC2034  # Variables used by framework/sourced functions
+# shellcheck disable=SC2119  # Functions have default args, calling without args is intentional
+# shellcheck disable=SC2120  # Functions have default args, calling without args is intentional
 
 set -uo pipefail
 
@@ -522,7 +524,8 @@ test_preflight_diverged_from_upstream() {
 
     # Verify divergence
     local ahead behind
-    read -r ahead behind < <(git -C "$repo_dir" rev-list --left-right --count HEAD...@{u} 2>/dev/null)
+    # shellcheck disable=SC1083  # @{u} is valid git syntax for upstream
+    read -r ahead behind < <(git -C "$repo_dir" rev-list --left-right --count "HEAD...@{u}" 2>/dev/null)
     if [[ "$ahead" -eq 0 || "$behind" -eq 0 ]]; then
         skip_test "Failed to create diverged state (ahead=$ahead, behind=$behind)"
         return 0
@@ -895,7 +898,7 @@ main() {
     run_test test_parallel_preflight
 
     print_results
-    return $(get_exit_code)
+    return "$(get_exit_code)"
 }
 
 main "$@"
