@@ -1326,6 +1326,10 @@ validate_release_plan() {
         # Default to version if tag_name not provided
         tag_name="$version"
     fi
+    # Align with execute_release_plan behavior: prefix v if version has v
+    if [[ "$version" == v* && "$tag_name" != v* ]]; then
+        tag_name="v$tag_name"
+    fi
     # Check tag doesn't already exist
     if git -C "$repo_path" rev-parse "refs/tags/$tag_name" >/dev/null 2>&1; then
         VALIDATION_ERROR="Tag already exists: $tag_name"
@@ -4421,11 +4425,12 @@ get_repo_status() {
     fi
 
     # Get ahead/behind counts using plumbing (deterministic, locale-independent)
-    local ahead=0 behind=0
+    local ahead=0 behind=0 output
     # shellcheck disable=SC1083  # @{u} is valid git syntax for upstream tracking branch
     if ! output=$(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null); then
-        # If rev-list fails (e.g. unrelated histories), assume diverged
-        echo "STATUS=diverged AHEAD=? BEHIND=? DIRTY=$dirty BRANCH=$branch"
+        # If rev-list fails (e.g. unrelated histories), use -1 to indicate unknown
+        # (must be numeric for JSON output compatibility, ? would break printf %d)
+        echo "STATUS=diverged AHEAD=-1 BEHIND=-1 DIRTY=$dirty BRANCH=$branch"
         return 0
     fi
     read -r ahead behind <<< "$output"

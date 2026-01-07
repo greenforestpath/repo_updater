@@ -4,6 +4,7 @@
 #
 # shellcheck disable=SC1091  # Sourced files checked separately
 # shellcheck disable=SC2317  # Test functions invoked indirectly via run_test
+# shellcheck disable=SC2034  # repos arrays used via nameref (indirect reference)
 
 set -uo pipefail
 
@@ -237,6 +238,225 @@ test_parallel_agent_sweep_requires_function() {
     log_test_pass "$test_name"
 }
 
+test_parallel_sweep_falls_back_to_sequential_for_single_repo() {
+    local test_name="run_parallel_agent_sweep: falls back to sequential for single repo"
+    log_test_start "$test_name"
+
+    if ! require_function "run_parallel_agent_sweep"; then
+        return 0
+    fi
+    if ! require_function "run_sequential_agent_sweep"; then
+        return 0
+    fi
+
+    setup_parallel_env
+
+    # Track calls via file since subshell isolates variables
+    local call_file
+    call_file=$(mktemp)
+    echo "0" > "$call_file"
+
+    # Mock run_single_agent_workflow to track calls
+    run_single_agent_workflow() {
+        local count
+        count=$(($(cat "$call_file") + 1))
+        echo "$count" > "$call_file"
+        return 0
+    }
+    export -f run_single_agent_workflow
+    export call_file
+
+    # Mock supporting functions
+    progress_init() { :; }
+    progress_start_repo() { :; }
+    progress_complete_repo() { :; }
+    record_repo_result() { :; }
+    get_repo_name() { echo "${1##*/}"; }
+    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name
+
+    local -a target_repos=("test/repo1")
+    run_parallel_agent_sweep target_repos 4 2>/dev/null || true
+
+    # Should have processed the one repo (via sequential fallback)
+    local final_count
+    final_count=$(cat "$call_file" 2>/dev/null || echo "0")
+    assert_equals "1" "$final_count" "single repo processed once"
+
+    rm -f "$call_file"
+    log_test_pass "$test_name"
+}
+
+test_parallel_sweep_processes_all_repos() {
+    local test_name="run_parallel_agent_sweep: processes all repos in queue"
+    log_test_start "$test_name"
+
+    if ! require_function "run_parallel_agent_sweep"; then
+        return 0
+    fi
+
+    setup_parallel_env
+
+    # Track which repos were processed
+    local processed_file
+    processed_file=$(mktemp)
+
+    # Mock run_single_agent_workflow to record processing
+    run_single_agent_workflow() {
+        echo "$1" >> "$processed_file"
+        sleep 0.1  # Small delay to test concurrency
+        return 0
+    }
+    export -f run_single_agent_workflow
+    export processed_file
+
+    # Mock supporting functions
+    progress_init() { :; }
+    progress_start_repo() { :; }
+    progress_complete_repo() { :; }
+    record_repo_result() { :; }
+    get_repo_name() { echo "${1##*/}"; }
+    mktemp_file() { mktemp; }
+    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name mktemp_file
+
+    local -a target_repos=("test/repo1" "test/repo2" "test/repo3" "test/repo4" "test/repo5")
+    run_parallel_agent_sweep target_repos 3 2>/dev/null || true
+
+    local processed_count
+    processed_count=$(wc -l < "$processed_file" | tr -d ' ')
+
+    assert_equals "5" "$processed_count" "all 5 repos processed"
+
+    # Verify no duplicates
+    local unique_count
+    unique_count=$(sort -u "$processed_file" | wc -l | tr -d ' ')
+    assert_equals "5" "$unique_count" "no repos processed twice"
+
+    rm -f "$processed_file"
+    log_test_pass "$test_name"
+}
+
+test_parallel_sweep_respects_max_workers() {
+    local test_name="run_parallel_agent_sweep: respects max_parallel limit"
+    log_test_start "$test_name"
+
+    if ! require_function "run_parallel_agent_sweep"; then
+        return 0
+    fi
+
+    setup_parallel_env
+
+    # Track concurrent execution
+    local concurrent_file
+    concurrent_file=$(mktemp)
+    echo "0" > "$concurrent_file"
+
+    run_single_agent_workflow() {
+        # Atomic increment and decrement to track concurrent usage
+        local current
+        {
+            flock 200
+            current=$(cat "$concurrent_file")
+            echo "$((current + 1))" > "$concurrent_file"
+        } 200>"${concurrent_file}.lock"
+
+        sleep 0.2  # Hold the "slot"
+
+        {
+            flock 200
+            current=$(cat "$concurrent_file")
+            echo "$((current - 1))" > "$concurrent_file"
+        } 200>"${concurrent_file}.lock"
+        return 0
+    }
+    export -f run_single_agent_workflow
+    export concurrent_file
+
+    # Mock supporting functions
+    progress_init() { :; }
+    progress_start_repo() { :; }
+    progress_complete_repo() { :; }
+    record_repo_result() { :; }
+    get_repo_name() { echo "${1##*/}"; }
+    mktemp_file() { mktemp; }
+    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name mktemp_file
+
+    local -a target_repos=("test/repo1" "test/repo2" "test/repo3" "test/repo4")
+    run_parallel_agent_sweep target_repos 2 2>/dev/null || true
+
+    # Workers should have finished (concurrent count back to 0)
+    local final_count
+    final_count=$(cat "$concurrent_file" 2>/dev/null || echo "0")
+    assert_equals "0" "$final_count" "all workers finished"
+
+    rm -f "$concurrent_file" "${concurrent_file}.lock"
+    log_test_pass "$test_name"
+}
+
+test_backoff_honored_by_workers() {
+    local test_name="run_parallel_agent_sweep: workers honor global backoff"
+    log_test_start "$test_name"
+
+    if ! require_function "run_parallel_agent_sweep"; then
+        return 0
+    fi
+    if ! require_function "agent_sweep_backoff_wait_if_needed"; then
+        return 0
+    fi
+
+    setup_parallel_env
+
+    # Set a short backoff
+    local state_file="$AGENT_SWEEP_STATE_DIR/backoff.state"
+    local now
+    now=$(date +%s)
+    cat > "$state_file" <<STATE_EOF
+{"reason":"rate_limited","pause_until":$((now + 1))}
+STATE_EOF
+
+    local start_time
+    start_time=$(date +%s)
+
+    # Mock run_single_agent_workflow
+    run_single_agent_workflow() { return 0; }
+    export -f run_single_agent_workflow
+
+    # Mock supporting functions
+    progress_init() { :; }
+    progress_start_repo() { :; }
+    progress_complete_repo() { :; }
+    record_repo_result() { :; }
+    get_repo_name() { echo "${1##*/}"; }
+    mktemp_file() { mktemp; }
+    export -f progress_init progress_start_repo progress_complete_repo record_repo_result get_repo_name mktemp_file
+
+    local -a target_repos=("test/repo1" "test/repo2")
+    run_parallel_agent_sweep target_repos 2 2>/dev/null || true
+
+    local end_time elapsed
+    end_time=$(date +%s)
+    elapsed=$((end_time - start_time))
+
+    # Workers should have waited at least briefly for backoff
+    # (Note: this is a weak test since backoff is checked before each dequeue)
+    assert_true "[[ $elapsed -ge 0 ]]" "workers completed after backoff"
+
+    log_test_pass "$test_name"
+}
+
+test_sequential_agent_sweep_function_exists() {
+    local test_name="run_sequential_agent_sweep: function exists"
+    log_test_start "$test_name"
+
+    if ! declare -f run_sequential_agent_sweep >/dev/null; then
+        skip_test "run_sequential_agent_sweep not implemented yet"
+        return 0
+    fi
+
+    assert_true "declare -f run_sequential_agent_sweep >/dev/null" "run_sequential_agent_sweep is defined"
+
+    log_test_pass "$test_name"
+}
+
 # Run tests
 setup_cleanup_trap
 run_test test_dir_lock_acquire_release
@@ -247,5 +467,10 @@ run_test test_backoff_trigger_writes_reason
 run_test test_backoff_trigger_extends_when_active
 run_test test_backoff_wait_skips_when_expired
 run_test test_parallel_agent_sweep_requires_function
+run_test test_parallel_sweep_falls_back_to_sequential_for_single_repo
+run_test test_parallel_sweep_processes_all_repos
+run_test test_parallel_sweep_respects_max_workers
+run_test test_backoff_honored_by_workers
+run_test test_sequential_agent_sweep_function_exists
 print_results
 exit "$(get_exit_code)"

@@ -993,6 +993,66 @@ test_status_with_merge_conflicts() {
     cleanup_test_env
 }
 
+# Regression test for bd-jleo: rev-list failure should output numeric AHEAD/BEHIND
+test_status_revlist_failure_numeric() {
+    echo "Testing get_repo_status outputs numeric AHEAD/BEHIND on rev-list failure (bd-jleo)..."
+    setup_test_env
+
+    local remote=$(create_remote_repo "revlist-fail")
+    local work_dir="$PROJECTS_DIR/revlist-fail"
+
+    # Create a normal repo with upstream tracking
+    init_repo_with_commit "$remote" "$work_dir"
+
+    # Create a mock git wrapper that fails specifically for rev-list --left-right
+    # This simulates edge cases like shallow clones with missing history
+    local mock_bin="$TEMP_DIR/mock-bin"
+    mkdir -p "$mock_bin"
+    cat > "$mock_bin/git" << 'MOCK_GIT'
+#!/usr/bin/env bash
+# Mock git that fails on rev-list --left-right (simulates shallow clone edge case)
+for arg in "$@"; do
+    if [[ "$arg" == "--left-right" ]]; then
+        exit 1
+    fi
+done
+# Otherwise pass through to real git
+exec /usr/bin/git "$@"
+MOCK_GIT
+    chmod +x "$mock_bin/git"
+
+    # Run get_repo_status with mock git in PATH
+    local status_line
+    status_line=$(PATH="$mock_bin:$PATH" get_repo_status "$work_dir" "false")
+
+    # Key assertion: AHEAD and BEHIND must be numeric (not "?")
+    local ahead_val behind_val
+    ahead_val=$(echo "$status_line" | sed 's/.*AHEAD=\([^ ]*\).*/\1/')
+    behind_val=$(echo "$status_line" | sed 's/.*BEHIND=\([^ ]*\).*/\1/')
+
+    # Both must be -1 (numeric indicator of unknown) for JSON compatibility
+    assert_equals "-1" "$ahead_val" "AHEAD should be -1 on rev-list failure (not '?')"
+    assert_equals "-1" "$behind_val" "BEHIND should be -1 on rev-list failure (not '?')"
+
+    # Also verify status is diverged (indicates rev-list failure path)
+    assert_contains "$status_line" "STATUS=diverged" "Status should be diverged on rev-list failure"
+
+    # Verify these are valid for printf %d (would fail with '?')
+    if printf '%d' "$ahead_val" >/dev/null 2>&1; then
+        pass "AHEAD value is valid for printf %d"
+    else
+        fail "AHEAD value '$ahead_val' is not valid for printf %d"
+    fi
+
+    if printf '%d' "$behind_val" >/dev/null 2>&1; then
+        pass "BEHIND value is valid for printf %d"
+    else
+        fail "BEHIND value '$behind_val' is not valid for printf %d"
+    fi
+
+    cleanup_test_env
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -1097,6 +1157,9 @@ test_do_pull_diverged_rebase_succeeds
 echo ""
 
 test_status_with_merge_conflicts
+echo ""
+
+test_status_revlist_failure_numeric
 echo ""
 
 echo "============================================"

@@ -496,6 +496,73 @@ test_status_json_output() {
     cleanup_test_env
 }
 
+test_status_json_revlist_failure() {
+    echo "Test: ru status --json handles rev-list failure gracefully (bd-jleo regression)"
+    setup_test_env
+
+    # Create a remote repo
+    local remote
+    remote=$(create_remote_repo "revlist-test")
+    clone_to_projects "$remote" "revlist-test"
+    local repo_dir="$TEST_PROJECTS_DIR/revlist-test"
+
+    init_test_config
+    add_repo_to_config "revlist-test"
+
+    # Force rev-list to fail by creating unrelated histories
+    # Reset origin/main to an orphan commit that has no common ancestor with HEAD
+    git -C "$repo_dir" checkout --orphan temp-orphan >/dev/null 2>&1
+    echo "orphan content" > "$repo_dir/orphan.txt"
+    git -C "$repo_dir" add orphan.txt
+    git -C "$repo_dir" commit -m "Orphan commit" >/dev/null 2>&1
+    local orphan_sha
+    orphan_sha=$(git -C "$repo_dir" rev-parse HEAD)
+    git -C "$repo_dir" checkout main >/dev/null 2>&1
+    # Point origin/main to the orphan commit (unrelated history)
+    git -C "$repo_dir" update-ref refs/remotes/origin/main "$orphan_sha"
+
+    # Now rev-list will fail because HEAD and origin/main have no common ancestor
+    local json_output
+    json_output=$("$RU_SCRIPT" status --no-fetch --json --non-interactive 2>/dev/null)
+    local exit_code=$?
+
+    # Should still exit cleanly (exit code 0 or 2 for diverged)
+    if [[ "$exit_code" -le 2 ]]; then
+        pass "status --json exits cleanly even with rev-list failure"
+    else
+        fail "status --json exit code $exit_code (expected 0-2)"
+    fi
+
+    # Check if valid JSON
+    if printf '%s\n' "$json_output" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
+        pass "JSON output is valid despite rev-list failure"
+    else
+        fail "JSON output is invalid when rev-list fails"
+    fi
+
+    # Check that ahead/behind are numeric (not "?")
+    # Note: ru status --json outputs an array directly, not {"repos": [...]}
+    local ahead behind
+    ahead=$(printf '%s\n' "$json_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data[0]['ahead'])" 2>/dev/null || echo "ERROR")
+    behind=$(printf '%s\n' "$json_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data[0]['behind'])" 2>/dev/null || echo "ERROR")
+
+    # Check ahead is numeric
+    if [[ "$ahead" =~ ^-?[0-9]+$ ]]; then
+        pass "ahead is numeric ($ahead)"
+    else
+        fail "ahead is not numeric: $ahead"
+    fi
+
+    # Check behind is numeric
+    if [[ "$behind" =~ ^-?[0-9]+$ ]]; then
+        pass "behind is numeric ($behind)"
+    else
+        fail "behind is not numeric: $behind"
+    fi
+
+    cleanup_test_env
+}
+
 #==============================================================================
 # Run Tests
 #==============================================================================
@@ -533,6 +600,9 @@ test_status_shows_missing
 echo ""
 
 test_status_json_output
+echo ""
+
+test_status_json_revlist_failure
 echo ""
 
 echo "============================================"
