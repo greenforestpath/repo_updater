@@ -49,6 +49,9 @@ fi
 # Stub log_warn to avoid errors
 log_warn() { :; }
 
+# Initialize required global arrays before sourcing extracted code
+declare -ga AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
+
 #------------------------------------------------------------------------------
 # Source the denylist functions at global scope (declare -a creates local vars in functions)
 # Extract from the array declaration to just before detect_review_driver
