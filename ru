@@ -15698,8 +15698,8 @@ run_secret_scan() {
             gl_summary=$(echo "$gl_output" | head -3 | tr '\n' ' ')
             findings+=("gitleaks: ${gl_summary:-detected potential secrets}")
         fi
-    # Layer 2: Use detect-secrets if available
-    elif command -v detect-secrets &>/dev/null; then
+    # Layer 2: Use detect-secrets if available (requires jq to parse output)
+    elif command -v detect-secrets &>/dev/null && command -v jq &>/dev/null; then
         log_verbose "Scanning for secrets with detect-secrets"
         local ds_output ds_count
         if ds_output=$(detect-secrets scan "$project_dir" 2>/dev/null); then
@@ -15720,6 +15720,10 @@ run_secret_scan() {
 
     # Layer 3: Regex fallback - used when no external scanner succeeded
     if [[ "$scanner_ran" != "true" ]]; then
+        # Log why detect-secrets was skipped if it's installed but jq is missing
+        if command -v detect-secrets &>/dev/null && ! command -v jq &>/dev/null; then
+            log_verbose "Skipping detect-secrets (requires jq to parse output)"
+        fi
         # Layer 3: Regex fallback with comprehensive patterns
         log_verbose "Scanning for secrets with regex patterns"
         local patterns=(
