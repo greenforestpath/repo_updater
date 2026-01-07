@@ -9937,7 +9937,10 @@ write_questions_queue() {
 
     local payload
     payload=$(jq -n --argjson questions "$questions_json" '{version:1, questions:$questions}')
-    with_state_lock write_json_atomic "$questions_file" "$payload"
+    if ! with_state_lock write_json_atomic "$questions_file" "$payload"; then
+        log_warn "Failed to write questions queue"
+        return 1
+    fi
 }
 
 update_question_in_queue() {
@@ -9970,7 +9973,10 @@ update_question_in_queue() {
     fi
 
     updated=$(echo "$current" | jq --arg qid "$question_id" "$@" "$update_filter" 2>/dev/null) || return 1
-    with_state_lock write_json_atomic "$questions_file" "$updated"
+    if ! with_state_lock write_json_atomic "$questions_file" "$updated"; then
+        log_warn "Failed to update question in queue"
+        return 1
+    fi
 }
 
 mark_question_answered() {
@@ -10283,7 +10289,7 @@ dashboard_skip_all_questions() {
     ' 2>/dev/null || echo "")
 
     if [[ -n "$updated" ]]; then
-        with_state_lock write_json_atomic "$questions_file" "$updated"
+        with_state_lock write_json_atomic "$questions_file" "$updated" || return 1
     fi
 }
 
@@ -12031,7 +12037,10 @@ init_review_state() {
 
     if [[ ! -f "$state_file" ]]; then
         local initial_state='{"version":2,"repos":{},"items":{},"runs":{}}'
-        with_state_lock write_json_atomic "$state_file" "$initial_state"
+        if ! with_state_lock write_json_atomic "$state_file" "$initial_state"; then
+            log_warn "Failed to initialize review state"
+            return 1
+        fi
     fi
 }
 
@@ -12211,7 +12220,10 @@ checkpoint_review_state() {
 EOF
 )
 
-    with_state_lock write_json_atomic "$checkpoint_file" "$checkpoint"
+    if ! with_state_lock write_json_atomic "$checkpoint_file" "$checkpoint"; then
+        log_warn "Failed to save review checkpoint"
+        return 1
+    fi
 }
 
 # Load checkpoint for resume
@@ -12645,7 +12657,10 @@ record_metrics_from_plan() {
             .[$e.key] = (.[$e.key] // 0) + $e.value))
         ' "$metrics_file" 2>/dev/null) || return 1
 
-    with_state_lock write_json_atomic "$metrics_file" "$updated"
+    if ! with_state_lock write_json_atomic "$metrics_file" "$updated"; then
+        log_warn "Failed to write metrics file"
+        return 1
+    fi
 }
 
 suggest_decision() {
