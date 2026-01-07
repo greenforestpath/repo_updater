@@ -120,12 +120,14 @@ ru sync
 - [AI-Assisted Code Review](#-ai-assisted-code-review)
   - [Priority Scoring Algorithm](#priority-scoring-algorithm)
   - [Session Drivers](#session-drivers)
+    - [ntm Integration](#ntm-named-tmux-manager-integration)
   - [Claude Code Integration](#claude-code-integration)
   - [Git Worktree Isolation](#git-worktree-isolation)
   - [GitHub Actions Execution](#github-actions-execution)
   - [Review Policies](#review-policies)
   - [GraphQL Batch Querying](#graphql-batch-querying)
   - [Rate-Limit Governor](#rate-limit-governor)
+  - [Global Backoff Coordination](#global-backoff-coordination)
   - [Quality Gates](#quality-gates)
   - [Session Health Monitoring](#session-health-monitoring)
 - [Agent-Driven Sweep](#-agent-driven-sweep)
@@ -140,8 +142,11 @@ ru sync
 - [Architecture](#-architecture)
   - [NDJSON Results Logging](#ndjson-results-logging)
   - [Portable Locking](#portable-locking)
+  - [Work-Stealing Queue](#work-stealing-queue)
+  - [Path Security Validation](#path-security-validation)
   - [Retry with Exponential Backoff](#retry-with-exponential-backoff)
 - [Design Principles](#-design-principles)
+- [File Denylist System](#️-file-denylist-system)
 - [Testing](#-testing)
 - [Troubleshooting](#-troubleshooting)
 - [Environment Variables](#-environment-variables)
@@ -1237,6 +1242,73 @@ ru review --mode=ntm --plan
 ru review -j 4 --plan
 ```
 
+#### ntm (Named Tmux Manager) Integration
+
+[ntm](https://github.com/dicklesworthstone/ntm) is a tmux session orchestration tool that provides a robot mode API for automated session management. When available, ru uses ntm for enhanced capabilities:
+
+**Robot Mode API Functions:**
+
+| Function | Purpose |
+|----------|---------|
+| `ntm --robot-spawn` | Create a Claude Code session in a new tmux pane |
+| `ntm --robot-send` | Send prompts with chunking for long messages |
+| `ntm --robot-wait` | Block until session completes with timeout |
+| `ntm --robot-activity` | Query real-time session state (idle/typing/thinking) |
+| `ntm --robot-status` | Get status of all managed sessions |
+| `ntm --robot-interrupt` | Send Ctrl+C to interrupt long operations |
+
+**Session Lifecycle:**
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    ntm Session Lifecycle                       │
+└───────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────┐
+│ ntm_spawn_    │◀─────── Creates tmux session with Claude Code
+│ session()     │         running in isolated worktree
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ ntm_send_     │◀─────── Delivers prompt (auto-chunks if >4KB)
+│ prompt()      │         Handles message delivery confirmation
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ ntm_wait_     │◀─────── Polls for completion with timeout
+│ completion()  │         Returns JSON with status/duration
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ ntm_kill_     │◀─────── Cleans up session when done
+│ session()     │         Idempotent—safe to call on gone sessions
+└───────────────┘
+```
+
+**Activity State Mapping:**
+
+ntm reports granular activity states that ru maps to unified states:
+
+| ntm State | ru Unified State | Meaning |
+|-----------|-----------------|---------|
+| `IDLE` | `idle` | Session waiting for input |
+| `TYPING` | `active` | User/agent is typing |
+| `THINKING` | `active` | AI processing |
+| `TOOL_USE` | `active` | Executing tool calls |
+| `COMPLETE` | `done` | Session finished |
+| `ERROR` | `error` | Something went wrong |
+
+**Fallback Behavior:**
+
+When ntm is not available, ru falls back to the `local` driver which uses raw tmux commands. The local driver provides the same core functionality but without:
+- Message chunking for long prompts
+- Activity state detection
+- Delivery confirmation
+
 ### Claude Code Integration
 
 ru orchestrates AI review sessions using Claude Code with stream-json output parsing:
@@ -1534,6 +1606,63 @@ Normal Operation → Errors Spike → Circuit OPEN → Cool-down → Half-Open �
 ```
 
 The governor runs as a background monitor during review sessions, checking rate limits every 30 seconds and adjusting `REVIEW_PARALLEL` dynamically.
+
+### Global Backoff Coordination
+
+When running parallel agent-sweep operations, ru uses a shared backoff mechanism to coordinate pause signals across all worker processes:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Global Backoff Coordination                    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │  Worker detects │
+                    │  rate limit 429 │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ agent_sweep_    │◀─────── Acquire lock
+                    │ backoff_trigger │         Write pause_until + reason
+                    └────────┬────────┘         Release lock
+                             │
+    ┌────────────────────────┼────────────────────────┐
+    ▼                        ▼                        ▼
+┌─────────┐            ┌─────────┐            ┌─────────┐
+│Worker 1 │            │Worker 2 │            │Worker 3 │
+│ check   │            │ check   │            │ check   │
+│backoff.─┼────────────┼────┬────┼────────────┼─state   │
+│state    │            │    │    │            │         │
+└────┬────┘            └────┼────┘            └────┬────┘
+     │                      │                      │
+     ▼                      ▼                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│          All workers sleep until pause_until expires            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Backoff behavior:**
+
+| Trigger | Initial Delay | Behavior |
+|---------|---------------|----------|
+| First rate limit | 30 seconds | Wait, then resume |
+| Repeated rate limit | Previous × 2 | Exponential backoff |
+| Maximum delay | 10 minutes | Capped to prevent infinite wait |
+| Jitter | ±25% | Prevents thundering herd |
+
+**State file format (`backoff.state`):**
+
+```json
+{
+  "reason": "rate_limited",
+  "pause_until": 1704307200,
+  "delay": 60
+}
+```
+
+Workers check this file before starting work on each repo. If `pause_until` is in the future, they sleep until it expires. This ensures all workers respect a global cooldown without requiring inter-process communication.
 
 ### Quality Gates
 
@@ -2164,6 +2293,91 @@ dir_lock_try_acquire() {
 - Worktree mapping updates during concurrent reviews
 - Sync state file coordination
 
+### Work-Stealing Queue
+
+For parallel sync operations (`--parallel N`), ru uses a work-stealing queue pattern where multiple worker processes compete for work items atomically:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                      Work Queue (temp file)                     │
+│  ┌─────────┬─────────┬─────────┬─────────┬─────────┐           │
+│  │ repo1   │ repo2   │ repo3   │ repo4   │ repo5   │ ...       │
+│  └─────────┴─────────┴─────────┴─────────┴─────────┘           │
+└────────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+   ┌──────────┐         ┌──────────┐         ┌──────────┐
+   │ Worker 1 │         │ Worker 2 │         │ Worker 3 │
+   │ (subshell)│        │ (subshell)│        │ (subshell)│
+   └──────────┘         └──────────┘         └──────────┘
+         │                    │                    │
+         │     ┌──────────────┴──────────────┐     │
+         │     ▼                             ▼     │
+         │  ┌────────────────────────────────────┐ │
+         └─▶│       Queue Lock (mkdir)           │◀┘
+            │   - Atomic dequeue via head/tail   │
+            │   - Spin-wait with timeout         │
+            └────────────────────────────────────┘
+```
+
+**Algorithm:**
+
+1. **Queue initialization**: Write all repo specs to a temporary file, one per line
+2. **Worker spawning**: Fork N worker subshells that compete for work
+3. **Atomic dequeue**:
+   - Acquire directory lock via `mkdir` (atomic on POSIX)
+   - Read first line from queue file (`head -1`)
+   - Remove first line (`tail -n +2 > tmp && mv tmp queue`)
+   - Release lock via `rmdir`
+4. **Work completion**: Worker processes repo, appends result to shared results file (also lock-protected)
+5. **Progress tracking**: Atomic counter updated under separate lock
+
+**Why work-stealing?**
+- **Load balancing**: Fast repos don't block slow ones—workers grab more work when free
+- **No coordinator bottleneck**: Workers self-organize without a central scheduler
+- **Graceful degradation**: If a worker dies, remaining workers continue
+
+**Lock contention handling:**
+- Spin-wait with 100ms sleep between attempts
+- Configurable timeout (default 60s)
+- Workers exit cleanly if they can't acquire lock
+
+### Path Security Validation
+
+ru includes two security functions that guard against path traversal attacks, especially important when paths come from state files or user input:
+
+**`_is_safe_path_segment(segment)`** — Validates individual path components:
+
+| Check | Blocks | Reason |
+|-------|--------|--------|
+| Empty string | `""` | Invalid path component |
+| Dot-only | `.`, `..` | Path traversal attack |
+| Leading dash | `-rf` | Git option confusion |
+| Path separators | `foo/bar` | Unexpected subdirectory |
+| Control characters | `\x1b[31m` | Terminal escape injection |
+
+**`_is_path_under_base(path, base)`** — Verifies a path is safely within a base directory:
+
+```bash
+# These pass:
+_is_path_under_base "/data/projects/repo" "/data/projects"     # ✓ Direct child
+_is_path_under_base "/data/projects/a/b/c" "/data/projects"    # ✓ Nested child
+
+# These fail:
+_is_path_under_base "../etc/passwd" "/data/projects"           # ✗ Traversal
+_is_path_under_base "/data/projects/../etc" "/data/projects"   # ✗ Dot segment
+_is_path_under_base "relative/path" "/data/projects"           # ✗ Not absolute
+_is_path_under_base "/data/projects" "/"                       # ✗ Base is root
+```
+
+**Key design decisions:**
+- **Lexical checks only**: Does NOT resolve symlinks. This is intentional—`rm -rf` on a symlink removes the link, not the target, so lexical containment is the correct safety check.
+- **Rejects dot segments**: Any `/.` or `/..` in path or base causes rejection, preventing `path/../../../etc/passwd` attacks.
+- **Requires absolute paths**: Relative paths are rejected to prevent confusion about the current directory.
+
+These functions are used throughout ru to protect `rm -rf` operations on worktrees and state directories.
+
 ### Retry with Exponential Backoff
 
 Network operations and API calls use intelligent retry logic with exponential backoff and jitter:
@@ -2280,6 +2494,83 @@ fi
 # Non-interactive mode: fail clearly
 log_error "gh not installed. Run with --install-deps or install manually."
 exit 3
+```
+
+---
+
+## 🛡️ File Denylist System
+
+When scanning repositories or processing file changes, ru applies a comprehensive denylist to prevent accidental exposure of secrets, processing of large build artifacts, or noise from IDE/editor files.
+
+### Default Denylist Patterns
+
+The built-in denylist covers four categories:
+
+| Category | Patterns | Examples |
+|----------|----------|----------|
+| **Secrets & Credentials** | `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `credentials.json`, `secrets.json`, `.netrc`, `.npmrc`, `.pypirc` | API keys, TLS certificates, SSH keys |
+| **Build Artifacts** | `node_modules`, `__pycache__`, `dist`, `build`, `.next`, `target`, `vendor`, `*.pyc` | Dependencies, compiled output |
+| **Logs & Temp Files** | `*.log`, `*.tmp`, `*.temp`, `*.swp`, `*.swo`, `*~`, `.DS_Store`, `Thumbs.db` | Debug logs, swap files, OS metadata |
+| **IDE/Editor** | `.idea`, `.vscode`, `*.iml` | JetBrains, VS Code settings |
+
+### Pattern Matching Algorithm
+
+The `is_file_denied()` function uses a three-tier matching approach:
+
+```bash
+is_file_denied "frontend/node_modules/lodash/index.js"  # ✗ Blocked
+is_file_denied "src/.env.local"                          # ✗ Blocked
+is_file_denied "src/components/Button.tsx"               # ✓ Allowed
+```
+
+**Matching order:**
+1. **Full path match**: Compare entire path against pattern (e.g., `dist/*` matches `dist/bundle.js`)
+2. **Basename match**: Compare just the filename (e.g., `.env` matches `config/.env`)
+3. **Directory containment**: Check if file is inside a denied directory at any nesting level (e.g., `node_modules` blocks `frontend/node_modules/pkg/index.js`)
+
+### Extending the Denylist
+
+**Via environment variable (space-separated):**
+```bash
+export AGENT_SWEEP_DENYLIST_EXTRA="*.custom internal_docs/*"
+ru agent-sweep
+```
+
+**Via config file (YAML):**
+```yaml
+# ~/.config/ru/config.yml
+agent_sweep:
+  denylist_extra:
+    - "*.custom"
+    - "internal_docs/*"
+    - "vendor/private/*"
+```
+
+**Via config file (JSON):**
+```json
+{
+  "agent_sweep": {
+    "denylist_extra": ["*.custom", "internal_docs/*"]
+  }
+}
+```
+
+### Programmatic Access
+
+```bash
+# List all active denylist patterns
+ru agent-sweep --show-denylist
+
+# From scripts, use the exported functions:
+source /path/to/ru
+if is_file_denied "path/to/file"; then
+    echo "File is blocked by denylist"
+fi
+
+# Filter a list of files
+echo -e "main.py\n.env\nREADME.md" | filter_files_denylist
+# Output: main.py
+#         README.md
 ```
 
 ---
