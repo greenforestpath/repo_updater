@@ -366,6 +366,117 @@ is_positive_int() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 10#${1:-0} > 0 )); }
 is_boolean() { [[ "${1:-}" == "true" || "${1:-}" == "false" ]]; }
 is_valid_config_key() { [[ "${1:-}" =~ ^[A-Z][A-Z0-9_]*$ ]]; }
 
+#------------------------------------------------------------------------------
+# PORTABLE JSON PARSING
+#
+# Provides json_get_field(), json_is_success(), and json_escape() with layered
+# fallbacks: jq → python3 → perl (JSON::PP) → minimal sed (fragile, flat only).
+# This enables ntm robot mode parsing on systems without jq installed.
+#------------------------------------------------------------------------------
+
+# Extract a field value from a JSON object.
+# Usage: json_get_field "$json_string" "field_name"
+# Returns: The field value on stdout. For nested objects, returns JSON string.
+# Fallback order: jq > python3 > perl+JSON::PP > sed (flat strings only)
+json_get_field() {
+    local json="${1:-}"
+    local field="${2:-}"
+
+    [[ -z "$json" || -z "$field" ]] && return 1
+
+    # Best: jq (most reliable, handles all JSON types correctly)
+    if command -v jq &>/dev/null; then
+        # Note: Can't use `// empty` as it treats false as falsy
+        jq -r --arg f "$field" '
+            if has($f) then
+                .[$f] | if type == "null" then empty
+                        elif type == "boolean" then (if . then "true" else "false" end)
+                        else .
+                        end
+            else empty end
+        ' <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Fallback: python3 (widely available, handles complex JSON)
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    val = data.get(sys.argv[1], '')
+    if isinstance(val, (dict, list)):
+        print(json.dumps(val))
+    elif val is True:
+        print('true')
+    elif val is False:
+        print('false')
+    elif val is None:
+        pass  # empty output
+    else:
+        print(val)
+except:
+    pass
+" "$field" <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Fallback: perl with JSON::PP (often available on Linux)
+    if command -v perl &>/dev/null && perl -MJSON::PP -e1 2>/dev/null; then
+        perl -MJSON::PP -e '
+            my $field = shift;
+            local $/; my $json = <STDIN>;
+            my $data = eval { decode_json($json) };
+            exit 0 unless defined $data && ref($data) eq "HASH";
+            my $val = $data->{$field};
+            if (!defined $val) { exit 0; }
+            if (ref($val)) { print encode_json($val); }
+            elsif (JSON::PP::is_bool($val)) { print $val ? "true" : "false"; }
+            else { print $val; }
+        ' "$field" <<<"$json" 2>/dev/null
+        return 0
+    fi
+
+    # Last resort: minimal sed (ONLY works for simple flat string values!)
+    # WARNING: This is fragile and won't handle nested objects, arrays,
+    # escaped quotes, or boolean/numeric types correctly. Use with caution.
+    local result
+    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"([^"\\]*(\\.[^"\\]*)*)".*/\1/p' <<<"$json" | head -n1)
+    if [[ -n "$result" ]]; then
+        printf '%s\n' "$result"
+        return 0
+    fi
+
+    # Try unquoted values (numbers, booleans)
+    result=$(sed -nE 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*([^,}\]]+).*/\1/p' <<<"$json" | head -n1 | tr -d '[:space:]')
+    [[ -n "$result" ]] && printf '%s\n' "$result"
+    return 0
+}
+
+# Check if JSON has "success": true
+# Usage: if json_is_success "$json_string"; then echo "success"; fi
+# Returns: 0 if success:true, 1 otherwise
+json_is_success() {
+    local json="${1:-}"
+    local success_val
+    success_val=$(json_get_field "$json" "success")
+    [[ "$success_val" == "true" ]]
+}
+
+# Escape a string for safe embedding in JSON.
+# Usage: escaped=$(json_escape "$raw_string")
+# Handles: backslash, double-quote, newline, tab, carriage return
+json_escape() {
+    local str="${1:-}"
+    # Order matters: escape backslashes first, then other chars
+    str="${str//\\/\\\\}"      # \ -> \\
+    str="${str//\"/\\\"}"      # " -> \"
+    str="${str//$'\n'/\\n}"    # newline -> \n
+    str="${str//$'\t'/\\t}"    # tab -> \t
+    str="${str//$'\r'/\\r}"    # carriage return -> \r
+    printf '%s' "$str"
+}
+
 # Retry a command with exponential backoff (+/-25% jitter).
 # Usage: retry_with_backoff [--capture=all|--capture=stdout] MAX_ATTEMPTS BASE_DELAY_SECONDS -- cmd arg...
 # - Logs retries to stderr (via log_warn), returns final exit code.
@@ -4771,6 +4882,152 @@ release_review_lock() {
     dir_lock_release "$lock_dir"
 }
 
+#------------------------------------------------------------------------------
+# FILE DENYLIST ENFORCEMENT (Security Guardrails)
+#
+# Prevents committing sensitive or ephemeral files during agent-sweep,
+# regardless of agent output. Default patterns cover common secrets,
+# credentials, and build artifacts.
+#------------------------------------------------------------------------------
+
+# Default denylist patterns (can be extended via AGENT_SWEEP_DENYLIST_EXTRA)
+# Patterns support glob-style matching via bash's fnmatch
+declare -a AGENT_SWEEP_DENYLIST_PATTERNS=(
+    # Secrets and credentials
+    ".env"
+    ".env.*"
+    "*.pem"
+    "*.key"
+    "id_rsa"
+    "id_rsa.*"
+    "*.p12"
+    "*.pfx"
+    "credentials.json"
+    "secrets.json"
+    "*.secret"
+    "*.secrets"
+    ".netrc"
+    ".npmrc"            # May contain auth tokens
+    ".pypirc"           # May contain auth tokens
+
+    # Build artifacts and dependencies (large/ephemeral)
+    "node_modules"
+    "node_modules/*"
+    "__pycache__"
+    "__pycache__/*"
+    "*.pyc"
+    "*.pyo"
+    "dist"
+    "dist/*"
+    "build"
+    "build/*"
+    ".next"
+    ".next/*"
+    "target"            # Rust/Maven
+    "target/*"
+    "vendor"            # Go/PHP
+    "vendor/*"
+
+    # Logs and temporary files
+    "*.log"
+    "*.tmp"
+    "*.temp"
+    "*.swp"
+    "*.swo"
+    "*~"
+    ".DS_Store"
+    "Thumbs.db"
+
+    # IDE and editor files
+    ".idea"
+    ".idea/*"
+    ".vscode"
+    ".vscode/*"
+    "*.iml"
+)
+
+# Check if a file path matches any denylist pattern
+# Args: $1=file_path (relative path)
+# Returns: 0=denied (file should be blocked), 1=allowed
+# Note: Checks basename against exact matches and full path against glob patterns
+is_file_denied() {
+    local file_path="$1"
+    local basename pattern
+
+    # Normalize: remove leading ./ and trailing /
+    file_path="${file_path#./}"
+    file_path="${file_path%/}"
+
+    # Get the basename for simple comparisons
+    basename="${file_path##*/}"
+
+    # Also check for any extra patterns from environment
+    local -a all_patterns=("${AGENT_SWEEP_DENYLIST_PATTERNS[@]}")
+    if [[ -n "${AGENT_SWEEP_DENYLIST_EXTRA:-}" ]]; then
+        # Split space-separated extra patterns
+        read -ra extra <<<"$AGENT_SWEEP_DENYLIST_EXTRA"
+        all_patterns+=("${extra[@]}")
+    fi
+
+    for pattern in "${all_patterns[@]}"; do
+        # Try matching against full path first (for directory patterns like "node_modules/*")
+        # shellcheck disable=SC2254  # Pattern is intentionally a glob
+        case "$file_path" in
+            $pattern) return 0 ;;  # Denied
+        esac
+
+        # Also match against just the basename (for patterns like ".env")
+        # shellcheck disable=SC2254
+        case "$basename" in
+            $pattern) return 0 ;;  # Denied
+        esac
+
+        # Special handling for directory matching (pattern without trailing /*)
+        # If pattern is "node_modules", match "node_modules/anything"
+        case "$pattern" in
+            */\*) ;;  # Already has /*, skip
+            *)
+                # Check if file is inside a denied directory
+                # shellcheck disable=SC2254
+                case "$file_path" in
+                    $pattern/*) return 0 ;;  # File is inside denied directory
+                esac
+                ;;
+        esac
+    done
+
+    return 1  # Allowed
+}
+
+# Filter a list of files through the denylist
+# Args: file paths on stdin (one per line)
+# Output: allowed file paths to stdout, denied files logged to stderr
+# Returns: 0 if all allowed, 1 if any were denied
+filter_files_denylist() {
+    local file denied_count=0
+
+    while IFS= read -r file || [[ -n "$file" ]]; do
+        [[ -z "$file" ]] && continue
+        if is_file_denied "$file"; then
+            log_warn "Blocked by denylist: $file"
+            ((denied_count++))
+        else
+            printf '%s\n' "$file"
+        fi
+    done
+
+    [[ $denied_count -eq 0 ]]
+}
+
+# Get all denylist patterns as newline-separated list
+# Useful for displaying to users or for external tools
+get_denylist_patterns() {
+    printf '%s\n' "${AGENT_SWEEP_DENYLIST_PATTERNS[@]}"
+    if [[ -n "${AGENT_SWEEP_DENYLIST_EXTRA:-}" ]]; then
+        printf '%s\n' $AGENT_SWEEP_DENYLIST_EXTRA
+    fi
+}
+
 # Detect which review driver to use
 detect_review_driver() {
     # Check if ntm is available and running
@@ -5909,16 +6166,258 @@ local_driver_session_alive() {
 # Uses ntm robot mode API for advanced session orchestration
 #------------------------------------------------------------------------------
 
-# Check if ntm is available and working
-ntm_is_available() {
+# Check if ntm is available and functional with distinct error codes.
+# Returns:
+#   0 - ntm available and functional
+#   1 - ntm not installed
+#   2 - ntm installed but robot mode not working
+# Usage in cmd_agent_sweep:
+#   ntm_check_available
+#   ntm_status=$?
+#   if [[ $ntm_status -eq 1 ]]; then log_error "Install ntm first"; return 3
+#   elif [[ $ntm_status -eq 2 ]]; then log_error "ntm robot mode broken"; return 3
+#   fi
+ntm_check_available() {
     if ! command -v ntm &>/dev/null; then
-        return 1
+        return 1  # Not installed
     fi
-    # Verify ntm responds to status query
+    # Verify robot mode works (fast, side-effect-free check)
     if ! ntm --robot-status &>/dev/null; then
-        return 1
+        return 2  # Installed but not functional
     fi
+    return 0  # Available and functional
+}
+
+# Backward-compatible wrapper: returns 0 if available, 1 otherwise
+ntm_is_available() {
+    ntm_check_available
+    [[ $? -eq 0 ]]
+}
+
+# Sanitize a string for use as tmux session name
+# Replaces non-alphanumeric chars with underscore, collapses multiple underscores
+sanitize_session_name() {
+    local name="${1:-}"
+    # Replace non-alphanumeric with underscore, collapse multiple underscores
+    name="${name//[^a-zA-Z0-9]/_}"
+    # Remove leading/trailing underscores and collapse multiples
+    echo "$name" | sed 's/__*/_/g; s/^_//; s/_$//'
+}
+
+# Spawn a Claude Code session for a repository via ntm robot mode.
+# Usage: ntm_spawn_session session_name workdir [timeout_seconds]
+# Returns: JSON response on stdout
+# Exit codes:
+#   0 - Session created successfully
+#   1 - Error (check error_code in JSON output)
+ntm_spawn_session() {
+    local session="${1:-}"
+    local workdir="${2:-}"
+    local timeout="${3:-60}"
+    local output
+
+    [[ -z "$session" ]] && { echo '{"success":false,"error":"session name required"}'; return 1; }
+    [[ -z "$workdir" ]] && { echo '{"success":false,"error":"workdir required"}'; return 1; }
+    [[ ! -d "$workdir" ]] && { echo '{"success":false,"error":"workdir does not exist"}'; return 1; }
+
+    # Spawn with wait-for-ready using robot mode
+    if output=$(ntm --robot-spawn="$session" \
+        --spawn-cc=1 \
+        --spawn-wait \
+        --spawn-dir="$workdir" \
+        --ready-timeout="${timeout}s" 2>&1); then
+        echo "$output"
+        return 0
+    else
+        local exit_code=$?
+        # Output may contain JSON error details
+        if [[ -n "$output" ]]; then
+            echo "$output"
+        else
+            echo "{\"success\":false,\"error\":\"spawn failed\",\"exit_code\":$exit_code}"
+        fi
+        return $exit_code
+    fi
+}
+
+# Send a prompt to a Claude Code session, handling large prompts via chunking.
+# Usage: ntm_send_prompt session prompt
+# Returns: JSON response on stdout
+# Prompts >4KB are automatically chunked to avoid tmux SendKeys limits.
+ntm_send_prompt() {
+    local session="${1:-}"
+    local prompt="${2:-}"
+    local output
+
+    [[ -z "$session" ]] && { echo '{"success":false,"error":"session name required"}'; return 1; }
+    [[ -z "$prompt" ]] && { echo '{"success":false,"error":"prompt required"}'; return 1; }
+
+    # Check prompt size - tmux has ~4KB practical limit per SendKeys call
+    if [[ ${#prompt} -gt 4000 ]]; then
+        log_warn "Prompt is ${#prompt} chars (>4KB), sending in chunks"
+        ntm_send_prompt_chunked "$session" "$prompt"
+        return $?
+    fi
+
+    if output=$(ntm --robot-send="$session" \
+        --msg="$prompt" \
+        --type=claude 2>&1); then
+        echo "$output"
+        return 0
+    else
+        local exit_code=$?
+        if [[ -n "$output" ]]; then
+            echo "$output"
+        else
+            echo "{\"success\":false,\"error\":\"send failed\",\"exit_code\":$exit_code}"
+        fi
+        return $exit_code
+    fi
+}
+
+# Send a large prompt in chunks to avoid tmux SendKeys limits.
+# Internal helper for ntm_send_prompt.
+ntm_send_prompt_chunked() {
+    local session="${1:-}"
+    local prompt="${2:-}"
+    local chunk_size=3500  # Leave buffer below 4KB limit
+    local offset=0
+    local length=${#prompt}
+
+    while [[ $offset -lt $length ]]; do
+        local chunk="${prompt:$offset:$chunk_size}"
+        if ! ntm --robot-send="$session" --msg="$chunk" --type=claude &>/dev/null; then
+            echo "{\"success\":false,\"error\":\"chunk send failed at offset $offset\"}"
+            return 1
+        fi
+        ((offset += chunk_size))
+        # Small delay between chunks to let terminal process
+        sleep 0.1
+    done
+
+    echo '{"success":true,"chunked":true}'
     return 0
+}
+
+# Wait for Claude Code agent to complete work and return to idle state.
+# Usage: ntm_wait_completion session [timeout_seconds]
+# Returns: JSON response on stdout
+# Exit codes:
+#   0 - Condition met (agent idle)
+#   1 - Timeout exceeded
+#   2 - Error (check error_code in JSON)
+#   3 - Agent error detected
+ntm_wait_completion() {
+    local session="${1:-}"
+    local timeout="${2:-300}"
+    local output exit_code
+
+    [[ -z "$session" ]] && { echo '{"success":false,"error":"session name required"}'; return 1; }
+
+    output=$(ntm --robot-wait="$session" \
+        --condition=idle \
+        --wait-timeout="${timeout}s" \
+        --exit-on-error 2>&1)
+    exit_code=$?
+
+    if [[ -n "$output" ]]; then
+        echo "$output"
+    else
+        # Generate minimal JSON response if ntm didn't
+        if [[ $exit_code -eq 0 ]]; then
+            echo '{"success":true,"condition":"idle"}'
+        else
+            echo "{\"success\":false,\"error\":\"wait failed\",\"exit_code\":$exit_code}"
+        fi
+    fi
+    return $exit_code
+}
+
+# Kill an ntm session. Idempotent - safe to call on non-existent sessions.
+# Usage: ntm_kill_session session_name
+# Returns: always 0 (cleanup should never fail the main workflow)
+ntm_kill_session() {
+    local session="${1:-}"
+    [[ -z "$session" ]] && return 0
+    # -f flag prevents confirmation prompt
+    ntm kill "$session" -f 2>/dev/null || true
+    return 0
+}
+
+# Send Ctrl+C interrupt to agent panes in an ntm session.
+# Used to stop long-running agent work before sending new prompts.
+# Usage: ntm_interrupt_session session_name
+# Returns: 0 on success, 1 on failure
+ntm_interrupt_session() {
+    local session="${1:-}"
+    [[ -z "$session" ]] && return 1
+    ntm --robot-interrupt="$session" 2>/dev/null || return 1
+    return 0
+}
+
+# Cleanup all agent-sweep sessions owned by this process.
+# Respects AGENT_SWEEP_KEEP_SESSIONS for debugging.
+# Usage: cleanup_agent_sweep_sessions
+cleanup_agent_sweep_sessions() {
+    [[ "${AGENT_SWEEP_KEEP_SESSIONS:-false}" == "true" ]] && return 0
+
+    local sessions session
+    # Find sessions matching our naming pattern with our PID
+    sessions=$(ntm --robot-status 2>/dev/null | \
+        grep -oE '"name":"ru_sweep_[^"]*"' | cut -d'"' -f4) || true
+
+    for session in $sessions; do
+        # Only kill sessions from this PID (pattern: ru_sweep_*_$$)
+        if [[ "$session" == *"_$$"* ]] || [[ "$session" == *"_$$_"* ]]; then
+            ntm_kill_session "$session"
+        fi
+    done
+}
+
+# Wait for Claude Code agent to complete work and return to idle state.
+# Usage: ntm_wait_completion session_name [timeout_seconds]
+# Exit codes:
+#   0 - Agent is idle (condition met)
+#   1 - Timeout exceeded
+#   2 - Error (check error_code in JSON)
+#   3 - Agent error detected via pattern match
+# Output: JSON response on stdout with wait details
+ntm_wait_completion() {
+    local session="${1:-}"
+    local timeout="${2:-300}"
+    local output exit_code
+
+    [[ -z "$session" ]] && {
+        echo '{"success":false,"error":"session name required","error_code":"INVALID_ARGS"}'
+        return 2
+    }
+
+    # Wait for idle condition with error detection
+    output=$(ntm --robot-wait="$session" \
+        --condition=idle \
+        --wait-timeout="${timeout}s" \
+        --exit-on-error 2>&1)
+    exit_code=$?
+
+    if [[ -n "$output" ]]; then
+        echo "$output"
+    else
+        echo "{\"success\":false,\"error\":\"no output from wait\",\"exit_code\":$exit_code}"
+    fi
+    return $exit_code
+}
+
+# Get real-time activity state for an ntm session.
+# Usage: ntm_get_activity session_name
+# Output: JSON with agent states, velocity, health, rate_limited flag
+# Use to poll during wait for progress or detect rate limiting
+ntm_get_activity() {
+    local session="${1:-}"
+    [[ -z "$session" ]] && {
+        echo '{"success":false,"error":"session name required"}'
+        return 1
+    }
+    ntm --robot-activity="$session" 2>/dev/null
 }
 
 # ntm driver: Start a new Claude Code session
@@ -13025,6 +13524,167 @@ execute_gh_actions() {
         return 1
     fi
     return 0
+}
+
+#==============================================================================
+# SECTION 13.9: AGENT SWEEP PREFLIGHT CHECKS
+#==============================================================================
+
+# Repository preflight check for agent-sweep
+# Validates that a repository is in a safe state before invoking an agent.
+# Sets PREFLIGHT_SKIP_REASON on failure with machine-readable reason.
+# Args: $1 = repo_path (absolute path to git repository)
+# Returns: 0 if repo passes all checks, 1 if any check fails
+# Outputs: PREFLIGHT_SKIP_REASON global variable (used by callers)
+# shellcheck disable=SC2034  # PREFLIGHT_SKIP_REASON is read by callers
+repo_preflight_check() {
+    local repo_path="$1"
+    PREFLIGHT_SKIP_REASON=""
+
+    # Check 1: Is it a git repo?
+    if ! git -C "$repo_path" rev-parse --is-inside-work-tree &>/dev/null; then
+        PREFLIGHT_SKIP_REASON="not_a_git_repo"
+        return 1
+    fi
+
+    # Check 2: Git email configured?
+    if [[ -z "$(git -C "$repo_path" config user.email 2>/dev/null)" ]]; then
+        PREFLIGHT_SKIP_REASON="git_email_not_configured"
+        return 1
+    fi
+
+    # Check 3: Git name configured?
+    if [[ -z "$(git -C "$repo_path" config user.name 2>/dev/null)" ]]; then
+        PREFLIGHT_SKIP_REASON="git_name_not_configured"
+        return 1
+    fi
+
+    # Check 4: Shallow clone? (some operations may fail)
+    if [[ -f "$repo_path/.git/shallow" ]]; then
+        PREFLIGHT_SKIP_REASON="shallow_clone"
+        return 1
+    fi
+
+    # Check 5: Dirty submodules?
+    if git -C "$repo_path" submodule status 2>/dev/null | grep -q '^+'; then
+        PREFLIGHT_SKIP_REASON="dirty_submodules"
+        return 1
+    fi
+
+    # Check 6: Rebase in progress?
+    if [[ -d "$repo_path/.git/rebase-apply" ]] || [[ -d "$repo_path/.git/rebase-merge" ]]; then
+        PREFLIGHT_SKIP_REASON="rebase_in_progress"
+        return 1
+    fi
+
+    # Check 7: Merge in progress?
+    if [[ -f "$repo_path/.git/MERGE_HEAD" ]]; then
+        PREFLIGHT_SKIP_REASON="merge_in_progress"
+        return 1
+    fi
+
+    # Check 8: Cherry-pick in progress?
+    if [[ -f "$repo_path/.git/CHERRY_PICK_HEAD" ]]; then
+        PREFLIGHT_SKIP_REASON="cherry_pick_in_progress"
+        return 1
+    fi
+
+    # Check 9: Detached HEAD?
+    local branch
+    branch=$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null)
+    if [[ -z "$branch" ]]; then
+        PREFLIGHT_SKIP_REASON="detached_HEAD"
+        return 1
+    fi
+
+    # Check 10: Has upstream? (only required if push strategy is not "none")
+    local upstream
+    upstream=$(git -C "$repo_path" rev-parse --abbrev-ref "@{u}" 2>/dev/null)
+    if [[ -z "$upstream" ]] && [[ "${AGENT_SWEEP_PUSH_STRATEGY:-push}" != "none" ]]; then
+        PREFLIGHT_SKIP_REASON="no_upstream_branch"
+        return 1
+    fi
+
+    # Check 11: Diverged from upstream?
+    if [[ -n "$upstream" ]]; then
+        local ahead behind
+        # shellcheck disable=SC1083  # @{u} is valid git syntax for upstream tracking branch
+        read -r ahead behind < <(git -C "$repo_path" rev-list --left-right --count HEAD...@{u} 2>/dev/null)
+        if [[ "$ahead" -gt 0 ]] && [[ "$behind" -gt 0 ]]; then
+            PREFLIGHT_SKIP_REASON="diverged_from_upstream"
+            return 1
+        fi
+    fi
+
+    # Check 12: Unmerged paths (merge conflicts)?
+    if git -C "$repo_path" ls-files --unmerged 2>/dev/null | grep -q .; then
+        PREFLIGHT_SKIP_REASON="unmerged_paths"
+        return 1
+    fi
+
+    # Check 13: git diff --check clean? (whitespace errors, conflict markers)
+    if ! git -C "$repo_path" diff --check &>/dev/null; then
+        PREFLIGHT_SKIP_REASON="diff_check_failed"
+        return 1
+    fi
+
+    # Check 14: Too many untracked files?
+    local untracked_count
+    untracked_count=$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null | wc -l)
+    if [[ "$untracked_count" -gt "${AGENT_SWEEP_MAX_UNTRACKED:-1000}" ]]; then
+        PREFLIGHT_SKIP_REASON="too_many_untracked_files"
+        return 1
+    fi
+
+    return 0
+}
+
+# Get human-readable explanation for a preflight skip reason
+# Args: $1 = skip_reason (from PREFLIGHT_SKIP_REASON)
+# Outputs: Human-readable message to stdout
+preflight_skip_reason_message() {
+    local reason="$1"
+    case "$reason" in
+        not_a_git_repo)             echo "Not a git repository" ;;
+        git_email_not_configured)   echo "Git user.email is not configured" ;;
+        git_name_not_configured)    echo "Git user.name is not configured" ;;
+        shallow_clone)              echo "Repository is a shallow clone" ;;
+        dirty_submodules)           echo "Submodules have uncommitted changes" ;;
+        rebase_in_progress)         echo "A rebase is in progress" ;;
+        merge_in_progress)          echo "A merge is in progress" ;;
+        cherry_pick_in_progress)    echo "A cherry-pick is in progress" ;;
+        detached_HEAD)              echo "HEAD is detached (not on a branch)" ;;
+        no_upstream_branch)         echo "No upstream tracking branch configured" ;;
+        diverged_from_upstream)     echo "Branch has diverged from upstream" ;;
+        unmerged_paths)             echo "Unmerged paths exist (merge conflicts)" ;;
+        diff_check_failed)          echo "Diff check failed (whitespace or conflict markers)" ;;
+        too_many_untracked_files)   echo "Too many untracked files" ;;
+        *)                          echo "Unknown preflight issue: $reason" ;;
+    esac
+}
+
+# Get suggested user action for a preflight skip reason
+# Args: $1 = skip_reason (from PREFLIGHT_SKIP_REASON)
+# Outputs: Suggested remediation command to stdout
+preflight_skip_reason_action() {
+    local reason="$1"
+    case "$reason" in
+        not_a_git_repo)             echo "Verify the directory is a git repository" ;;
+        git_email_not_configured)   echo "Run: git config user.email \"you@example.com\"" ;;
+        git_name_not_configured)    echo "Run: git config user.name \"Your Name\"" ;;
+        shallow_clone)              echo "Run: git fetch --unshallow" ;;
+        dirty_submodules)           echo "Commit or discard submodule changes" ;;
+        rebase_in_progress)         echo "Complete or abort the rebase: git rebase --continue OR git rebase --abort" ;;
+        merge_in_progress)          echo "Complete or abort the merge: git merge --continue OR git merge --abort" ;;
+        cherry_pick_in_progress)    echo "Complete or abort: git cherry-pick --continue OR git cherry-pick --abort" ;;
+        detached_HEAD)              echo "Switch to a branch: git checkout <branch>" ;;
+        no_upstream_branch)         echo "Set upstream: git branch --set-upstream-to=origin/<branch>" ;;
+        diverged_from_upstream)     echo "Pull and rebase: git pull --rebase" ;;
+        unmerged_paths)             echo "Resolve conflicts and run: git add <files>" ;;
+        diff_check_failed)          echo "Fix whitespace issues or conflict markers in working tree" ;;
+        too_many_untracked_files)   echo "Review .gitignore or clean untracked files: git clean -n" ;;
+        *)                          echo "Investigate and fix the issue" ;;
+    esac
 }
 
 #==============================================================================
