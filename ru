@@ -215,6 +215,8 @@ PARALLEL=""
 JSON_OUTPUT="false"
 QUIET="false"
 VERBOSE="false"
+DEBUG="false"
+LOG_LEVEL=0  # 0=normal, 1=verbose, 2=debug
 NON_INTERACTIVE="false"
 DRY_RUN="false"
 CLONE_ONLY="false"
@@ -993,6 +995,8 @@ get_combined_denylist() {
 
 # Global result tracking state (initialized by setup_agent_sweep_results)
 declare -g AGENT_SWEEP_STATE_DIR=""
+declare -g AGENT_SWEEP_LOG_FILE=""
+declare -g AGENT_SWEEP_REPO_LOG_DIR=""
 declare -g RUN_ID=""
 declare -g RUN_START_TIME=""
 declare -g RUN_ARTIFACTS_DIR=""
@@ -1016,6 +1020,20 @@ setup_agent_sweep_results() {
     # Create run directory for artifacts
     RUN_ARTIFACTS_DIR="${AGENT_SWEEP_STATE_DIR}/runs/${RUN_ID}"
     ensure_dir "$RUN_ARTIFACTS_DIR"
+
+    # Set up log files (if verbose/debug mode)
+    local log_date_dir
+    log_date_dir="${state_base}/logs/$(date +%Y-%m-%d)"
+    ensure_dir "$log_date_dir"
+    AGENT_SWEEP_LOG_FILE="${log_date_dir}/agent_sweep.log"
+    AGENT_SWEEP_REPO_LOG_DIR="${log_date_dir}/repos"
+    ensure_dir "$AGENT_SWEEP_REPO_LOG_DIR"
+
+    # Log session start
+    if [[ $LOG_LEVEL -ge 1 || "$VERBOSE" == "true" ]]; then
+        log_verbose "Agent-sweep session starting: run_id=$RUN_ID"
+        log_verbose "Log file: $AGENT_SWEEP_LOG_FILE"
+    fi
 
     # Set up results file (used by existing write_result function)
     export RESULTS_FILE="${AGENT_SWEEP_STATE_DIR}/results.ndjson"
@@ -1847,8 +1865,38 @@ log_step() {
 }
 
 log_verbose() {
-    [[ "$VERBOSE" != "true" ]] && return
-    printf '%b\n' "${DIM}$*${RESET}" >&2
+    [[ $LOG_LEVEL -lt 1 && "$VERBOSE" != "true" ]] && return
+    printf '%b\n' "${DIM}[VERBOSE] $*${RESET}" >&2
+    _log_to_file "VERBOSE" "$*"
+}
+
+log_debug() {
+    [[ $LOG_LEVEL -lt 2 && "$DEBUG" != "true" ]] && return
+    printf '%b\n' "${DIM}[DEBUG] $*${RESET}" >&2
+    _log_to_file "DEBUG" "$*"
+}
+
+# Write log message to file (if file logging is enabled)
+_log_to_file() {
+    local level="$1" msg="$2"
+    [[ -z "$AGENT_SWEEP_LOG_FILE" ]] && return
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$AGENT_SWEEP_LOG_FILE" 2>/dev/null
+}
+
+# Redact sensitive data from log messages
+redact_sensitive() {
+    local msg="$1"
+    # Redact common secret patterns
+    msg="${msg//sk-[a-zA-Z0-9_-]*/sk-***REDACTED***}"
+    msg="${msg//ghp_[a-zA-Z0-9]*/ghp_***REDACTED***}"
+    msg="${msg//gho_[a-zA-Z0-9]*/gho_***REDACTED***}"
+    msg="${msg//AKIA[A-Z0-9]*/AKIA***REDACTED***}"
+    msg="${msg//password=[^[:space:]]*/password=***REDACTED***}"
+    msg="${msg//api_key=[^[:space:]]*/api_key=***REDACTED***}"
+    msg="${msg//token=[^[:space:]]*/token=***REDACTED***}"
+    echo "$msg"
 }
 
 # Output JSON to stdout (only in --json mode)
@@ -15327,6 +15375,8 @@ cmd_agent_sweep() {
             --phase2-timeout=*) phase2_timeout="${arg#--phase2-timeout=}" ;;
             --phase3-timeout=*) phase3_timeout="${arg#--phase3-timeout=}" ;;
             --json) json_output=true ;;
+            --verbose|-v) VERBOSE=true; LOG_LEVEL=1 ;;
+            --debug|-d) DEBUG=true; VERBOSE=true; LOG_LEVEL=2 ;;
         esac
     done
 
@@ -15373,8 +15423,10 @@ cmd_agent_sweep() {
     fi
     echo $$ > "$lock_dir/pid"
     trap 'release_lock' EXIT
+    log_debug "Acquired instance lock: $lock_dir (PID: $$)"
 
     # Check ntm availability
+    log_verbose "Checking ntm availability..."
     if ! ntm_check_available; then
         log_error "ntm (Named Tmux Manager) is not available"
         release_lock
@@ -15387,10 +15439,13 @@ cmd_agent_sweep() {
         release_lock
         return 3
     fi
+    log_debug "ntm and tmux availability confirmed"
 
     # Load all configured repos
+    log_verbose "Loading configured repositories..."
     local -a repos=()
     load_all_repos repos
+    log_debug "Loaded ${#repos[@]} configured repositories"
 
     if [[ ${#repos[@]} -eq 0 ]]; then
         log_error "No repositories configured. Run 'ru add' to add repositories."
@@ -15399,6 +15454,7 @@ cmd_agent_sweep() {
     fi
 
     # Filter to repos with uncommitted changes
+    log_verbose "Filtering for repositories with uncommitted changes..."
     local -a dirty_repos=()
     local repo_spec repo_path
     for repo_spec in "${repos[@]}"; do
@@ -15406,9 +15462,11 @@ cmd_agent_sweep() {
         if [[ -d "$repo_path" ]] && has_uncommitted_changes "$repo_path"; then
             if [[ -z "$repos_filter" ]] || [[ "$repo_spec" == *"$repos_filter"* ]]; then
                 dirty_repos+=("$repo_spec")
+                log_debug "Found dirty repo: $(get_repo_name "$repo_spec")"
             fi
         fi
     done
+    log_verbose "Found ${#dirty_repos[@]} repositories with uncommitted changes"
 
     # Handle empty case
     if [[ ${#dirty_repos[@]} -eq 0 ]]; then
@@ -15525,19 +15583,26 @@ run_sequential_agent_sweep() {
     # shellcheck disable=SC2178
     local -n repos_ref=$1
     local any_failed=false
-    local rn
+    local rn idx=0 total=${#repos_ref[@]}
+    log_debug "Starting sequential sweep of $total repositories"
     for repo_spec in "${repos_ref[@]}"; do
+        ((idx++))
         rn=$(get_repo_name "$repo_spec")
-        log_step "Processing: $rn"
+        log_step "Processing: $rn ($idx/$total)"
+        log_verbose "Starting workflow for $rn"
         if run_single_agent_workflow "$repo_spec"; then
             record_repo_result "$rn" "success"
             log_success "Completed: $rn"
+            log_debug "Workflow succeeded for $rn"
         else
-            record_repo_result "$rn" "failed" "$?"
+            local exit_code=$?
+            record_repo_result "$rn" "failed" "$exit_code"
             log_error "Failed: $rn"
+            log_debug "Workflow failed for $rn (exit code: $exit_code)"
             any_failed=true
         fi
     done
+    log_debug "Sequential sweep complete: any_failed=$any_failed"
     [[ "$any_failed" != true ]]
 }
 
@@ -15554,13 +15619,16 @@ run_single_agent_workflow() {
     local rn rp
     rn=$(get_repo_name "$repo_spec")
     rp=$(repo_spec_to_path "$repo_spec")
+    log_debug "run_single_agent_workflow: repo=$rn path=$rp"
     load_repo_agent_config "$rp"
+    log_debug "Config loaded: AGENT_SWEEP_ENABLED=$AGENT_SWEEP_ENABLED"
     if [[ "$AGENT_SWEEP_ENABLED" != "true" ]]; then
-        log_verbose "Skipping $rn (disabled)"
+        log_verbose "Skipping $rn (disabled in config)"
         return 0
     fi
     # TODO: Full implementation in bd-b00c
     log_verbose "Would process $rn with agent workflow"
+    log_debug "Stub returning success for $rn"
     return 0
 }
 
