@@ -2268,18 +2268,20 @@ save_agent_sweep_state() {
 
     # Build JSON arrays for repos
     if command -v jq &>/dev/null; then
-        completed_json=$(printf '%s\n' "${COMPLETED_REPOS[@]}" 2>/dev/null | jq -R . | jq -s . 2>/dev/null || echo '[]')
+        # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+        completed_json=$(printf '%s\n' ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"} 2>/dev/null | jq -R . | jq -s . 2>/dev/null || echo '[]')
     elif command -v python3 &>/dev/null; then
         completed_json=$(python3 -c "
 import json, sys
 repos = [line.strip() for line in sys.stdin if line.strip()]
 print(json.dumps(repos))
-" <<<"$(printf '%s\n' "${COMPLETED_REPOS[@]}" 2>/dev/null)" 2>/dev/null || echo '[]')
+" <<<"$(printf '%s\n' ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"} 2>/dev/null)" 2>/dev/null || echo '[]')
     else
         # Fallback: manual JSON array construction
         local first=true item
         completed_json="["
-        for item in "${COMPLETED_REPOS[@]}"; do
+        # Use ${arr[@]+"${arr[@]}"} pattern for Bash 4.0-4.3 empty array safety
+        for item in ${COMPLETED_REPOS[@]+"${COMPLETED_REPOS[@]}"}; do
             $first || completed_json+=","
             completed_json+="\"$(json_escape "$item")\""
             first=false
