@@ -472,22 +472,27 @@ load_repo_agent_config() {
     local is_yaml=false
     [[ "$config_file" == *.yml || "$config_file" == *.yaml ]] && is_yaml=true
 
+    # Helper: normalize truthy/falsy values to "true"/"false"
+    _normalize_bool() {
+        case "${1,,}" in  # ${1,,} lowercases the value (Bash 4.0+)
+            true|yes|1|on) echo "true" ;;
+            false|no|0|off|"") echo "false" ;;
+            *) echo "true" ;;  # Default to true for unknown values
+        esac
+    }
+
     if $is_yaml && command -v yq &>/dev/null; then
         # yq for YAML (preferred)
-        AGENT_SWEEP_ENABLED=$(yq -r '.agent_sweep.enabled // "true"' "$config_file" 2>/dev/null || echo "true")
+        local raw_enabled
+        raw_enabled=$(yq -r '.agent_sweep.enabled // "true"' "$config_file" 2>/dev/null || echo "true")
+        AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
         AGENT_SWEEP_MAX_FILE_SIZE=$(yq -r '.agent_sweep.max_file_size // 5242880' "$config_file" 2>/dev/null || echo "5242880")
         AGENT_SWEEP_EXTRA_CONTEXT=$(yq -r '.agent_sweep.extra_context // ""' "$config_file" 2>/dev/null || echo "")
         AGENT_SWEEP_PRE_HOOK=$(yq -r '.agent_sweep.pre_hook // ""' "$config_file" 2>/dev/null || echo "")
         AGENT_SWEEP_POST_HOOK=$(yq -r '.agent_sweep.post_hook // ""' "$config_file" 2>/dev/null || echo "")
-        local skip_json denylist_json
-        skip_json=$(yq -r '.agent_sweep.skip_phases // []' "$config_file" 2>/dev/null)
-        denylist_json=$(yq -r '.agent_sweep.denylist_extra // []' "$config_file" 2>/dev/null)
-        if [[ -n "$skip_json" && "$skip_json" != "null" && "$skip_json" != "[]" ]]; then
-            mapfile -t AGENT_SWEEP_SKIP_PHASES < <(echo "$skip_json" | yq -r '.[]' 2>/dev/null)
-        fi
-        if [[ -n "$denylist_json" && "$denylist_json" != "null" && "$denylist_json" != "[]" ]]; then
-            mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL < <(echo "$denylist_json" | yq -r '.[]' 2>/dev/null)
-        fi
+        # Use direct array element extraction (each element on separate line)
+        mapfile -t AGENT_SWEEP_SKIP_PHASES < <(yq -r '.agent_sweep.skip_phases // [] | .[]' "$config_file" 2>/dev/null)
+        mapfile -t AGENT_SWEEP_DENYLIST_EXTRA_LOCAL < <(yq -r '.agent_sweep.denylist_extra // [] | .[]' "$config_file" 2>/dev/null)
     elif $is_yaml && command -v python3 &>/dev/null; then
         # python3 fallback for YAML
         local py_output
@@ -511,7 +516,9 @@ except Exception as e:
     sys.exit(1)
 " "$config_file" 2>/dev/null)
         if [[ $? -eq 0 && -n "$py_output" ]]; then
-            AGENT_SWEEP_ENABLED=$(json_get_field "$py_output" "enabled" || echo "true")
+            local raw_enabled
+            raw_enabled=$(json_get_field "$py_output" "enabled" || echo "true")
+            AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
             AGENT_SWEEP_MAX_FILE_SIZE=$(json_get_field "$py_output" "max_file_size" || echo "5242880")
             AGENT_SWEEP_EXTRA_CONTEXT=$(json_get_field "$py_output" "extra_context" || echo "")
             AGENT_SWEEP_PRE_HOOK=$(json_get_field "$py_output" "pre_hook" || echo "")
@@ -524,7 +531,9 @@ except Exception as e:
         fi
     elif ! $is_yaml && command -v jq &>/dev/null; then
         # jq for JSON
-        AGENT_SWEEP_ENABLED=$(jq -r '.agent_sweep.enabled // true' "$config_file" 2>/dev/null || echo "true")
+        local raw_enabled
+        raw_enabled=$(jq -r '.agent_sweep.enabled // true' "$config_file" 2>/dev/null || echo "true")
+        AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
         AGENT_SWEEP_MAX_FILE_SIZE=$(jq -r '.agent_sweep.max_file_size // 5242880' "$config_file" 2>/dev/null || echo "5242880")
         AGENT_SWEEP_EXTRA_CONTEXT=$(jq -r '.agent_sweep.extra_context // ""' "$config_file" 2>/dev/null || echo "")
         AGENT_SWEEP_PRE_HOOK=$(jq -r '.agent_sweep.pre_hook // ""' "$config_file" 2>/dev/null || echo "")
@@ -554,7 +563,9 @@ except Exception as e:
     sys.exit(1)
 " "$config_file" 2>/dev/null)
         if [[ $? -eq 0 && -n "$py_output" ]]; then
-            AGENT_SWEEP_ENABLED=$(json_get_field "$py_output" "enabled" || echo "true")
+            local raw_enabled
+            raw_enabled=$(json_get_field "$py_output" "enabled" || echo "true")
+            AGENT_SWEEP_ENABLED=$(_normalize_bool "$raw_enabled")
             AGENT_SWEEP_MAX_FILE_SIZE=$(json_get_field "$py_output" "max_file_size" || echo "5242880")
             AGENT_SWEEP_EXTRA_CONTEXT=$(json_get_field "$py_output" "extra_context" || echo "")
             AGENT_SWEEP_PRE_HOOK=$(json_get_field "$py_output" "pre_hook" || echo "")
@@ -722,6 +733,13 @@ declare -g SWEEP_CURRENT_PHASE=0
 # Uses atomic write (temp + mv) for safety.
 save_agent_sweep_state() {
     local status="${1:-in_progress}"
+
+    # Guard: require state dir to be initialized
+    if [[ -z "$AGENT_SWEEP_STATE_DIR" ]]; then
+        log_verbose "save_agent_sweep_state: state dir not initialized, skipping"
+        return 1
+    fi
+
     local state_file="${AGENT_SWEEP_STATE_DIR}/state.json"
     local tmp_file="${state_file}.tmp.$$"
     local completed_json
@@ -13558,10 +13576,12 @@ run_secret_scan() {
     local scope="${2:-all}"
     local findings=()
     local exit_code=0
+    local scanner_ran=false
 
-    # Use gitleaks if available
+    # Layer 1: Use gitleaks if available
     if command -v gitleaks &>/dev/null; then
         log_verbose "Scanning for secrets with gitleaks"
+        scanner_ran=true
         local gl_output
         if ! gl_output=$(gitleaks detect --source "$project_dir" --no-git 2>&1); then
             exit_code=1
@@ -13575,13 +13595,23 @@ run_secret_scan() {
         log_verbose "Scanning for secrets with detect-secrets"
         local ds_output ds_count
         if ds_output=$(detect-secrets scan "$project_dir" 2>/dev/null); then
-            ds_count=$(echo "$ds_output" | jq '.results | length' 2>/dev/null || echo "0")
-            if [[ "$ds_count" -gt 0 ]]; then
-                exit_code=1
-                findings+=("detect-secrets: found $ds_count potential secrets")
+            ds_count=$(echo "$ds_output" | jq '.results | length' 2>/dev/null || echo "")
+            if [[ "$ds_count" =~ ^[0-9]+$ ]]; then
+                scanner_ran=true
+                if [[ "$ds_count" -gt 0 ]]; then
+                    exit_code=1
+                    findings+=("detect-secrets: found $ds_count potential secrets")
+                fi
             fi
         fi
-    else
+        # If detect-secrets failed or produced invalid output, scanner_ran stays false
+        if [[ "$scanner_ran" != "true" ]]; then
+            log_verbose "detect-secrets scan failed, falling back to regex patterns"
+        fi
+    fi
+
+    # Layer 3: Regex fallback - used when no external scanner succeeded
+    if [[ "$scanner_ran" != "true" ]]; then
         # Layer 3: Regex fallback with comprehensive patterns
         log_verbose "Scanning for secrets with regex patterns"
         local patterns=(
