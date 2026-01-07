@@ -15372,14 +15372,14 @@ cmd_agent_sweep() {
     # Check ntm availability
     if ! ntm_check_available; then
         log_error "ntm (Named Tmux Manager) is not available"
-        rmdir "$lock_dir" 2>/dev/null || true
+        release_lock
         return 3
     fi
 
     # Check tmux availability
     if ! command -v tmux &>/dev/null; then
         log_error "tmux is required for agent-sweep"
-        rmdir "$lock_dir" 2>/dev/null || true
+        release_lock
         return 3
     fi
 
@@ -15389,7 +15389,7 @@ cmd_agent_sweep() {
 
     if [[ ${#repos[@]} -eq 0 ]]; then
         log_error "No repositories configured. Run 'ru add' to add repositories."
-        rmdir "$lock_dir" 2>/dev/null || true
+        release_lock
         return 4
     fi
 
