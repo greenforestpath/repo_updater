@@ -63,6 +63,51 @@ test_dir_lock_acquire_release() {
     log_test_pass "$test_name"
 }
 
+test_dir_lock_contention_timeout() {
+    local test_name="dir_lock_acquire: times out when lock held"
+    log_test_start "$test_name"
+
+    if ! require_function "dir_lock_acquire"; then
+        return 0
+    fi
+    if ! require_function "dir_lock_release"; then
+        return 0
+    fi
+
+    local lock_dir
+    lock_dir="$(create_temp_dir)/queue.lock"
+    mkdir -p "$lock_dir"
+    printf '%s:%s\n' "$$" "$(date +%s)" > "$lock_dir/owner"
+
+    assert_fails "acquire lock while held" dir_lock_acquire "$lock_dir" 1
+    assert_success "release held lock" dir_lock_release "$lock_dir"
+
+    log_test_pass "$test_name"
+}
+
+test_dir_lock_stale_cleanup() {
+    local test_name="dir_lock_acquire: cleans stale lock"
+    log_test_start "$test_name"
+
+    if ! require_function "dir_lock_acquire"; then
+        return 0
+    fi
+    if ! require_function "dir_lock_release"; then
+        return 0
+    fi
+
+    local lock_dir
+    lock_dir="$(create_temp_dir)/queue.lock"
+    mkdir -p "$lock_dir"
+    printf '%s:%s\n' "99999" "$(( $(date +%s) - 400 ))" > "$lock_dir/owner"
+
+    assert_success "acquire lock after stale cleanup" dir_lock_acquire "$lock_dir" 1
+    assert_true "lock directory exists" "[[ -d \"$lock_dir\" ]]"
+    assert_success "release lock" dir_lock_release "$lock_dir"
+
+    log_test_pass "$test_name"
+}
+
 test_backoff_trigger_creates_state() {
     local test_name="agent_sweep_backoff_trigger: writes backoff state"
     log_test_start "$test_name"
@@ -131,6 +176,8 @@ test_parallel_agent_sweep_requires_function() {
 # Run tests
 setup_cleanup_trap
 run_test test_dir_lock_acquire_release
+run_test test_dir_lock_contention_timeout
+run_test test_dir_lock_stale_cleanup
 run_test test_backoff_trigger_creates_state
 run_test test_backoff_wait_skips_when_expired
 run_test test_parallel_agent_sweep_requires_function
