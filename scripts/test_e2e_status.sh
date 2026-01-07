@@ -497,6 +497,10 @@ test_status_json_output() {
 }
 
 test_status_json_revlist_failure() {
+    # NOTE: This test validates JSON output with diverged/unusual histories.
+    # The actual rev-list failure case (outputting -1) is tested via mock in
+    # test_local_git.sh:test_status_revlist_failure_numeric which uses a mock
+    # git wrapper to force the failure scenario.
     echo "Test: ru status --json handles rev-list failure gracefully (bd-jleo regression)"
     setup_test_env
 
@@ -509,8 +513,9 @@ test_status_json_revlist_failure() {
     init_test_config
     add_repo_to_config "revlist-test"
 
-    # Force rev-list to fail by creating unrelated histories
-    # Reset origin/main to an orphan commit that has no common ancestor with HEAD
+    # Create unrelated histories (diverged state)
+    # NOTE: This doesn't actually cause rev-list to fail, but validates
+    # JSON output in edge cases. See test_local_git.sh for the -1 test.
     git -C "$repo_dir" checkout --orphan temp-orphan >/dev/null 2>&1
     echo "orphan content" > "$repo_dir/orphan.txt"
     git -C "$repo_dir" add orphan.txt
@@ -518,10 +523,10 @@ test_status_json_revlist_failure() {
     local orphan_sha
     orphan_sha=$(git -C "$repo_dir" rev-parse HEAD)
     git -C "$repo_dir" checkout main >/dev/null 2>&1
-    # Point origin/main to the orphan commit (unrelated history)
+    # Point origin/main to the orphan commit (creates diverged status)
     git -C "$repo_dir" update-ref refs/remotes/origin/main "$orphan_sha"
 
-    # Now rev-list will fail because HEAD and origin/main have no common ancestor
+    # Run status with this diverged state
     local json_output
     json_output=$("$RU_SCRIPT" status --no-fetch --json --non-interactive 2>/dev/null)
     local exit_code=$?
