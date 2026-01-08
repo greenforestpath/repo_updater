@@ -678,7 +678,7 @@ log_event_json() {
 #==============================================================================
 
 # drop_last_lines - Remove the last N lines from input (portable alternative to head -n -N)
-# BSD/macOS head doesn't support negative line counts, so we use sed instead.
+# BSD/macOS head doesn't support negative line counts, so we calculate the positive count.
 # Usage: command | drop_last_lines 2  # Remove last 2 lines
 drop_last_lines() {
     local n="${1:-1}"
@@ -686,10 +686,7 @@ drop_last_lines() {
         cat
         return
     fi
-    # Build a sed command that deletes the last N lines
-    # For n=1: sed '$d' (delete last line)
-    # For n=2: sed 'N;$!P;$!D;$d' is complex, so we use a different approach
-    # We'll use head with line count calculated from wc -l
+    # Calculate total lines and use head with positive count
     local input
     input=$(cat)
     local total
