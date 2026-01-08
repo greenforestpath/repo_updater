@@ -9284,17 +9284,299 @@ has_pending_repos() {
     return 1
 }
 
-# Start the next queued session (stub)
+# Start the next queued session from pending repos
 # Args:
 #   $1 - Reference to sessions associative array
+#   $2 - Reference to pending repos array
 # Returns:
 #   0 on success, 1 if no session started
 start_next_queued_session() {
     local -n _sessions_ref=$1
+    local -n _pending_ref=$2
 
-    # This would be implemented by the orchestration layer
-    # For now, return 1 to indicate no session started
-    return 1
+    # Check if there are pending repos
+    if [[ ${#_pending_ref[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    # Get next repo from pending list
+    local repo_id="${_pending_ref[0]}"
+    _pending_ref=("${_pending_ref[@]:1}")  # Remove first element
+
+    # Get worktree path for this repo
+    local wt_path=""
+    if ! get_worktree_path "$repo_id" wt_path 2>/dev/null; then
+        log_warn "No worktree found for $repo_id, skipping"
+        return 1
+    fi
+
+    # Generate session ID
+    local session_id="ru-review-${REVIEW_RUN_ID:-$$}-${repo_id//\//-}"
+
+    # Load and start driver
+    if [[ -z "${REVIEW_DRIVER_LOADED:-}" ]]; then
+        load_review_driver "${REVIEW_DRIVER:-local}" || return 1
+        REVIEW_DRIVER_LOADED=1
+    fi
+
+    # Start session via driver
+    if ! driver_start_session "$session_id" "$wt_path" "$repo_id"; then
+        log_error "Failed to start session for $repo_id"
+        update_review_state ".repos[\"$repo_id\"].status = \"error\""
+        return 1
+    fi
+
+    # Track session
+    _sessions_ref["$repo_id"]="$session_id"
+    update_review_state ".repos[\"$repo_id\"].status = \"in_progress\" | .repos[\"$repo_id\"].session_id = \"$session_id\""
+
+    log_info "Started session for $repo_id (${#_sessions_ref[@]} active)"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# Cost Budget Management (bd-l05s)
+# Enforce limits on repos, runtime, and questions during review
+#------------------------------------------------------------------------------
+
+# Cost budget state (initialized in run_review_orchestration)
+declare -g COST_BUDGET_REPOS_PROCESSED=0
+declare -g COST_BUDGET_QUESTIONS_ASKED=0
+declare -g COST_BUDGET_START_TIME=0
+
+# Check if cost budget allows continuing
+# Uses REVIEW_MAX_REPOS, REVIEW_MAX_RUNTIME, REVIEW_MAX_QUESTIONS
+# Returns:
+#   0 if within budget, 1 if budget exceeded
+check_cost_budget() {
+    # Check repo limit
+    if [[ -n "${REVIEW_MAX_REPOS:-}" && "${REVIEW_MAX_REPOS:-0}" -gt 0 ]]; then
+        if [[ $COST_BUDGET_REPOS_PROCESSED -ge $REVIEW_MAX_REPOS ]]; then
+            log_warn "Cost budget: max repos ($REVIEW_MAX_REPOS) reached"
+            return 1
+        fi
+    fi
+
+    # Check runtime limit (in minutes)
+    if [[ -n "${REVIEW_MAX_RUNTIME:-}" && "${REVIEW_MAX_RUNTIME:-0}" -gt 0 ]]; then
+        local now elapsed_minutes
+        now=$(date +%s)
+        elapsed_minutes=$(( (now - COST_BUDGET_START_TIME) / 60 ))
+        if [[ $elapsed_minutes -ge $REVIEW_MAX_RUNTIME ]]; then
+            log_warn "Cost budget: max runtime (${REVIEW_MAX_RUNTIME}m) reached"
+            return 1
+        fi
+    fi
+
+    # Check questions limit
+    if [[ -n "${REVIEW_MAX_QUESTIONS:-}" && "${REVIEW_MAX_QUESTIONS:-0}" -gt 0 ]]; then
+        if [[ $COST_BUDGET_QUESTIONS_ASKED -ge $REVIEW_MAX_QUESTIONS ]]; then
+            log_warn "Cost budget: max questions ($REVIEW_MAX_QUESTIONS) reached"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Increment cost budget counters
+increment_repos_processed() {
+    ((COST_BUDGET_REPOS_PROCESSED++))
+}
+
+increment_questions_asked() {
+    ((COST_BUDGET_QUESTIONS_ASKED++))
+}
+
+#------------------------------------------------------------------------------
+# Pre-fetching Strategy (bd-l05s)
+# Warm caches for upcoming repos while reviewing current ones
+#------------------------------------------------------------------------------
+
+# Pre-fetch data for next N repos to minimize wait times
+# Args:
+#   $1 - Current index in repos array
+#   $2+ - Full repos array
+prefetch_next_repos() {
+    local current_index="$1"
+    shift
+    local -a repos=("$@")
+    local prefetch_count=2
+
+    local i
+    for ((i=1; i<=prefetch_count; i++)); do
+        local next_index=$((current_index + i))
+        if [[ $next_index -lt ${#repos[@]} ]]; then
+            local next_repo="${repos[next_index]}"
+
+            # Background prefetch
+            (
+                # Pre-fetch GitHub activity data (if function exists)
+                if declare -f get_repo_activity_cached &>/dev/null; then
+                    get_repo_activity_cached "$next_repo" >/dev/null 2>&1 || true
+                fi
+
+                # Warm git fetch
+                local local_path=""
+                local url branch custom_name repo_id
+                if resolve_repo_spec "$next_repo" "${PROJECTS_DIR:-}" "${LAYOUT:-flat}" \
+                        url branch custom_name local_path repo_id 2>/dev/null; then
+                    if [[ -d "$local_path" ]]; then
+                        git -C "$local_path" fetch --quiet 2>/dev/null || true
+                    fi
+                fi
+
+                log_debug "Pre-fetched data for $next_repo"
+            ) &
+        fi
+    done
+}
+
+#------------------------------------------------------------------------------
+# Main Review Orchestration Loop (bd-l05s)
+# Ties together worktrees, sessions, monitoring, and questions
+#------------------------------------------------------------------------------
+
+# Run the main orchestration loop for review sessions
+# Args:
+#   $1+ - Work items array (repo_id|type|number|...)
+# Returns:
+#   0 on success
+run_review_orchestration() {
+    local -a work_items=("$@")
+
+    # Initialize tracking
+    declare -A active_sessions=()  # repo_id -> session_id
+    local -a pending_repos=()
+    local -a completed_repos=()
+    local repo_index=0
+    local poll_interval=2
+
+    # Extract unique repos from work items
+    declare -A seen_repos=()
+    local item repo_id
+    for item in "${work_items[@]}"; do
+        IFS='|' read -r repo_id _ <<< "$item"
+        if [[ -n "$repo_id" && -z "${seen_repos[$repo_id]:-}" ]]; then
+            seen_repos["$repo_id"]=1
+            pending_repos+=("$repo_id")
+        fi
+    done
+
+    # Initialize cost budget
+    COST_BUDGET_START_TIME=$(date +%s)
+    COST_BUDGET_REPOS_PROCESSED=0
+    COST_BUDGET_QUESTIONS_ASKED=0
+
+    # Initialize review state
+    init_review_state
+    for repo_id in "${pending_repos[@]}"; do
+        update_review_state ".repos[\"$repo_id\"] = {\"status\": \"pending\", \"started_at\": null}"
+    done
+
+    log_info "Starting orchestration for ${#pending_repos[@]} repos (driver: ${REVIEW_DRIVER:-local}, parallel: ${REVIEW_PARALLEL:-1})"
+
+    # Load driver
+    load_review_driver "${REVIEW_DRIVER:-local}" || return 3
+
+    # Prepare worktrees for all repos
+    log_step "Preparing isolated worktrees..."
+    if ! prepare_review_worktrees "${work_items[@]}"; then
+        log_error "Failed to prepare worktrees"
+        return 1
+    fi
+
+    # Main orchestration loop
+    local lock_file="${RU_STATE_DIR:-/tmp}/review-${REVIEW_RUN_ID:-$$}.lock"
+    touch "$lock_file"
+
+    while [[ ${#pending_repos[@]} -gt 0 || ${#active_sessions[@]} -gt 0 ]]; do
+        # Check cost budget before starting new sessions
+        if ! check_cost_budget; then
+            log_warn "Cost budget exceeded, stopping new sessions"
+            pending_repos=()  # Don't start any more
+        fi
+
+        # Pre-fetch next repos while we have active sessions
+        if [[ ${#active_sessions[@]} -gt 0 && ${#pending_repos[@]} -gt 0 ]]; then
+            prefetch_next_repos "$repo_index" "${pending_repos[@]}"
+        fi
+
+        # Start new sessions if capacity allows
+        while can_start_new_session && [[ ${#pending_repos[@]} -gt 0 ]]; do
+            if start_next_queued_session active_sessions pending_repos; then
+                increment_repos_processed
+                ((repo_index++))
+            else
+                break
+            fi
+        done
+
+        # Monitor active sessions
+        for repo_id in "${!active_sessions[@]}"; do
+            local session_id="${active_sessions[$repo_id]}"
+            local raw_state confirmed_state
+
+            raw_state=$(detect_session_state_raw "$session_id" 2>/dev/null || echo "generating")
+            confirmed_state=$(apply_state_hysteresis "$session_id" "$raw_state" "${active_sessions[$repo_id]:-generating}")
+
+            log_debug "Session $session_id: state=$confirmed_state"
+
+            case "$confirmed_state" in
+                waiting)
+                    local reason
+                    reason=$(detect_wait_reason "$session_id" 2>/dev/null || echo "unknown")
+                    if [[ "$reason" == ask_user_question:* || "$reason" == agent_question:* ]]; then
+                        increment_questions_asked
+                        if ! check_cost_budget; then
+                            log_warn "Question budget reached, auto-skipping"
+                            driver_send_message "$session_id" "Skip this question and continue" 2>/dev/null || true
+                        else
+                            handle_waiting_session "$session_id"
+                        fi
+                    else
+                        handle_waiting_session "$session_id"
+                    fi
+                    ;;
+                complete)
+                    completed_repos+=("$repo_id")
+                    unset "active_sessions[$repo_id]"
+                    update_review_state ".repos[\"$repo_id\"].status = \"completed\""
+                    handle_session_complete "$session_id"
+                    log_info "Session completed for $repo_id"
+                    ;;
+                error)
+                    governor_record_error "session_error" "$session_id" 2>/dev/null || true
+                    handle_session_error "$session_id"
+                    unset "active_sessions[$repo_id]"
+                    update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                    ;;
+                stalled)
+                    handle_stalled_session "$session_id"
+                    ;;
+            esac
+        done
+
+        # Process question queue (TUI) if we have pending questions
+        if declare -f has_pending_questions &>/dev/null && has_pending_questions 2>/dev/null; then
+            if declare -f render_question_tui &>/dev/null; then
+                render_question_tui
+                if declare -f process_user_answers &>/dev/null; then
+                    process_user_answers
+                fi
+            fi
+        fi
+
+        sleep "$poll_interval"
+    done
+
+    rm -f "$lock_file"
+    log_success "Orchestration complete: ${#completed_repos[@]} repos processed"
+
+    # Update digest caches from completed worktrees
+    update_repo_digests_from_worktrees || true
+
+    return 0
 }
 
 #------------------------------------------------------------------------------
@@ -15174,35 +15456,34 @@ cmd_review() {
     pending_repos_list="${pending_repos_list%" "}"
     checkpoint_review_state "" "$pending_repos_list"
 
-    # TODO: Orchestration phases (implemented in later beads)
-    # - Prepare worktrees
-    # - Start Claude Code sessions
-    # - Monitor and aggregate questions
-    # - Apply approved changes
-
-    log_warn "Review orchestration not yet implemented"
+    # Run main orchestration loop (bd-l05s)
     log_info "Run ID: $run_id"
     log_info "Driver: $REVIEW_DRIVER"
     log_info "Mode: $REVIEW_MODE"
     log_info "Parallel: $REVIEW_PARALLEL"
 
-    if [[ "$REVIEW_MODE" == "apply" ]]; then
-        log_info "Apply mode: would execute approved plans"
-        if [[ "$REVIEW_PUSH" == "true" ]]; then
-            log_info "Push enabled: would push approved changes"
-        fi
+    local orchestration_code=0
+    if ! run_review_orchestration "${work_items[@]}"; then
+        orchestration_code=$?
+        log_error "Orchestration failed with code $orchestration_code"
     fi
 
+    # Handle non-interactive mode questions summary
     if [[ "$REVIEW_NON_INTERACTIVE" == "true" ]]; then
         summarize_non_interactive_questions
     fi
 
-    update_repo_digests_from_worktrees || true
-    clear_review_checkpoint
-    if [[ "$JSON_OUTPUT" == "true" ]]; then
-        build_review_completion_json "$run_id" "$REVIEW_MODE" "$review_start_epoch" "0" "${work_items[@]}"
+    # Clear checkpoint on success
+    if [[ "$orchestration_code" -eq 0 ]]; then
+        clear_review_checkpoint
     fi
-    return 0
+
+    # Build completion JSON if requested
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        build_review_completion_json "$run_id" "$REVIEW_MODE" "$review_start_epoch" "$orchestration_code" "${work_items[@]}"
+    fi
+
+    finalize_review_exit "$orchestration_code"
 }
 
 #------------------------------------------------------------------------------

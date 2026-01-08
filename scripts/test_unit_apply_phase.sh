@@ -203,8 +203,8 @@ test_gh_action_comment() {
     log_test_start "$test_name"
     setup_apply_test
 
-    # Test canonicalize_gh_action with comment
-    local action_json='{"op":"comment","target":"#42","body":"Test comment"}'
+    # Test canonicalize_gh_action with comment (target format: issue#N or pr#N)
+    local action_json='{"op":"comment","target":"issue#42","body":"Test comment"}'
     local canonical
     canonical=$(canonicalize_gh_action "$action_json")
 
@@ -214,13 +214,13 @@ test_gh_action_comment() {
         fail "Should canonicalize comment action"
     fi
 
-    # Test parse_gh_action_target
+    # Test parse_gh_action_target (expects issue#N or pr#N format)
     local target_type number
-    if parse_gh_action_target "#42" target_type number; then
+    if parse_gh_action_target "issue#42" target_type number; then
         assert_equals "42" "$number" "Should parse issue number"
         pass "Target parsed correctly"
     else
-        fail "Should parse target #42"
+        fail "Should parse target issue#42"
     fi
 
     log_test_pass "$test_name"
@@ -231,8 +231,8 @@ test_gh_action_close() {
     log_test_start "$test_name"
     setup_apply_test
 
-    # Test canonicalize_gh_action with close
-    local action_json='{"op":"close","target":"#42","reason":"completed"}'
+    # Test canonicalize_gh_action with close (target format: issue#N or pr#N)
+    local action_json='{"op":"close","target":"issue#42","reason":"completed"}'
     local canonical
     canonical=$(canonicalize_gh_action "$action_json")
 
@@ -250,8 +250,8 @@ test_gh_action_label() {
     log_test_start "$test_name"
     setup_apply_test
 
-    # Test canonicalize_gh_action with label
-    local action_json='{"op":"label","target":"#42","add":["bug","urgent"]}'
+    # Test canonicalize_gh_action with label (target format: issue#N or pr#N)
+    local action_json='{"op":"label","target":"issue#42","add":["bug","urgent"]}'
     local canonical
     canonical=$(canonicalize_gh_action "$action_json")
 
