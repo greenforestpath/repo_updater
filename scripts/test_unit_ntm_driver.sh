@@ -24,6 +24,8 @@ source_ru_function "json_get_field"
 source_ru_function "json_is_success"
 source_ru_function "json_escape"
 source_ru_function "ntm_check_available"
+source_ru_function "is_git_repo"
+source_ru_function "repo_is_dirty"
 source_ru_function "has_uncommitted_changes"
 source_ru_function "is_file_denied"
 
@@ -54,6 +56,9 @@ declare -a AGENT_SWEEP_DENYLIST_PATTERNS=(
     "*.pyc"
     "*.pyo"
 )
+
+# Initialize AGENT_SWEEP_DENYLIST_EXTRA_LOCAL (used by is_file_denied, normally loaded from config)
+declare -ga AGENT_SWEEP_DENYLIST_EXTRA_LOCAL=()
 
 #==============================================================================
 # JSON Parsing Tests: json_get_field()

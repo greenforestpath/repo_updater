@@ -45,6 +45,7 @@ source_ru_function "worktree_exists"
 source_ru_function "list_review_worktrees"
 source_ru_function "cleanup_review_worktrees"
 source_ru_function "is_git_repo"
+source_ru_function "repo_is_dirty"
 source_ru_function "ensure_clean_or_fail"
 source_ru_function "prepare_review_worktrees"
 

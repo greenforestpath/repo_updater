@@ -23,6 +23,7 @@ source_ru_function "_set_out_var"
 source_ru_function "_is_safe_path_segment"
 source_ru_function "_is_path_under_base"
 source_ru_function "is_git_repo"
+source_ru_function "repo_is_dirty"
 source_ru_function "ensure_dir"
 source_ru_function "get_worktrees_dir"
 source_ru_function "ensure_clean_or_fail"
@@ -81,8 +82,8 @@ test_ensure_clean_clean_repo() {
     repo_dir=$(create_test_repo "clean-repo")
 
     # Clean repo should pass
-    ensure_clean_or_fail "$repo_dir" 2>/dev/null
-    assert_exit_code 0 "Clean repo should pass ensure_clean_or_fail" true
+    assert_exit_code 0 "Clean repo should pass ensure_clean_or_fail" \
+        ensure_clean_or_fail "$repo_dir"
 }
 
 test_ensure_clean_dirty_repo() {
