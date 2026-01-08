@@ -113,10 +113,11 @@ test_plan_validation_accepts_valid() {
     log_test_start "$test_name"
     setup_apply_test
 
-    # Create valid plan
+    # Create valid plan with all required fields
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
+        "schema_version": "1",
         "repo": "owner/repo",
-        "items": [{"id": "1", "type": "issue", "decision": "fix"}],
+        "items": [{"type": "issue", "number": 42, "decision": "fix"}],
         "gh_actions": [],
         "git": {"commits": [], "tests": {"ran": false}}
     }'
@@ -160,13 +161,14 @@ test_quality_gate_lint_failure() {
     # Verify lint gate detection
     # This tests the plan structure for lint results
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
+        "schema_version": "1",
         "repo": "owner/repo",
         "items": [],
         "git": {"lint": {"ran": true, "ok": false, "output": "errors found"}}
     }'
 
     local lint_ok
-    lint_ok=$(jq -r '.git.lint.ok // true' "$TEST_DIR/worktree/.ru/review-plan.json")
+    lint_ok=$(jq -r '.git.lint.ok' "$TEST_DIR/worktree/.ru/review-plan.json")
     assert_equals "false" "$lint_ok" "Lint failure recorded in plan"
 
     log_test_pass "$test_name"
@@ -179,13 +181,14 @@ test_quality_gate_secret_failure() {
 
     # Verify secret scan detection structure
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
+        "schema_version": "1",
         "repo": "owner/repo",
         "items": [],
         "git": {"secrets": {"scanned": true, "ok": false, "findings": ["API_KEY"]}}
     }'
 
     local secrets_ok
-    secrets_ok=$(jq -r '.git.secrets.ok // true' "$TEST_DIR/worktree/.ru/review-plan.json")
+    secrets_ok=$(jq -r '.git.secrets.ok' "$TEST_DIR/worktree/.ru/review-plan.json")
     assert_equals "false" "$secrets_ok" "Secret scan failure recorded"
 
     log_test_pass "$test_name"
