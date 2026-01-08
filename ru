@@ -16799,11 +16799,29 @@ run_test_gate() {
 
     log_verbose "Running tests: $test_cmd"
 
-    # Run tests with timeout
-    if output=$(cd "$project_dir" && timeout "$timeout" bash -c "$test_cmd" 2>&1); then
-        exit_code=0
+    # Run tests with timeout (portable: use gtimeout on macOS if available)
+    local timeout_cmd="timeout"
+    if ! command -v timeout &>/dev/null; then
+        if command -v gtimeout &>/dev/null; then
+            timeout_cmd="gtimeout"
+        else
+            timeout_cmd=""
+            log_verbose "No timeout command available; running tests without timeout"
+        fi
+    fi
+
+    if [[ -n "$timeout_cmd" ]]; then
+        if output=$(cd "$project_dir" && "$timeout_cmd" "$timeout" bash -c "$test_cmd" 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     else
-        exit_code=$?
+        if output=$(cd "$project_dir" && bash -c "$test_cmd" 2>&1); then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     fi
 
     local end_time duration
