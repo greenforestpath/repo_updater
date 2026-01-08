@@ -9256,7 +9256,7 @@ monitor_sessions() {
         done <<< "$session_list"
 
         # Start new sessions if governor allows
-        while can_start_new_session 2>/dev/null && has_pending_repos 2>/dev/null; do
+        while can_start_new_session "${#sessions[@]}" 2>/dev/null && has_pending_repos 2>/dev/null; do
             start_next_queued_session sessions 2>/dev/null || break
         done
 
@@ -9505,7 +9505,7 @@ run_review_orchestration() {
         fi
 
         # Start new sessions if capacity allows
-        while can_start_new_session && [[ ${#pending_repos[@]} -gt 0 ]]; do
+        while can_start_new_session "${#active_sessions[@]}" && [[ ${#pending_repos[@]} -gt 0 ]]; do
             if start_next_queued_session active_sessions pending_repos; then
                 increment_repos_processed
                 ((repo_index++))
@@ -10516,6 +10516,7 @@ _enable_local_driver() {
     driver_stream_events() {
         local_driver_stream_events "$@"
     }
+    # shellcheck disable=SC2120  # Called with varying args via dispatch
     driver_list_sessions() {
         local_driver_list_sessions "$@"
     }
@@ -10729,10 +10730,10 @@ adjust_parallelism() {
 }
 
 # Check if we can start a new session based on governor state
-# Args: current_active_sessions
+# Args: current_active_count (number of currently active sessions)
 # Returns: 0 if allowed, 1 if not
 can_start_new_session() {
-    local active_sessions="${1:-0}"
+    local active_count="${1:-0}"
 
     # Circuit breaker open = no new sessions
     if [[ "${GOVERNOR_STATE[circuit_breaker_open]}" == "true" ]]; then
@@ -10749,10 +10750,10 @@ can_start_new_session() {
     # Check effective parallelism
     local effective="${GOVERNOR_STATE[effective_parallelism]}"
     # Validate integers; default to conservative values if corrupted
-    [[ "$active_sessions" =~ ^[0-9]+$ ]] || active_sessions=0
+    [[ "$active_count" =~ ^[0-9]+$ ]] || active_count=0
     [[ "$effective" =~ ^[0-9]+$ ]] || effective=1
-    if [[ "$active_sessions" -ge "$effective" ]]; then
-        log_verbose "Cannot start session: at capacity ($active_sessions >= $effective)"
+    if [[ "$active_count" -ge "$effective" ]]; then
+        log_verbose "Cannot start session: at capacity ($active_count >= $effective)"
         return 1
     fi
 

@@ -269,7 +269,8 @@ test_review_max_repos_budget() {
     export RU_STATE_DIR="$E2E_TEMP_DIR/state"
     export REVIEW_MAX_REPOS=3
     export COST_BUDGET_REPOS_PROCESSED=0
-    export COST_BUDGET_START_TIME=$(date +%s)
+    COST_BUDGET_START_TIME=$(date +%s)
+    export COST_BUDGET_START_TIME
     export COST_BUDGET_QUESTIONS_ASKED=0
     mkdir -p "$RU_STATE_DIR"
 
@@ -305,7 +306,8 @@ test_review_max_runtime_budget() {
 
     export RU_STATE_DIR="$E2E_TEMP_DIR/state"
     export REVIEW_MAX_RUNTIME=1  # 1 minute
-    export COST_BUDGET_START_TIME=$(date +%s)
+    COST_BUDGET_START_TIME=$(date +%s)
+    export COST_BUDGET_START_TIME
     export COST_BUDGET_REPOS_PROCESSED=0
     export COST_BUDGET_QUESTIONS_ASKED=0
     mkdir -p "$RU_STATE_DIR"

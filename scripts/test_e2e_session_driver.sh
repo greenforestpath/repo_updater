@@ -44,7 +44,8 @@ source_ru_function "local_driver_interrupt_session"
 driver_start_session() {
     local wt_path="$1"
     local prompt="$2"
-    local session_id="ru-e2e-$$-$(date +%s)"
+    local session_id
+    session_id="ru-e2e-$$-$(date +%s)"
 
     # Create session directory
     local session_dir="${RU_STATE_DIR}/sessions/${session_id}"

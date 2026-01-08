@@ -61,7 +61,8 @@ setup_orchestration_test() {
     # Reset cost budget state
     export COST_BUDGET_REPOS_PROCESSED=0
     export COST_BUDGET_QUESTIONS_ASKED=0
-    export COST_BUDGET_START_TIME=$(date +%s)
+    COST_BUDGET_START_TIME=$(date +%s)
+    export COST_BUDGET_START_TIME
 
     # Clear review args
     unset REVIEW_MAX_REPOS REVIEW_MAX_RUNTIME REVIEW_MAX_QUESTIONS
@@ -300,7 +301,8 @@ test_cost_budget_runtime() {
     setup_orchestration_test
 
     export REVIEW_MAX_RUNTIME=1  # 1 minute
-    export COST_BUDGET_START_TIME=$(date +%s)
+    COST_BUDGET_START_TIME=$(date +%s)
+    export COST_BUDGET_START_TIME
 
     # Should allow at start
     if check_cost_budget; then
