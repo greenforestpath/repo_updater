@@ -9262,9 +9262,10 @@ monitor_sessions() {
 
         # Rebuild pending repos from state and start sessions
         local -a pending_repos=()
+        local -A repo_items=()
         if has_pending_repos 2>/dev/null && get_pending_repos_from_state pending_repos 2>/dev/null; then
             while can_start_new_session "${#sessions[@]}" 2>/dev/null && [[ ${#pending_repos[@]} -gt 0 ]]; do
-                start_next_queued_session sessions pending_repos 2>/dev/null || break
+                start_next_queued_session sessions pending_repos repo_items 2>/dev/null || break
             done
         fi
 
@@ -9290,32 +9291,6 @@ has_pending_repos() {
         fi
     fi
     return 1
-}
-
-# Load pending repos from review state into an array
-# Args:
-#   $1 - Reference to output array
-# Returns:
-#   0 if any pending repos found, 1 otherwise
-load_pending_repos_from_state() {
-    local -n _pending_out="$1"
-    _pending_out=()
-
-    if ! command -v jq &>/dev/null; then
-        return 1
-    fi
-
-    if [[ -n "${RU_STATE_DIR:-}" ]]; then
-        local state_file
-        state_file=$(get_review_state_file 2>/dev/null || echo "")
-        if [[ -f "$state_file" ]]; then
-            while IFS= read -r repo_id; do
-                [[ -n "$repo_id" ]] && _pending_out+=("$repo_id")
-            done < <(jq -r '.repos | to_entries[] | select(.value.status == "pending") | .key' "$state_file" 2>/dev/null)
-        fi
-    fi
-
-    [[ ${#_pending_out[@]} -gt 0 ]]
 }
 
 # Get pending repos from state file into an array
