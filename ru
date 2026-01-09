@@ -9292,6 +9292,32 @@ has_pending_repos() {
     return 1
 }
 
+# Load pending repos from review state into an array
+# Args:
+#   $1 - Reference to output array
+# Returns:
+#   0 if any pending repos found, 1 otherwise
+load_pending_repos_from_state() {
+    local -n _pending_out="$1"
+    _pending_out=()
+
+    if ! command -v jq &>/dev/null; then
+        return 1
+    fi
+
+    if [[ -n "${RU_STATE_DIR:-}" ]]; then
+        local state_file
+        state_file=$(get_review_state_file 2>/dev/null || echo "")
+        if [[ -f "$state_file" ]]; then
+            while IFS= read -r repo_id; do
+                [[ -n "$repo_id" ]] && _pending_out+=("$repo_id")
+            done < <(jq -r '.repos | to_entries[] | select(.value.status == "pending") | .key' "$state_file" 2>/dev/null)
+        fi
+    fi
+
+    [[ ${#_pending_out[@]} -gt 0 ]]
+}
+
 # Get pending repos from state file into an array
 # Args:
 #   $1 - Name of array variable to populate
@@ -9327,11 +9353,25 @@ get_pending_repos_from_state() {
 # Args:
 #   $1 - Reference to sessions associative array
 #   $2 - Reference to pending repos array
+#   $3 - Reference to repo_items associative array (repo_id -> newline-separated work items)
 # Returns:
 #   0 on success, 1 if no session started
 start_next_queued_session() {
-    local -n _sessions_ref=$1
-    local -n _pending_ref=$2
+    if [[ -z "${1:-}" || -z "${2:-}" ]]; then
+        log_error "start_next_queued_session: missing arguments"
+        return 1
+    fi
+
+    local -n _sessions_ref="$1"
+    local -n _pending_ref="$2"
+    local items_ref_name="${3:-}"
+    local -A _empty_items=()
+    # If caller doesn't provide a repo_items map, use an empty map.
+    if [[ -n "$items_ref_name" ]]; then
+        local -n _repo_items_ref="$items_ref_name"
+    else
+        local -n _repo_items_ref="_empty_items"
+    fi
 
     # Check if there are pending repos
     if [[ ${#_pending_ref[@]} -eq 0 ]]; then
@@ -9352,6 +9392,23 @@ start_next_queued_session() {
     # Generate session ID
     local session_id="ru-review-${REVIEW_RUN_ID:-$$}-${repo_id//\//-}"
 
+    # Build review prompt for this repo
+    local items_blob="${_repo_items_ref[$repo_id]:-}"
+    local -a repo_items=()
+    if [[ -n "$items_blob" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && repo_items+=("$line")
+        done <<< "$items_blob"
+    fi
+
+    local items_json="[]"
+    if [[ ${#repo_items[@]} -gt 0 ]]; then
+        items_json=$(build_review_items_json "${repo_items[@]}")
+    fi
+
+    local prompt
+    prompt=$(generate_review_prompt "$repo_id" "$wt_path" "${REVIEW_RUN_ID:-unknown}" "$items_json")
+
     # Load and start driver
     if [[ -z "${REVIEW_DRIVER_LOADED:-}" ]]; then
         load_review_driver "${REVIEW_DRIVER:-local}" || return 1
@@ -9359,7 +9416,7 @@ start_next_queued_session() {
     fi
 
     # Start session via driver
-    if ! driver_start_session "$session_id" "$wt_path" "$repo_id"; then
+    if ! driver_start_session "$wt_path" "$session_id" "$prompt"; then
         log_error "Failed to start session for $repo_id"
         update_review_state ".repos[\"$repo_id\"].status = \"error\""
         return 1
@@ -9492,14 +9549,22 @@ run_review_orchestration() {
     local repo_index=0
     local poll_interval=2
 
-    # Extract unique repos from work items
+    # Extract unique repos from work items and group items per repo
     declare -A seen_repos=()
+    declare -A repo_items=()
     local item repo_id
     for item in "${work_items[@]}"; do
         IFS='|' read -r repo_id _ <<< "$item"
         if [[ -n "$repo_id" && -z "${seen_repos[$repo_id]:-}" ]]; then
             seen_repos["$repo_id"]=1
             pending_repos+=("$repo_id")
+        fi
+        if [[ -n "$repo_id" ]]; then
+            if [[ -n "${repo_items[$repo_id]:-}" ]]; then
+                repo_items["$repo_id"]+=$'\n'"$item"
+            else
+                repo_items["$repo_id"]="$item"
+            fi
         fi
     done
 
@@ -9550,7 +9615,7 @@ run_review_orchestration() {
 
         # Start new sessions if capacity allows
         while can_start_new_session "${#active_sessions[@]}" && [[ ${#pending_repos[@]} -gt 0 ]]; do
-            if start_next_queued_session active_sessions pending_repos; then
+            if start_next_queued_session active_sessions pending_repos repo_items; then
                 increment_repos_processed
                 ((repo_index++))
             else
