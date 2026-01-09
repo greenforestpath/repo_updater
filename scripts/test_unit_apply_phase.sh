@@ -280,7 +280,7 @@ test_dry_run_no_mutations() {
     create_test_plan "$TEST_DIR/worktree/.ru/review-plan.json" '{
         "repo": "owner/repo",
         "items": [],
-        "gh_actions": [{"op":"comment","target":"#1","body":"test"}]
+        "gh_actions": [{"op":"comment","target":"issue#1","body":"test"}]
     }'
 
     # In dry-run mode, actions should be logged but not executed
