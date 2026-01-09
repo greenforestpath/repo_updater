@@ -29,6 +29,75 @@ session_from_state() {
     echo "$session"
 }
 
+handle_spawn() {
+    local session="${1:-}"
+    if [[ "$scenario" == "resource_busy" ]]; then
+        echo '{"success":false,"error_code":"RESOURCE_BUSY","error":"session already exists"}'
+        exit 1
+    fi
+    if [[ "$scenario" == "spawn_fail" ]]; then
+        echo '{"success":false,"error_code":"INTERNAL_ERROR","error":"spawn failed"}'
+        exit 1
+    fi
+    [[ -z "$session" ]] && session="test"
+    save_session "$session"
+    echo "{\"success\":true,\"session\":\"$session\",\"agents\":[{\"pane\":\"0.1\",\"type\":\"claude\",\"ready\":true}],\"panes\":[\"0.1\"]}"
+}
+
+extract_msg_arg() {
+    local msg=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --msg=*) msg="${1#--msg=}" ;;
+            --msg)
+                shift
+                msg="${1:-}"
+                ;;
+        esac
+        shift || true
+    done
+    echo "$msg"
+}
+
+handle_send() {
+    if [[ "$scenario" == "agent_error" ]]; then
+        echo '{"success":false,"error_code":"AGENT_ERROR","error":"Agent crashed"}'
+        exit 3
+    fi
+    local msg
+    msg=$(extract_msg_arg "$@")
+    if [[ -n "$msg" ]]; then
+        printf '%s' "$msg" > "$prompt_file"
+    fi
+    echo '{"success":true,"delivered":true,"chunks":1}'
+}
+
+handle_wait() {
+    if [[ "$scenario" == "timeout" ]]; then
+        echo '{"success":false,"error_code":"TIMEOUT","error":"Timeout waiting for condition"}'
+        exit 1
+    fi
+    if [[ "$scenario" == "agent_error" ]]; then
+        echo '{"success":false,"error_code":"AGENT_ERROR","error":"Agent crashed or rate limited"}'
+        exit 3
+    fi
+    echo '{"success":true,"condition":"idle","waited_seconds":45.2}'
+}
+
+handle_activity() {
+    case "$scenario" in
+        rate_limited)
+            echo '{"success":true,"state":"WAITING","velocity":0.0,"confidence":0.9,"rate_limited":true}'
+            ;;
+        generating)
+            echo '{"success":true,"state":"GENERATING","velocity":150.5,"confidence":0.9,"rate_limited":false}'
+            ;;
+        *)
+            echo '{"success":true,"state":"WAITING","velocity":0.0,"confidence":0.9,"rate_limited":false}'
+            ;;
+    esac
+}
+
 cmd="${1:-}"
 case "$cmd" in
     --robot-status)
@@ -39,62 +108,42 @@ EOF
         ;;
     --robot-spawn=*)
         session="${cmd#--robot-spawn=}"
-        if [[ "$scenario" == "resource_busy" ]]; then
-            echo '{"success":false,"error_code":"RESOURCE_BUSY","error":"session already exists"}'
-            exit 1
-        fi
-        if [[ "$scenario" == "spawn_fail" ]]; then
-            echo '{"success":false,"error_code":"INTERNAL_ERROR","error":"spawn failed"}'
-            exit 1
-        fi
-        [[ -z "$session" ]] && session="test"
-        save_session "$session"
-        echo "{\"success\":true,\"session\":\"$session\",\"agents\":[{\"pane\":\"0.1\",\"type\":\"claude\",\"ready\":true}],\"panes\":[\"0.1\"]}"
+        handle_spawn "$session"
+        ;;
+    --robot-spawn)
+        shift
+        handle_spawn "${1:-}"
         ;;
     --robot-send=*)
-        if [[ "$scenario" == "agent_error" ]]; then
-            echo '{"success":false,"error_code":"AGENT_ERROR","error":"Agent crashed"}'
-            exit 3
-        fi
-        msg=""
-        for arg in "$@"; do
-            case "$arg" in
-                --msg=*) msg="${arg#--msg=}" ;;
-            esac
-        done
-        if [[ -n "$msg" ]]; then
-            printf '%s' "$msg" > "$prompt_file"
-        fi
-        echo '{"success":true,"delivered":true,"chunks":1}'
+        shift
+        handle_send "$@"
+        ;;
+    --robot-send)
+        shift
+        handle_send "$@"
         ;;
     --robot-wait=*)
-        if [[ "$scenario" == "timeout" ]]; then
-            echo '{"success":false,"error_code":"TIMEOUT","error":"Timeout waiting for condition"}'
-            exit 1
-        fi
-        if [[ "$scenario" == "agent_error" ]]; then
-            echo '{"success":false,"error_code":"AGENT_ERROR","error":"Agent crashed or rate limited"}'
-            exit 3
-        fi
-        echo '{"success":true,"condition":"idle","waited_seconds":45.2}'
+        handle_wait
+        ;;
+    --robot-wait)
+        handle_wait
         ;;
     --robot-activity=*)
-        case "$scenario" in
-            rate_limited)
-                echo '{"success":true,"state":"WAITING","velocity":0.0,"confidence":0.9,"rate_limited":true}'
-                ;;
-            generating)
-                echo '{"success":true,"state":"GENERATING","velocity":150.5,"confidence":0.9,"rate_limited":false}'
-                ;;
-            *)
-                echo '{"success":true,"state":"WAITING","velocity":0.0,"confidence":0.9,"rate_limited":false}'
-                ;;
-        esac
+        handle_activity
+        ;;
+    --robot-activity)
+        handle_activity
         ;;
     --robot-health=*)
         echo '{"success":true,"alerts":[]}'
         ;;
+    --robot-health)
+        echo '{"success":true,"alerts":[]}'
+        ;;
     --robot-interrupt=*)
+        echo '{"success":true}'
+        ;;
+    --robot-interrupt)
         echo '{"success":true}'
         ;;
     kill)
