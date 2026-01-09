@@ -9487,7 +9487,11 @@ start_next_queued_session() {
 
         # Load and start driver
         if [[ -z "${REVIEW_DRIVER_LOADED:-}" ]]; then
-            load_review_driver "${REVIEW_DRIVER:-local}" || return 1
+            if ! load_review_driver "${REVIEW_DRIVER:-local}"; then
+                log_error "Failed to load review driver for $repo_id"
+                update_review_state ".repos[\"$repo_id\"].status = \"error\""
+                return 1
+            fi
             REVIEW_DRIVER_LOADED=1
         fi
 
