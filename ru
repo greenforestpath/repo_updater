@@ -7210,8 +7210,10 @@ cmd_self_update() {
     # Create temp directory for download
     local temp_dir
     temp_dir=$(mktemp_dir) || { log_error "Failed to create temp directory"; exit 3; }
-    # Clean up on exit, but preserve global cleanup behavior
-    trap 'rm -rf "$temp_dir"; cleanup' EXIT
+    # Clean up on exit, but preserve global cleanup behavior.
+    # Expand temp_dir now so the EXIT trap doesn't lose the local variable.
+    # shellcheck disable=SC2064  # Intentional early expansion of temp_dir
+    trap "rm -rf -- \"$temp_dir\"; cleanup" EXIT
 
     # Download URLs
     local release_base="https://github.com/$RU_REPO_OWNER/$RU_REPO_NAME/releases/download/v$latest_version"
