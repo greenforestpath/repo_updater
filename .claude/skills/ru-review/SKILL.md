@@ -233,7 +233,7 @@ xf search "contribution policy" --limit 10
 xf search "local LLM" --limit 10
 
 # Search recent tweets (within last N days)
-xf search "openrouter" --limit 10
+xf search "openrouter" --since "30 days ago" --limit 10
 ```
 
 The Twitter data is indexed at `/data/projects/my_twitter_data` and accessible via `xf`.
