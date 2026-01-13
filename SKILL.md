@@ -112,6 +112,32 @@ ru self-update # Update ru itself
 
 RU includes a powerful review orchestration system for managing AI-assisted code review across your repositories.
 
+### ⚠️ CRITICAL SAFETY RULES - NEVER VIOLATE ⚠️
+
+**1. NEVER Stash User Changes**
+If repositories have uncommitted changes, **NEVER use `git stash`**. This risks losing user work. Stashed changes can be difficult to recover, especially untracked files which require `git show stash@{0}^3:path` to extract.
+
+**2. NEVER Modify Working Tree Without Permission**
+Do not run `git checkout`, `git reset`, `git clean`, or any command that modifies uncommitted changes without explicit user permission.
+
+**3. Commit Changes First (The Correct Approach)**
+If repos have uncommitted changes and the user wants to proceed with review, **commit the changes first** with logical groupings and detailed messages, then push.
+
+**4. Let ru Skip Dirty Repos**
+The `ru review` command automatically skips repositories with uncommitted changes. This is correct behavior—let it skip them rather than forcing them clean.
+
+### Decision Tree: Handling Dirty Repos
+
+```
+Found uncommitted changes in repos?
+├── User wants to proceed with ru review?
+│   ├── YES → Ask: "Should I commit these changes first?"
+│   │   ├── User says YES → Commit with logical groupings, push, then run ru review
+│   │   └── User says NO → Let ru skip those repos, review clean repos only
+│   └── NO → Stop, let user handle their changes
+└── No uncommitted changes → Run ru review normally
+```
+
 ### Two-Phase Review Workflow
 
 **Phase 1: Discovery (`--plan`)**
@@ -126,7 +152,10 @@ RU includes a powerful review orchestration system for managing AI-assisted code
 - Optionally pushes approved changes (`--push`)
 
 ```bash
-# Discover and plan reviews
+# Discovery - see what issues/PRs exist
+ru review --dry-run
+
+# Plan mode - generate review plans, no mutations
 ru review --plan
 
 # After reviewing AI suggestions
@@ -155,16 +184,91 @@ Priority levels: CRITICAL (≥150), HIGH (≥100), NORMAL (≥50), LOW (<50)
 
 ```bash
 ru review --mode=ntm --plan
-ru review -j 4 --plan  # Parallel sessions
+ru review --mode=local --plan  # Use if ntm has issues
+ru review -j 4 --plan          # Parallel sessions
 ```
 
-### Cost Budgets
+### Review Options
 
 ```bash
-ru review --max-repos=10 --plan
-ru review --max-runtime=30 --plan  # Minutes
-ru review --skip-days=14 --plan    # Skip recently reviewed
-ru review --analytics              # View past review stats
+ru review --max-repos=10 --plan       # Limit repos
+ru review --max-runtime=30 --plan     # Minutes budget
+ru review --skip-days=14 --plan       # Skip recently reviewed
+ru review --repos=PATTERN --plan      # Filter by regex
+ru review --analytics                 # View past review stats
+```
+
+### Contribution Policy
+
+The `ru review` command includes this contribution policy in its prompts:
+
+> We don't allow PRs or outside contributions to this project as a matter of policy. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them.
+
+**Key principle:** Independently verify and validate all user reports. Don't trust submitted fixes blindly—use them as inspiration but verify everything against actual code and documentation.
+
+### Multi-Agent Coordination
+
+When multiple agents review repos simultaneously:
+
+1. **Use alphabetical ordering** - One agent works A→Z, another Z→A
+2. **Check which repos are in progress** - Look for uncommitted changes or lock files
+3. **Skip repos being worked on** - Don't review a repo another agent is actively modifying
+
+### Review Response Guidelines
+
+When reviewing issues and PRs:
+- **Verify independently** - Don't trust submitted code blindly
+- **Check actual behavior** - Run tests, verify against docs
+- **Use gh commands** to respond on behalf of the user
+- **Close issues** that are resolved or invalid
+- **Request clarification** if issue is unclear
+
+### What NOT to Do During Review
+
+- ❌ `git stash` - NEVER stash user changes
+- ❌ `git checkout -- .` - NEVER discard changes
+- ❌ `git reset --hard` - NEVER reset working tree
+- ❌ `git clean -fd` - NEVER clean untracked files
+- ❌ Shell loops to iterate repos - ru handles iteration internally
+- ❌ Direct `gh` commands for bulk operations - use ru's orchestration
+
+### What TO Do During Review
+
+- ✅ Use `ru review --dry-run` to discover work items
+- ✅ Let ru skip repos with uncommitted changes
+- ✅ Ask user before modifying their working tree state
+- ✅ Commit changes (with user permission) before review if needed
+- ✅ Use `--mode=local` if ntm has issues
+- ✅ Work in reverse alphabetical order when coordinating with other agents
+
+### Emergency: Recovering from Accidental Stash
+
+If someone accidentally stashed changes:
+
+**Tracked Files (Easy):**
+```bash
+git stash pop  # Restore tracked changes
+```
+
+**Untracked Files (Harder):**
+```bash
+# List untracked files in stash
+git show stash@{0}^3 --name-only
+
+# Extract a specific untracked file
+git show stash@{0}^3:path/to/file.rs > path/to/file.rs
+```
+
+**If Stash Was Dropped:**
+```bash
+# Find dangling stash commits
+git fsck --unreachable | grep commit
+
+# For each commit, check if it's your stash
+git show <commit-hash>
+
+# Recover if found
+git stash apply <commit-hash>
 ```
 
 ## Agent Sweep (Automated Dirty Repo Processing)
