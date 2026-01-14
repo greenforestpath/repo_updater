@@ -562,6 +562,2028 @@ get_repo_name() {
 }
 
 #------------------------------------------------------------------------------
+# PACKAGE MANAGER DETECTION
+# Detect which package manager(s) a repository uses for dep-update feature.
+#------------------------------------------------------------------------------
+
+# Detect package managers in a repository by checking for manifest/lockfiles.
+# Usage: detect_package_managers /path/to/repo
+# Output: JSON to stdout with detected managers and trigger files
+# Returns: 0 if any manager detected, 1 if none found
+# Example output: {"managers":["npm","pip"],"files":{"npm":"package.json","pip":"requirements.txt"}}
+detect_package_managers() {
+    local repo_path="${1:-}"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        echo '{"managers":[],"files":{},"error":"Invalid or missing repo path"}'
+        return 1
+    fi
+
+    local -a managers=()
+    local -A files=()
+
+    # npm/yarn/pnpm (Node.js)
+    if [[ -f "$repo_path/package.json" ]]; then
+        managers+=("npm")
+        files["npm"]="package.json"
+    elif [[ -f "$repo_path/package-lock.json" ]]; then
+        managers+=("npm")
+        files["npm"]="package-lock.json"
+    elif [[ -f "$repo_path/yarn.lock" ]]; then
+        managers+=("yarn")
+        files["yarn"]="yarn.lock"
+    elif [[ -f "$repo_path/pnpm-lock.yaml" ]]; then
+        managers+=("pnpm")
+        files["pnpm"]="pnpm-lock.yaml"
+    fi
+
+    # pip (Python)
+    if [[ -f "$repo_path/pyproject.toml" ]]; then
+        managers+=("pip")
+        files["pip"]="pyproject.toml"
+    elif [[ -f "$repo_path/requirements.txt" ]]; then
+        managers+=("pip")
+        files["pip"]="requirements.txt"
+    elif [[ -f "$repo_path/setup.py" ]]; then
+        managers+=("pip")
+        files["pip"]="setup.py"
+    elif [[ -f "$repo_path/Pipfile" ]]; then
+        managers+=("pipenv")
+        files["pipenv"]="Pipfile"
+    fi
+
+    # cargo (Rust)
+    if [[ -f "$repo_path/Cargo.toml" ]]; then
+        managers+=("cargo")
+        files["cargo"]="Cargo.toml"
+    fi
+
+    # go modules (Go)
+    if [[ -f "$repo_path/go.mod" ]]; then
+        managers+=("go")
+        files["go"]="go.mod"
+    fi
+
+    # composer (PHP)
+    if [[ -f "$repo_path/composer.json" ]]; then
+        managers+=("composer")
+        files["composer"]="composer.json"
+    fi
+
+    # bundler (Ruby)
+    if [[ -f "$repo_path/Gemfile" ]]; then
+        managers+=("bundler")
+        files["bundler"]="Gemfile"
+    fi
+
+    # maven (Java)
+    if [[ -f "$repo_path/pom.xml" ]]; then
+        managers+=("maven")
+        files["maven"]="pom.xml"
+    fi
+
+    # gradle (Java/Kotlin)
+    if [[ -f "$repo_path/build.gradle" ]] || [[ -f "$repo_path/build.gradle.kts" ]]; then
+        managers+=("gradle")
+        if [[ -f "$repo_path/build.gradle.kts" ]]; then
+            files["gradle"]="build.gradle.kts"
+        else
+            files["gradle"]="build.gradle"
+        fi
+    fi
+
+    # Build JSON output
+    local json_managers json_files
+
+    # Build managers array
+    if [[ ${#managers[@]} -eq 0 ]]; then
+        json_managers="[]"
+    else
+        json_managers=$(printf '%s\n' "${managers[@]}" | jq -R . | jq -s .)
+    fi
+
+    # Build files object
+    if [[ ${#files[@]} -eq 0 ]]; then
+        json_files="{}"
+    else
+        json_files="{"
+        local first=true
+        local mgr
+        for mgr in "${!files[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                json_files+=","
+            fi
+            # Escape values for JSON
+            local escaped_mgr escaped_file
+            escaped_mgr=$(printf '%s' "$mgr" | sed 's/"/\\"/g')
+            escaped_file=$(printf '%s' "${files[$mgr]}" | sed 's/"/\\"/g')
+            json_files+="\"$escaped_mgr\":\"$escaped_file\""
+        done
+        json_files+="}"
+    fi
+
+    printf '{"managers":%s,"files":%s}\n' "$json_managers" "$json_files"
+
+    [[ ${#managers[@]} -gt 0 ]]
+}
+
+#------------------------------------------------------------------------------
+# TEST RUNNER DETECTION
+# Detect the appropriate test command for a repository
+#------------------------------------------------------------------------------
+
+# Detect the test command for a repository based on config files.
+# Usage: detect_test_command /path/to/repo
+# Output: Test command string to stdout (empty if none detected)
+# Returns: 0 if test command found, 1 if none found
+detect_test_command() {
+    local repo_path="${1:-}"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        return 1
+    fi
+
+    # 1. Check package.json scripts.test (npm/node projects)
+    if [[ -f "$repo_path/package.json" ]]; then
+        local test_script
+        test_script=$(jq -r '.scripts.test // empty' "$repo_path/package.json" 2>/dev/null)
+        if [[ -n "$test_script" && "$test_script" != "null" ]]; then
+            echo "npm test"
+            return 0
+        fi
+
+        # Check for jest config
+        if [[ -f "$repo_path/jest.config.js" || -f "$repo_path/jest.config.ts" || -f "$repo_path/jest.config.json" ]]; then
+            echo "npx jest"
+            return 0
+        fi
+
+        # Check for vitest
+        if [[ -f "$repo_path/vitest.config.js" || -f "$repo_path/vitest.config.ts" ]]; then
+            echo "npx vitest run"
+            return 0
+        fi
+    fi
+
+    # 2. Cargo (Rust)
+    if [[ -f "$repo_path/Cargo.toml" ]]; then
+        echo "cargo test"
+        return 0
+    fi
+
+    # 3. Go modules
+    if [[ -f "$repo_path/go.mod" ]]; then
+        # Check if there are test files
+        if find "$repo_path" -maxdepth 3 -name "*_test.go" -type f 2>/dev/null | head -1 | grep -q .; then
+            echo "go test ./..."
+            return 0
+        fi
+    fi
+
+    # 4. Python - pytest
+    if [[ -f "$repo_path/pytest.ini" || -f "$repo_path/conftest.py" || -f "$repo_path/pyproject.toml" ]]; then
+        # Check for pytest in pyproject.toml
+        if [[ -f "$repo_path/pyproject.toml" ]] && grep -q "pytest" "$repo_path/pyproject.toml" 2>/dev/null; then
+            echo "pytest"
+            return 0
+        fi
+        # Check for pytest.ini or conftest.py
+        if [[ -f "$repo_path/pytest.ini" || -f "$repo_path/conftest.py" ]]; then
+            echo "pytest"
+            return 0
+        fi
+    fi
+
+    # Check for test directory with python tests
+    if [[ -d "$repo_path/tests" ]] && find "$repo_path/tests" -maxdepth 2 -name "test_*.py" -type f 2>/dev/null | head -1 | grep -q .; then
+        echo "pytest"
+        return 0
+    fi
+
+    # 5. Ruby - bundler/rake
+    if [[ -f "$repo_path/Gemfile" ]]; then
+        if grep -q "rspec" "$repo_path/Gemfile" 2>/dev/null; then
+            echo "bundle exec rspec"
+            return 0
+        fi
+        if [[ -f "$repo_path/Rakefile" ]] && grep -q "test" "$repo_path/Rakefile" 2>/dev/null; then
+            echo "bundle exec rake test"
+            return 0
+        fi
+    fi
+
+    # 6. Maven (Java)
+    if [[ -f "$repo_path/pom.xml" ]]; then
+        echo "mvn test"
+        return 0
+    fi
+
+    # 7. Gradle (Java/Kotlin)
+    if [[ -f "$repo_path/build.gradle" || -f "$repo_path/build.gradle.kts" ]]; then
+        if [[ -f "$repo_path/gradlew" ]]; then
+            echo "./gradlew test"
+        else
+            echo "gradle test"
+        fi
+        return 0
+    fi
+
+    # 8. Makefile with test target (fallback)
+    if [[ -f "$repo_path/Makefile" ]]; then
+        if grep -qE "^test:" "$repo_path/Makefile" 2>/dev/null; then
+            echo "make test"
+            return 0
+        fi
+    fi
+
+    # 9. PHP Composer
+    if [[ -f "$repo_path/composer.json" ]]; then
+        local test_script
+        test_script=$(jq -r '.scripts.test // empty' "$repo_path/composer.json" 2>/dev/null)
+        if [[ -n "$test_script" && "$test_script" != "null" ]]; then
+            echo "composer test"
+            return 0
+        fi
+        if [[ -f "$repo_path/phpunit.xml" || -f "$repo_path/phpunit.xml.dist" ]]; then
+            echo "vendor/bin/phpunit"
+            return 0
+        fi
+    fi
+
+    # No test command detected
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# DEPENDENCY VERSION CHECKING
+# Check for outdated dependencies per package manager
+#------------------------------------------------------------------------------
+
+# Check for outdated dependencies in a repository.
+# Usage: check_outdated_deps <repo_path> [manager]
+# Output: JSON to stdout with outdated dependencies
+# Returns: 0 if any outdated deps found, 1 if all current or error
+# If manager is omitted, checks all detected managers
+check_outdated_deps() {
+    local repo_path="${1:-}"
+    local specific_manager="${2:-}"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        echo '{"error":"Invalid or missing repo path","outdated":[]}'
+        return 1
+    fi
+
+    # Get detected managers if not specified
+    local -a managers=()
+    if [[ -n "$specific_manager" ]]; then
+        managers=("$specific_manager")
+    else
+        local detected
+        detected=$(detect_package_managers "$repo_path")
+        if [[ -n "$detected" ]]; then
+            readarray -t managers < <(echo "$detected" | jq -r '.managers[]' 2>/dev/null)
+        fi
+    fi
+
+    if [[ ${#managers[@]} -eq 0 ]]; then
+        echo '{"managers":[],"outdated":[],"error":"No package managers detected"}'
+        return 1
+    fi
+
+    local -a all_results=()
+    local total_outdated=0
+
+    for manager in "${managers[@]}"; do
+        local result
+        result=$(_check_outdated_for_manager "$repo_path" "$manager")
+        if [[ -n "$result" ]]; then
+            all_results+=("$result")
+            local count
+            count=$(echo "$result" | jq '.outdated | length' 2>/dev/null || echo 0)
+            total_outdated=$((total_outdated + count))
+        fi
+    done
+
+    # Combine results
+    if [[ ${#all_results[@]} -eq 0 ]]; then
+        echo '{"managers":[],"outdated":[]}'
+        return 1
+    fi
+
+    # Build combined JSON
+    printf '{"managers":%s,"results":[%s],"total_outdated":%d}\n' \
+        "$(printf '%s\n' "${managers[@]}" | jq -R . | jq -s .)" \
+        "$(IFS=,; echo "${all_results[*]}")" \
+        "$total_outdated"
+
+    [[ $total_outdated -gt 0 ]]
+}
+
+# Internal function to check outdated deps for a specific manager.
+# Usage: _check_outdated_for_manager <repo_path> <manager>
+_check_outdated_for_manager() {
+    local repo_path="$1"
+    local manager="$2"
+    local output=""
+    local -a outdated=()
+
+    case "$manager" in
+        npm|yarn|pnpm)
+            # npm outdated --json returns non-zero if outdated packages exist
+            output=$(cd "$repo_path" && npm outdated --json 2>/dev/null || true)
+            if [[ -n "$output" && "$output" != "{}" ]]; then
+                # Parse npm outdated JSON format: {"pkg": {"current": "x", "wanted": "y", "latest": "z"}}
+                local json_array
+                json_array=$(echo "$output" | jq -r 'to_entries | map({name: .key, current: .value.current, wanted: .value.wanted, latest: .value.latest, type: .value.type})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        pip|pipenv)
+            output=$(cd "$repo_path" && pip list --outdated --format=json 2>/dev/null || true)
+            if [[ -n "$output" && "$output" != "[]" ]]; then
+                # pip returns: [{"name": "pkg", "version": "current", "latest_version": "latest"}]
+                local json_array
+                json_array=$(echo "$output" | jq 'map({name: .name, current: .version, latest: .latest_version, type: .latest_filetype})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        cargo)
+            # cargo-outdated is an optional tool
+            if ! command -v cargo-outdated &>/dev/null && ! cargo outdated --version &>/dev/null 2>&1; then
+                printf '{"manager":"%s","outdated":[],"warning":"cargo-outdated not installed"}\n' "$manager"
+                return
+            fi
+            output=$(cd "$repo_path" && cargo outdated --format json 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # cargo outdated returns: {"dependencies": [{"name": "pkg", "project": "cur", "latest": "x"}]}
+                local json_array
+                json_array=$(echo "$output" | jq '.dependencies | map({name: .name, current: .project, latest: .latest})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        go)
+            output=$(cd "$repo_path" && go list -m -u -json all 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # go list returns NDJSON, parse it
+                local json_array
+                json_array=$(echo "$output" | jq -s '[.[] | select(.Update != null) | {name: .Path, current: .Version, latest: .Update.Version}]' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        composer)
+            output=$(cd "$repo_path" && composer outdated --format=json 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # composer returns: {"installed": [{"name": "pkg", "version": "cur", "latest": "x"}]}
+                local json_array
+                json_array=$(echo "$output" | jq '.installed // [] | map({name: .name, current: .version, latest: .latest})' 2>/dev/null || echo "[]")
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        bundler)
+            output=$(cd "$repo_path" && bundle outdated --parseable 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # bundle outdated --parseable returns: pkg (newest x.y.z, installed a.b.c)
+                local json_array="["
+                local first="true"
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] && continue
+                    local name current latest
+                    # Parse: "pkg (newest x.y.z, installed a.b.c, requested ~> m.n)"
+                    name=$(echo "$line" | sed -E 's/^([^ ]+) .*/\1/')
+                    latest=$(echo "$line" | sed -E 's/.*newest ([^,)]+).*/\1/')
+                    current=$(echo "$line" | sed -E 's/.*installed ([^,)]+).*/\1/')
+                    if [[ -n "$name" && -n "$current" && -n "$latest" ]]; then
+                        [[ "$first" == "true" ]] && first="false" || json_array+=","
+                        json_array+="{\"name\":\"$name\",\"current\":\"$current\",\"latest\":\"$latest\"}"
+                    fi
+                done <<< "$output"
+                json_array+="]"
+                printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        maven)
+            # Maven versions plugin requires specific setup
+            output=$(cd "$repo_path" && mvn versions:display-dependency-updates -DprocessDependencyManagement=false -q 2>/dev/null || true)
+            if [[ -n "$output" ]]; then
+                # Parse Maven output (text format) - this is a simplified version
+                local json_array="[]"
+                printf '{"manager":"%s","outdated":%s,"note":"Run mvn versions:display-dependency-updates for details"}\n' "$manager" "$json_array"
+                return
+            fi
+            printf '{"manager":"%s","outdated":[]}\n' "$manager"
+            ;;
+
+        gradle)
+            # Gradle requires plugins for version checking
+            printf '{"manager":"%s","outdated":[],"note":"Use gradle-versions-plugin for dependency updates"}\n' "$manager"
+            ;;
+
+        *)
+            printf '{"manager":"%s","outdated":[],"error":"Unsupported manager"}\n' "$manager"
+            ;;
+    esac
+}
+
+#------------------------------------------------------------------------------
+# CHANGELOG FETCHER
+# Fetch release notes/changelogs for package updates
+#------------------------------------------------------------------------------
+
+# Fetch changelog/release notes for a package between versions.
+# Usage: fetch_changelog <package_name> <from_version> <to_version> [--manager=npm]
+# Output: Markdown text to stdout with relevant changelog entries
+# Returns: 0 if changelog found, 1 if not found
+fetch_changelog() {
+    local package_name=""
+    local from_version=""
+    local to_version=""
+    local manager="npm"
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --manager=*)
+                manager="${1#*=}"
+                shift
+                ;;
+            -*)
+                shift
+                ;;
+            *)
+                if [[ -z "$package_name" ]]; then
+                    package_name="$1"
+                elif [[ -z "$from_version" ]]; then
+                    from_version="$1"
+                elif [[ -z "$to_version" ]]; then
+                    to_version="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$package_name" || -z "$from_version" || -z "$to_version" ]]; then
+        echo "# No changelog found"
+        echo "Missing required arguments (package, from_version, to_version)"
+        return 1
+    fi
+
+    # Try to get changelog based on manager
+    local changelog=""
+    case "$manager" in
+        npm|yarn|pnpm)
+            changelog=$(_fetch_npm_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        pip|pipenv)
+            changelog=$(_fetch_pypi_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        cargo)
+            changelog=$(_fetch_crates_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        go)
+            changelog=$(_fetch_go_changelog "$package_name" "$from_version" "$to_version")
+            ;;
+        *)
+            echo "# No changelog found"
+            echo "Unsupported package manager: $manager"
+            return 1
+            ;;
+    esac
+
+    if [[ -n "$changelog" ]]; then
+        echo "$changelog"
+        return 0
+    fi
+
+    echo "# No changelog found"
+    echo "Could not find changelog for $package_name ($from_version -> $to_version)"
+    return 1
+}
+
+# Fetch changelog for npm package via GitHub releases.
+# Usage: _fetch_npm_changelog <package> <from> <to>
+_fetch_npm_changelog() {
+    local package="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Get package info from npm registry
+    local npm_info
+    npm_info=$(curl -sf "https://registry.npmjs.org/$package" 2>/dev/null)
+    if [[ -z "$npm_info" ]]; then
+        return 1
+    fi
+
+    # Extract repository URL
+    local repo_url
+    repo_url=$(echo "$npm_info" | jq -r '.repository.url // .repository // empty' 2>/dev/null)
+    if [[ -z "$repo_url" ]]; then
+        return 1
+    fi
+
+    # Convert to GitHub API URL
+    local github_repo
+    github_repo=$(_extract_github_repo "$repo_url")
+    if [[ -z "$github_repo" ]]; then
+        return 1
+    fi
+
+    # Fetch GitHub releases
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Fetch changelog for PyPI package via GitHub releases.
+_fetch_pypi_changelog() {
+    local package="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Get package info from PyPI
+    local pypi_info
+    pypi_info=$(curl -sf "https://pypi.org/pypi/$package/json" 2>/dev/null)
+    if [[ -z "$pypi_info" ]]; then
+        return 1
+    fi
+
+    # Extract project URLs
+    local repo_url
+    repo_url=$(echo "$pypi_info" | jq -r '.info.project_urls.Repository // .info.project_urls.Source // .info.home_page // empty' 2>/dev/null)
+    if [[ -z "$repo_url" ]]; then
+        return 1
+    fi
+
+    local github_repo
+    github_repo=$(_extract_github_repo "$repo_url")
+    if [[ -z "$github_repo" ]]; then
+        return 1
+    fi
+
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Fetch changelog for crates.io package.
+_fetch_crates_changelog() {
+    local package="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Get crate info
+    local crate_info
+    crate_info=$(curl -sf "https://crates.io/api/v1/crates/$package" 2>/dev/null)
+    if [[ -z "$crate_info" ]]; then
+        return 1
+    fi
+
+    local repo_url
+    repo_url=$(echo "$crate_info" | jq -r '.crate.repository // empty' 2>/dev/null)
+    if [[ -z "$repo_url" ]]; then
+        return 1
+    fi
+
+    local github_repo
+    github_repo=$(_extract_github_repo "$repo_url")
+    if [[ -z "$github_repo" ]]; then
+        return 1
+    fi
+
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Fetch changelog for Go module (usually from GitHub).
+_fetch_go_changelog() {
+    local module="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Go modules typically are GitHub repos
+    local github_repo=""
+    if [[ "$module" == github.com/* ]]; then
+        github_repo="${module#github.com/}"
+        # Take only owner/repo (first two path segments)
+        github_repo=$(echo "$github_repo" | cut -d'/' -f1-2)
+    else
+        return 1
+    fi
+
+    _fetch_github_releases "$github_repo" "$from_version" "$to_version"
+}
+
+# Extract GitHub owner/repo from various URL formats.
+_extract_github_repo() {
+    local url="$1"
+
+    # Handle various formats:
+    # https://github.com/owner/repo
+    # git+https://github.com/owner/repo.git
+    # git://github.com/owner/repo.git
+    # git@github.com:owner/repo.git
+    # github:owner/repo
+
+    local repo=""
+
+    if [[ "$url" == *"github.com"* ]]; then
+        # Extract owner/repo from URL
+        repo=$(echo "$url" | sed -E 's|.*github\.com[:/]([^/]+/[^/.]+)(\.git)?.*|\1|')
+    elif [[ "$url" == github:* ]]; then
+        repo="${url#github:}"
+    fi
+
+    if [[ -n "$repo" && "$repo" != "$url" ]]; then
+        echo "$repo"
+    fi
+}
+
+# Fetch GitHub releases between versions.
+# Usage: _fetch_github_releases <owner/repo> <from_version> <to_version>
+_fetch_github_releases() {
+    local repo="$1"
+    local from_version="$2"
+    local to_version="$3"
+
+    # Fetch recent releases from GitHub
+    local releases
+    releases=$(curl -sf "https://api.github.com/repos/$repo/releases?per_page=50" 2>/dev/null)
+    if [[ -z "$releases" || "$releases" == "[]" ]]; then
+        # Try tags if no releases
+        return 1
+    fi
+
+    # Filter releases between versions and format as markdown
+    local changelog=""
+    changelog=$(echo "$releases" | jq -r --arg from "$from_version" --arg to "$to_version" '
+        [.[] | select(
+            (.tag_name | gsub("^v"; "")) as $ver |
+            ($from | gsub("^v"; "")) as $f |
+            ($to | gsub("^v"; "")) as $t |
+            # Simple version comparison - include all between from and to
+            true
+        )][:10] |
+        .[] |
+        "## " + .tag_name + " (" + (.published_at // .created_at | split("T")[0]) + ")\n\n" + (.body // "No release notes") + "\n"
+    ' 2>/dev/null)
+
+    if [[ -n "$changelog" ]]; then
+        echo "# Changelog for $repo"
+        echo "## Versions: $from_version -> $to_version"
+        echo ""
+        echo "$changelog"
+        return 0
+    fi
+
+    return 1
+}
+
+#------------------------------------------------------------------------------
+# DIRTY REPO DETECTION
+# Find repos with uncommitted changes (staged, unstaged, untracked)
+#------------------------------------------------------------------------------
+
+# Get list of repos with uncommitted changes.
+# Usage: get_dirty_repos [--no-untracked] [--json]
+# Output: Newline-separated repo paths to stdout (or JSON array with --json)
+# Returns: 0 if any dirty repos found, 1 if all clean
+# Example: get_dirty_repos --json → [{"path":"/data/projects/foo","status":"dirty"}]
+get_dirty_repos() {
+    local include_untracked="true"
+    local json_output="false"
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-untracked)
+                include_untracked="false"
+                shift
+                ;;
+            --json)
+                json_output="true"
+                shift
+                ;;
+            *)
+                log_error "get_dirty_repos: Unknown option: $1"
+                return 4
+                ;;
+        esac
+    done
+
+    local -a dirty_repos=()
+    local spec url branch custom_name local_path repo_id
+
+    # Iterate through all configured repos
+    while IFS= read -r spec; do
+        [[ -z "$spec" ]] && continue
+
+        # Resolve spec to get local path
+        if ! resolve_repo_spec "$spec" "$PROJECTS_DIR" "$LAYOUT" url branch custom_name local_path repo_id; then
+            log_warn "get_dirty_repos: Cannot resolve spec: $spec"
+            continue
+        fi
+
+        # Skip if repo doesn't exist
+        if [[ ! -d "$local_path" ]]; then
+            log_debug "get_dirty_repos: Repo not cloned: $local_path"
+            continue
+        fi
+
+        # Skip if not a git repo
+        if [[ ! -d "$local_path/.git" ]]; then
+            log_warn "get_dirty_repos: Not a git repo: $local_path"
+            continue
+        fi
+
+        # Check for dirty status using git plumbing
+        local status_output
+        if [[ "$include_untracked" == "true" ]]; then
+            # Include untracked files
+            status_output=$(git -C "$local_path" status --porcelain 2>/dev/null)
+        else
+            # Exclude untracked files (only staged and unstaged changes)
+            status_output=$(git -C "$local_path" status --porcelain --untracked-files=no 2>/dev/null)
+        fi
+
+        if [[ -n "$status_output" ]]; then
+            dirty_repos+=("$local_path")
+        fi
+    done < <(get_all_repos)
+
+    # Output results
+    if [[ "$json_output" == "true" ]]; then
+        if [[ ${#dirty_repos[@]} -eq 0 ]]; then
+            echo "[]"
+        else
+            local json_array="["
+            local first="true"
+            for path in "${dirty_repos[@]}"; do
+                if [[ "$first" == "true" ]]; then
+                    first="false"
+                else
+                    json_array+=","
+                fi
+                local safe_path
+                safe_path=$(json_escape "$path")
+                json_array+="{\"path\":\"$safe_path\",\"status\":\"dirty\"}"
+            done
+            json_array+="]"
+            echo "$json_array"
+        fi
+    else
+        # Plain text output - one path per line
+        for path in "${dirty_repos[@]}"; do
+            printf '%s\n' "$path"
+        done
+    fi
+
+    [[ ${#dirty_repos[@]} -gt 0 ]]
+}
+
+#------------------------------------------------------------------------------
+# NTM SESSION SPAWNING
+# Wrapper for spawning AI coding sessions via ntm (Named Tmux Manager)
+#------------------------------------------------------------------------------
+
+# Spawn an ntm session for AI-assisted operations on a repository.
+# Usage: spawn_ai_session <repo_path> <prompt_file> [timeout_seconds] [--agent=claude|codex|gemini]
+# Output: JSON status to stdout {"session":"name","status":"success|timeout|failed","duration_seconds":N}
+# Returns: 0 on success, 1 on timeout, 2 on failure
+spawn_ai_session() {
+    local repo_path=""
+    local prompt_file=""
+    local timeout_seconds=600
+    local agent_type="claude"
+    local session_prefix="ru-ai"
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --agent=*)
+                agent_type="${1#*=}"
+                shift
+                ;;
+            --timeout=*)
+                timeout_seconds="${1#*=}"
+                shift
+                ;;
+            --prefix=*)
+                session_prefix="${1#*=}"
+                shift
+                ;;
+            -*)
+                log_error "spawn_ai_session: Unknown option: $1"
+                return 2
+                ;;
+            *)
+                if [[ -z "$repo_path" ]]; then
+                    repo_path="$1"
+                elif [[ -z "$prompt_file" ]]; then
+                    prompt_file="$1"
+                else
+                    timeout_seconds="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ -z "$repo_path" ]]; then
+        log_error "spawn_ai_session: repo_path is required"
+        echo '{"session":"","status":"failed","error":"repo_path required"}'
+        return 2
+    fi
+
+    if [[ ! -d "$repo_path" ]]; then
+        log_error "spawn_ai_session: repo not found: $repo_path"
+        echo '{"session":"","status":"failed","error":"repo not found"}'
+        return 2
+    fi
+
+    if [[ -z "$prompt_file" ]]; then
+        log_error "spawn_ai_session: prompt_file is required"
+        echo '{"session":"","status":"failed","error":"prompt_file required"}'
+        return 2
+    fi
+
+    if [[ ! -f "$prompt_file" ]]; then
+        log_error "spawn_ai_session: prompt file not found: $prompt_file"
+        echo '{"session":"","status":"failed","error":"prompt file not found"}'
+        return 2
+    fi
+
+    # Check ntm availability
+    if ! command -v ntm &>/dev/null; then
+        log_error "spawn_ai_session: ntm not installed"
+        echo '{"session":"","status":"failed","error":"ntm not installed"}'
+        return 2
+    fi
+
+    # Generate unique session name from repo path
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local timestamp
+    timestamp=$(date +%s)
+    local session_name="${session_prefix}-${repo_name}-${timestamp}"
+
+    # Map agent type to ntm flag
+    local agent_flag
+    case "$agent_type" in
+        claude|cc)  agent_flag="--cc=1" ;;
+        codex|cod)  agent_flag="--cod=1" ;;
+        gemini|gmi) agent_flag="--gmi=1" ;;
+        *)
+            log_error "spawn_ai_session: Unknown agent type: $agent_type"
+            echo '{"session":"","status":"failed","error":"unknown agent type"}'
+            return 2
+            ;;
+    esac
+
+    local start_time
+    start_time=$(date +%s)
+
+    # Spawn the session with initial prompt
+    log_info "Spawning ntm session: $session_name"
+    if ! ntm spawn "$session_name" $agent_flag --no-user 2>/dev/null; then
+        log_error "spawn_ai_session: Failed to spawn session"
+        echo '{"session":"'"$session_name"'","status":"failed","error":"spawn failed"}'
+        return 2
+    fi
+
+    # Change to repo directory and send the prompt
+    # Use tmux to cd first, then send the prompt file contents
+    local pane_target="${session_name}:0.0"
+
+    # CD to repo directory
+    tmux send-keys -t "$pane_target" "cd $(printf '%q' "$repo_path")" Enter 2>/dev/null
+    sleep 1
+
+    # Send the prompt from file
+    if ! ntm send "$session_name" --cc --file "$prompt_file" 2>/dev/null; then
+        log_error "spawn_ai_session: Failed to send prompt"
+        ntm kill "$session_name" --force 2>/dev/null
+        echo '{"session":"'"$session_name"'","status":"failed","error":"send prompt failed"}'
+        return 2
+    fi
+
+    # Wait for completion with timeout
+    # Poll health status until agent shows as idle/completed or timeout
+    local elapsed=0
+    local poll_interval=10
+    local status="running"
+
+    log_info "Waiting for session completion (timeout: ${timeout_seconds}s)"
+
+    while [[ $elapsed -lt $timeout_seconds ]]; do
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+
+        # Check if session still exists
+        if ! tmux has-session -t "$session_name" 2>/dev/null; then
+            status="completed"
+            break
+        fi
+
+        # Check agent health
+        local health_output
+        health_output=$(ntm health "$session_name" --json 2>/dev/null)
+
+        if [[ -n "$health_output" ]]; then
+            # Check if agent is idle (no recent activity)
+            local activity
+            activity=$(echo "$health_output" | jq -r '.panes[0].activity // "unknown"' 2>/dev/null)
+
+            if [[ "$activity" == "idle" || "$activity" == "stale" ]]; then
+                # Agent appears to be done - give it a moment then check again
+                sleep 5
+                health_output=$(ntm health "$session_name" --json 2>/dev/null)
+                activity=$(echo "$health_output" | jq -r '.panes[0].activity // "unknown"' 2>/dev/null)
+
+                if [[ "$activity" == "idle" || "$activity" == "stale" ]]; then
+                    status="completed"
+                    break
+                fi
+            fi
+        fi
+
+        log_debug "Session $session_name still running (${elapsed}s/${timeout_seconds}s)"
+    done
+
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    # Clean up the session
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+        ntm kill "$session_name" --force 2>/dev/null
+    fi
+
+    # Return results
+    if [[ "$status" == "completed" ]]; then
+        log_success "Session completed in ${duration}s"
+        printf '{"session":"%s","status":"success","duration_seconds":%d}\n' "$session_name" "$duration"
+        return 0
+    else
+        log_warn "Session timed out after ${duration}s"
+        printf '{"session":"%s","status":"timeout","duration_seconds":%d}\n' "$session_name" "$duration"
+        return 1
+    fi
+}
+
+# Check if an ntm session is still running.
+# Usage: is_session_active <session_name>
+# Returns: 0 if active, 1 if not
+is_session_active() {
+    local session_name="$1"
+    [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null
+}
+
+# Kill an ntm session forcefully.
+# Usage: kill_ai_session <session_name>
+# Returns: 0 on success, 1 on failure
+kill_ai_session() {
+    local session_name="$1"
+    if [[ -z "$session_name" ]]; then
+        log_error "kill_ai_session: session_name required"
+        return 1
+    fi
+
+    if is_session_active "$session_name"; then
+        ntm kill "$session_name" --force 2>/dev/null
+        return $?
+    fi
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# AI-SYNC PROMPT TEMPLATES
+# Two-phase prompts for intelligent repository sync via AI agents
+#------------------------------------------------------------------------------
+
+# Generate Phase 1 prompt for context acquisition.
+# Usage: generate_aisync_prompt_phase1 <repo_path>
+# Output: Prompt text to stdout
+generate_aisync_prompt_phase1() {
+    local repo_path="$1"
+    local has_agents_md="false"
+    local has_readme="false"
+
+    [[ -f "$repo_path/AGENTS.md" ]] && has_agents_md="true"
+    [[ -f "$repo_path/README.md" || -f "$repo_path/readme.md" ]] && has_readme="true"
+
+    # Build dynamic prompt based on available documentation
+    local prompt=""
+
+    if [[ "$has_agents_md" == "true" && "$has_readme" == "true" ]]; then
+        prompt="First read ALL of the AGENTS.md file and README.md file super carefully and understand ALL of both!
+Then use your code investigation agent mode to fully understand the code, technical architecture, and purpose of the project."
+    elif [[ "$has_agents_md" == "true" ]]; then
+        prompt="First read ALL of the AGENTS.md file super carefully and understand everything in it!
+Then use your code investigation agent mode to fully understand the code, technical architecture, and purpose of the project."
+    elif [[ "$has_readme" == "true" ]]; then
+        prompt="First read ALL of the README.md file super carefully and understand everything in it!
+Then use your code investigation agent mode to fully understand the code, technical architecture, and purpose of the project."
+    else
+        prompt="Use your code investigation agent mode to fully understand the code, technical architecture, and purpose of this project.
+Explore the directory structure, key files, and understand what this codebase does."
+    fi
+
+    printf '%s\n' "$prompt"
+}
+
+# Generate Phase 2 prompt for intelligent commit.
+# Usage: generate_aisync_prompt_phase2 [--branch=NAME] [--remote=NAME] [--no-push]
+# Output: Prompt text to stdout
+generate_aisync_prompt_phase2() {
+    local branch_name=""
+    local remote_name="origin"
+    local push_enabled="true"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branch=*)
+                branch_name="${1#*=}"
+                shift
+                ;;
+            --remote=*)
+                remote_name="${1#*=}"
+                shift
+                ;;
+            --no-push)
+                push_enabled="false"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local prompt="Now, based on your knowledge of the project, commit all changed files now in a series of logically connected groupings with super detailed commit messages for each"
+
+    if [[ "$push_enabled" == "true" ]]; then
+        prompt+=" and then push"
+        if [[ -n "$branch_name" ]]; then
+            prompt+=" to $remote_name/$branch_name"
+        fi
+    fi
+
+    prompt+=".
+
+Take your time to do it right. Don't edit the code at all. Don't commit obviously ephemeral files (like .pyc, node_modules, __pycache__, etc). Use ultrathink.
+
+Guidelines:
+- Group related changes into logical commits (e.g., 'fix: auth bug' separate from 'chore: update deps')
+- Write detailed commit messages explaining WHY, not just what
+- If there are staged vs unstaged changes, consider if they should be separate commits
+- Skip any temporary or generated files
+- Review each change before committing to ensure it makes sense"
+
+    printf '%s\n' "$prompt"
+}
+
+# Write prompt to a temporary file for use with spawn_ai_session.
+# Usage: write_prompt_to_file <prompt_text>
+# Output: Path to temp file on stdout
+# Returns: 0 on success, 1 on failure
+write_prompt_to_file() {
+    local prompt="$1"
+    local temp_file
+
+    temp_file=$(mktemp_file) || return 1
+    printf '%s\n' "$prompt" > "$temp_file"
+    echo "$temp_file"
+}
+
+# Generate combined two-phase prompt for single session (alternative approach).
+# Usage: generate_aisync_prompt_combined <repo_path> [--no-push]
+# Output: Combined prompt text to stdout
+generate_aisync_prompt_combined() {
+    local repo_path="$1"
+    shift
+
+    local phase1
+    local phase2
+    phase1=$(generate_aisync_prompt_phase1 "$repo_path")
+    phase2=$(generate_aisync_prompt_phase2 "$@")
+
+    printf '%s\n\n---\n\nOnce you have fully understood the project:\n\n%s\n' "$phase1" "$phase2"
+}
+
+#------------------------------------------------------------------------------
+# DEP-UPDATE PROMPT TEMPLATES
+# Two-phase prompts for AI-powered dependency updates
+#------------------------------------------------------------------------------
+
+# Generate Phase 1 prompt for dep-update: Analysis of outdated dependencies.
+# Usage: generate_depupdate_prompt_phase1 <repo_path> <outdated_json> [changelog_text]
+# Arguments:
+#   repo_path     - Path to repository being updated
+#   outdated_json - JSON output from check_outdated_deps()
+#   changelog_text - Optional: Pre-fetched changelog content
+# Output: Prompt text to stdout
+generate_depupdate_prompt_phase1() {
+    local repo_path="$1"
+    local outdated_json="$2"
+    local changelog_text="${3:-}"
+    local repo_name
+    repo_name=$(basename "$repo_path")
+
+    local prompt
+    prompt="You are a dependency update assistant analyzing the '$repo_name' project.
+
+## Project Location
+$repo_path
+
+## Your Task - ANALYSIS ONLY
+
+Review the outdated dependencies below and create an update plan. Do NOT make any changes yet.
+
+## Outdated Dependencies
+
+$outdated_json
+
+## Changelogs & Release Notes
+
+${changelog_text:-No changelogs provided. Check package documentation for breaking changes.}
+
+## Analysis Steps
+
+1. **Review Each Dependency**: For each outdated package:
+   - Note the current version vs latest version
+   - Check if it's a major/minor/patch update
+   - Review changelog for breaking changes
+
+2. **Identify Breaking Changes**: Look for:
+   - API changes that require code modifications
+   - Deprecated features being removed
+   - New required configuration
+   - Peer dependency conflicts
+
+3. **Create Migration Plan**: For each dependency:
+   - List specific code changes needed (if any)
+   - Note the order of updates (dependencies first)
+   - Flag any risky updates that need extra testing
+
+4. **Risk Assessment**:
+   - LOW: Patch updates, no breaking changes
+   - MEDIUM: Minor updates with deprecation warnings
+   - HIGH: Major updates with breaking changes
+
+Output your analysis in markdown format with sections for each dependency."
+
+    printf '%s\n' "$prompt"
+}
+
+# Generate Phase 2 prompt for dep-update: Update, test, and fix loop.
+# Usage: generate_depupdate_prompt_phase2 <repo_path> <test_command> [--max-attempts=N]
+# Arguments:
+#   repo_path    - Path to repository being updated
+#   test_command - Command to run tests (e.g., "npm test")
+#   --max-attempts=N - Maximum fix attempts per dependency (default: 3)
+# Output: Prompt text to stdout
+generate_depupdate_prompt_phase2() {
+    local repo_path="$1"
+    local test_command="$2"
+    shift 2
+
+    local max_attempts=3
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-attempts=*)
+                max_attempts="${1#*=}"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local prompt
+    prompt="## Your Task - UPDATE DEPENDENCIES
+
+Now implement the migration plan. For each dependency:
+
+### Update Loop (repeat for each dependency)
+
+1. **Update the dependency version**
+   - Edit the manifest file (package.json, Cargo.toml, etc.)
+   - Run the package manager's install/update command
+
+2. **Make code changes** (if needed from your analysis)
+   - Update import statements
+   - Fix deprecated API usage
+   - Add any new required configuration
+
+3. **Run tests**
+   \`\`\`bash
+   ${test_command:-echo 'No test command detected - check manually'}
+   \`\`\`
+
+4. **If tests fail** (max $max_attempts attempts per dependency):
+   - Read the error messages carefully
+   - Fix the issues in the code
+   - Re-run tests
+   - If still failing after $max_attempts attempts, revert this dependency and note it as blocked
+
+5. **Commit the change**
+   - One commit per dependency (or logical group)
+   - Format: \"chore(deps): update <package> from <old> to <new>\"
+   - Include any code changes in the same commit
+
+### Important Guidelines
+
+- **Order matters**: Update dependencies before dependents
+- **Atomic commits**: Each dependency update should be a single working commit
+- **Don't break the build**: If an update can't be fixed, revert it
+- **Document blockers**: Note any dependencies that couldn't be updated and why
+
+### After All Updates
+
+1. Run the full test suite one more time
+2. Check for any peer dependency warnings
+3. Summarize what was updated and what was blocked"
+
+    printf '%s\n' "$prompt"
+}
+
+# Generate combined dep-update prompt for single session.
+# Usage: generate_depupdate_prompt_combined <repo_path> <outdated_json> <test_command> [options]
+# Options:
+#   --changelog=TEXT   Pre-fetched changelog content
+#   --max-attempts=N   Max fix attempts per dep (default: 3)
+# Output: Combined prompt text to stdout
+generate_depupdate_prompt_combined() {
+    local repo_path="$1"
+    local outdated_json="$2"
+    local test_command="$3"
+    shift 3
+
+    local changelog_text=""
+    local max_attempts=3
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --changelog=*)
+                changelog_text="${1#*=}"
+                shift
+                ;;
+            --max-attempts=*)
+                max_attempts="${1#*=}"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local phase1
+    local phase2
+    phase1=$(generate_depupdate_prompt_phase1 "$repo_path" "$outdated_json" "$changelog_text")
+    phase2=$(generate_depupdate_prompt_phase2 "$repo_path" "$test_command" "--max-attempts=$max_attempts")
+
+    printf '%s\n\n---\n\nOnce you have completed your analysis:\n\n%s\n' "$phase1" "$phase2"
+}
+
+#------------------------------------------------------------------------------
+# AI-SYNC SUBCOMMAND
+# Automatically sync dirty repos using AI-powered commits via ntm
+#------------------------------------------------------------------------------
+
+# cmd_ai_sync - Main entry point for ai-sync subcommand
+# Usage: ru ai-sync [OPTIONS]
+#   --dry-run       Show which repos would be processed
+#   --include=PAT   Only process repos matching pattern
+#   --exclude=PAT   Skip repos matching pattern
+#   --sequential    Process one at a time (default)
+#   --timeout=SEC   Per-repo timeout (default: 600)
+#   --no-push       Commit but don't push
+#   --agent=TYPE    Agent type: claude (default), codex, gemini
+cmd_ai_sync() {
+    local dry_run="false"
+    local include_pattern=""
+    local exclude_pattern=""
+    local timeout_seconds=600
+    local no_push="false"
+    local agent_type="claude"
+    local include_untracked="true"
+
+    # Parse command arguments from ARGS array
+    local arg
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --dry-run)
+                dry_run="true"
+                ;;
+            --include=*)
+                include_pattern="${arg#*=}"
+                ;;
+            --exclude=*)
+                exclude_pattern="${arg#*=}"
+                ;;
+            --timeout=*)
+                timeout_seconds="${arg#*=}"
+                ;;
+            --no-push)
+                no_push="true"
+                ;;
+            --agent=*)
+                agent_type="${arg#*=}"
+                ;;
+            --no-untracked)
+                include_untracked="false"
+                ;;
+            --sequential)
+                # Default behavior, ignored
+                ;;
+            *)
+                log_error "ai-sync: Unknown option: $arg"
+                _ai_sync_help
+                return 4
+                ;;
+        esac
+    done
+
+    # Check dependencies
+    if ! command -v ntm &>/dev/null; then
+        log_error "ai-sync requires ntm (Named Tmux Manager) to be installed"
+        log_error "Install from: https://github.com/Dicklesworthstone/ntm"
+        return 3
+    fi
+
+    if ! command -v claude &>/dev/null && [[ "$agent_type" == "claude" ]]; then
+        log_error "ai-sync with Claude requires claude-code to be installed"
+        log_error "Install from: https://github.com/anthropics/claude-code"
+        return 3
+    fi
+
+    # Get dirty repos
+    log_info "Scanning for repositories with uncommitted changes..."
+    local dirty_repos_output
+    local dirty_args=""
+    [[ "$include_untracked" == "false" ]] && dirty_args="--no-untracked"
+
+    dirty_repos_output=$(get_dirty_repos $dirty_args)
+    if [[ -z "$dirty_repos_output" ]]; then
+        log_success "All repositories are clean - nothing to sync"
+        return 0
+    fi
+
+    # Convert to array
+    local -a dirty_repos=()
+    while IFS= read -r repo_path; do
+        [[ -z "$repo_path" ]] && continue
+
+        # Apply include filter
+        if [[ -n "$include_pattern" ]]; then
+            if [[ ! "$repo_path" == *"$include_pattern"* ]]; then
+                log_debug "Skipping (not matching include): $repo_path"
+                continue
+            fi
+        fi
+
+        # Apply exclude filter
+        if [[ -n "$exclude_pattern" ]]; then
+            if [[ "$repo_path" == *"$exclude_pattern"* ]]; then
+                log_debug "Skipping (matching exclude): $repo_path"
+                continue
+            fi
+        fi
+
+        dirty_repos+=("$repo_path")
+    done <<< "$dirty_repos_output"
+
+    if [[ ${#dirty_repos[@]} -eq 0 ]]; then
+        log_success "No dirty repositories match the filters"
+        return 0
+    fi
+
+    log_info "Found ${#dirty_repos[@]} dirty repository(s)"
+
+    # Dry run mode - just list
+    if [[ "$dry_run" == "true" ]]; then
+        log_info "Dry run - would process these repositories:"
+        for repo_path in "${dirty_repos[@]}"; do
+            local repo_name
+            repo_name=$(basename "$repo_path")
+            printf '  %s (%s)\n' "$repo_name" "$repo_path" >&2
+        done
+
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            local json_array="["
+            local first="true"
+            for repo_path in "${dirty_repos[@]}"; do
+                [[ "$first" == "true" ]] && first="false" || json_array+=","
+                local safe_path
+                safe_path=$(json_escape "$repo_path")
+                json_array+="{\"path\":\"$safe_path\",\"status\":\"pending\"}"
+            done
+            json_array+="]"
+            echo "$json_array"
+        fi
+        return 0
+    fi
+
+    # Process each dirty repo
+    local succeeded=0
+    local failed=0
+    local -a results=()
+
+    for repo_path in "${dirty_repos[@]}"; do
+        local repo_name
+        repo_name=$(basename "$repo_path")
+
+        log_info "Processing: $repo_name"
+
+        # Generate the combined prompt for this repo
+        local prompt_args=""
+        [[ "$no_push" == "true" ]] && prompt_args="--no-push"
+        local prompt
+        prompt=$(generate_aisync_prompt_combined "$repo_path" $prompt_args)
+
+        # Write prompt to temp file
+        local prompt_file
+        prompt_file=$(write_prompt_to_file "$prompt")
+        if [[ -z "$prompt_file" || ! -f "$prompt_file" ]]; then
+            log_error "Failed to create prompt file for $repo_name"
+            ((failed++))
+            results+=("{\"repo\":\"$(json_escape "$repo_path")\",\"status\":\"failed\",\"error\":\"prompt file creation\"}")
+            continue
+        fi
+
+        # Spawn AI session and wait
+        local session_result
+        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" --timeout="$timeout_seconds" --agent="$agent_type")
+        local exit_code=$?
+
+        # Clean up prompt file
+        rm -f "$prompt_file" 2>/dev/null
+
+        # Parse result
+        local status
+        status=$(echo "$session_result" | jq -r '.status // "unknown"' 2>/dev/null)
+
+        if [[ "$status" == "success" ]]; then
+            log_success "Completed: $repo_name"
+            ((succeeded++))
+            results+=("$session_result")
+        else
+            log_error "Failed: $repo_name ($status)"
+            ((failed++))
+            results+=("$session_result")
+        fi
+    done
+
+    # Print summary
+    local total=$((succeeded + failed))
+    log_info "AI-Sync complete: $succeeded/$total repositories processed successfully"
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local json_results="["
+        local first="true"
+        for result in "${results[@]}"; do
+            [[ "$first" == "true" ]] && first="false" || json_results+=","
+            json_results+="$result"
+        done
+        json_results+="]"
+        printf '{"total":%d,"succeeded":%d,"failed":%d,"repos":%s}\n' "$total" "$succeeded" "$failed" "$json_results"
+    fi
+
+    # Exit code based on results
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Print ai-sync help
+_ai_sync_help() {
+    cat >&2 <<'EOF'
+Usage: ru ai-sync [OPTIONS]
+
+Automatically commit uncommitted changes across repositories using AI.
+
+Options:
+  --dry-run       Show which repos would be processed (no changes)
+  --include=PAT   Only process repos with paths matching pattern
+  --exclude=PAT   Skip repos with paths matching pattern
+  --timeout=SEC   Per-repo timeout in seconds (default: 600)
+  --no-push       Commit changes but don't push to remote
+  --agent=TYPE    Agent type: claude (default), codex, gemini
+  --no-untracked  Ignore untracked files when detecting dirty repos
+
+The AI agent will:
+1. Read AGENTS.md and README.md to understand each project
+2. Review all changes and group them logically
+3. Create detailed commit messages explaining the changes
+4. Push to the remote (unless --no-push specified)
+
+Examples:
+  ru ai-sync                        # Process all dirty repos
+  ru ai-sync --dry-run              # Show what would be processed
+  ru ai-sync --include=my-project   # Only process matching repos
+  ru ai-sync --timeout=1200         # Allow 20 minutes per repo
+  ru ai-sync --no-push              # Commit but don't push
+
+Exit Codes:
+  0  All repos processed successfully
+  1  Some repos failed
+  3  Missing dependencies (ntm, claude-code)
+  4  Invalid arguments
+EOF
+}
+
+#------------------------------------------------------------------------------
+# DEP-UPDATE SUBCOMMAND
+# Update dependencies across repos using AI-powered analysis and testing
+#------------------------------------------------------------------------------
+
+# cmd_dep_update - Main entry point for dep-update subcommand
+# Usage: ru dep-update [OPTIONS]
+#   --dry-run           Show what would be updated (no changes)
+#   --manager=NAME      Only update deps for specific manager
+#   --include=PAT       Only update deps matching pattern
+#   --exclude=PAT       Skip deps matching pattern
+#   --major             Include major version updates (default: skip)
+#   --test-cmd=CMD      Custom test command (overrides detection)
+#   --max-fix-attempts=N  Max iterations for test/fix loop (default: 5)
+#   --no-push           Commit but don't push
+#   --repo=PATH         Single repo mode (default: all repos)
+#   --agent=TYPE        Agent type: claude (default), codex, gemini
+cmd_dep_update() {
+    local dry_run="false"
+    local manager_filter=""
+    local include_pattern=""
+    local exclude_pattern=""
+    local include_major="false"
+    local custom_test_cmd=""
+    local max_fix_attempts=5
+    local no_push="false"
+    local single_repo=""
+    local agent_type="claude"
+    local timeout_seconds=900
+
+    # Parse command arguments from ARGS array
+    local arg
+    for arg in "${ARGS[@]}"; do
+        case "$arg" in
+            --dry-run)
+                dry_run="true"
+                ;;
+            --manager=*)
+                manager_filter="${arg#*=}"
+                ;;
+            --include=*)
+                include_pattern="${arg#*=}"
+                ;;
+            --exclude=*)
+                exclude_pattern="${arg#*=}"
+                ;;
+            --major)
+                include_major="true"
+                ;;
+            --test-cmd=*)
+                custom_test_cmd="${arg#*=}"
+                ;;
+            --max-fix-attempts=*)
+                max_fix_attempts="${arg#*=}"
+                ;;
+            --no-push)
+                no_push="true"
+                ;;
+            --repo=*)
+                single_repo="${arg#*=}"
+                ;;
+            --agent=*)
+                agent_type="${arg#*=}"
+                ;;
+            --timeout=*)
+                timeout_seconds="${arg#*=}"
+                ;;
+            *)
+                log_error "dep-update: Unknown option: $arg"
+                _dep_update_help
+                return 4
+                ;;
+        esac
+    done
+
+    # Check dependencies
+    if ! command -v ntm &>/dev/null; then
+        log_error "dep-update requires ntm (Named Tmux Manager)"
+        log_error "Install from: https://github.com/anthropics/ntm"
+        return 3
+    fi
+
+    case "$agent_type" in
+        claude)
+            if ! command -v claude &>/dev/null; then
+                log_error "dep-update requires claude-code for agent type 'claude'"
+                log_error "Install from: https://github.com/anthropics/claude-code"
+                return 3
+            fi
+            ;;
+        codex)
+            if ! command -v codex &>/dev/null; then
+                log_error "dep-update requires codex for agent type 'codex'"
+                return 3
+            fi
+            ;;
+        gemini)
+            if ! command -v gemini &>/dev/null; then
+                log_error "dep-update requires gemini CLI for agent type 'gemini'"
+                return 3
+            fi
+            ;;
+        *)
+            log_error "Unknown agent type: $agent_type (supported: claude, codex, gemini)"
+            return 4
+            ;;
+    esac
+
+    # Build list of repos to process
+    local -a repos_to_process=()
+    if [[ -n "$single_repo" ]]; then
+        if [[ ! -d "$single_repo" ]]; then
+            log_error "Repository not found: $single_repo"
+            return 4
+        fi
+        repos_to_process+=("$single_repo")
+    else
+        # Get all configured repos
+        local repo_list
+        repo_list=$(_list_local_repos 2>/dev/null) || repo_list=""
+        if [[ -z "$repo_list" ]]; then
+            log_warn "No repositories configured. Run 'ru add <repo>' first."
+            return 0
+        fi
+        while IFS= read -r repo; do
+            [[ -n "$repo" && -d "$repo" ]] && repos_to_process+=("$repo")
+        done <<< "$repo_list"
+    fi
+
+    if [[ ${#repos_to_process[@]} -eq 0 ]]; then
+        log_info "No repositories to process"
+        return 0
+    fi
+
+    # Process each repo
+    local processed=0
+    local updated=0
+    local failed=0
+    local skipped=0
+    local -a results=()
+
+    for repo_path in "${repos_to_process[@]}"; do
+        local repo_name
+        repo_name=$(basename "$repo_path")
+
+        # Detect package managers in this repo
+        local managers
+        managers=$(detect_package_managers "$repo_path")
+        if [[ -z "$managers" || "$managers" == "[]" ]]; then
+            log_debug "No package managers found in $repo_name, skipping"
+            ((skipped++))
+            continue
+        fi
+
+        # Filter by manager if specified
+        if [[ -n "$manager_filter" ]]; then
+            if ! echo "$managers" | jq -e ".[] | select(. == \"$manager_filter\")" &>/dev/null; then
+                log_debug "Repo $repo_name does not use manager '$manager_filter', skipping"
+                ((skipped++))
+                continue
+            fi
+            managers="[\"$manager_filter\"]"
+        fi
+
+        # Check for outdated dependencies
+        local outdated_json
+        outdated_json=$(check_outdated_deps "$repo_path" "$manager_filter")
+        local total_outdated
+        total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
+
+        if [[ "$total_outdated" -eq 0 ]]; then
+            log_debug "No outdated dependencies in $repo_name"
+            ((skipped++))
+            continue
+        fi
+
+        # Filter by include/exclude patterns (on package names)
+        if [[ -n "$include_pattern" || -n "$exclude_pattern" ]]; then
+            outdated_json=$(_filter_outdated_deps "$outdated_json" "$include_pattern" "$exclude_pattern")
+            total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
+            if [[ "$total_outdated" -eq 0 ]]; then
+                log_debug "No matching dependencies after filtering in $repo_name"
+                ((skipped++))
+                continue
+            fi
+        fi
+
+        # Filter out major updates unless --major specified
+        if [[ "$include_major" != "true" ]]; then
+            outdated_json=$(_filter_major_updates "$outdated_json")
+            total_outdated=$(echo "$outdated_json" | jq -r '.total_outdated // 0')
+            if [[ "$total_outdated" -eq 0 ]]; then
+                log_debug "No non-major updates in $repo_name (use --major to include)"
+                ((skipped++))
+                continue
+            fi
+        fi
+
+        ((processed++))
+        log_info "Processing $repo_name: $total_outdated outdated dependencies"
+
+        if [[ "$dry_run" == "true" ]]; then
+            echo "Would update $total_outdated deps in: $repo_path"
+            echo "$outdated_json" | jq -r '
+                to_entries | .[] | select(.key != "total_outdated") |
+                "\(.key):" as $mgr |
+                .value.packages // [] | .[] |
+                "  \($mgr) \(.name): \(.current) -> \(.latest)"
+            ' 2>/dev/null || true
+            continue
+        fi
+
+        # Fetch changelogs for outdated deps
+        log_info "Fetching changelogs for $repo_name..."
+        local changelog_text=""
+        changelog_text=$(_fetch_changelogs_for_outdated "$outdated_json")
+
+        # Detect or use custom test command
+        local test_cmd
+        if [[ -n "$custom_test_cmd" ]]; then
+            test_cmd="$custom_test_cmd"
+        else
+            test_cmd=$(detect_test_command "$repo_path")
+        fi
+        if [[ -z "$test_cmd" ]]; then
+            log_warn "No test command detected for $repo_name, tests will be skipped"
+            test_cmd="echo 'No tests configured'"
+        fi
+
+        # Generate the combined prompt
+        local prompt
+        prompt=$(generate_depupdate_prompt_combined \
+            "$repo_path" \
+            "$outdated_json" \
+            "$test_cmd" \
+            "--changelog=$changelog_text" \
+            "--max-attempts=$max_fix_attempts")
+
+        # Write prompt to temp file
+        local prompt_file
+        prompt_file=$(write_prompt_to_file "$prompt")
+        if [[ -z "$prompt_file" || ! -f "$prompt_file" ]]; then
+            log_error "Failed to create prompt file for $repo_name"
+            ((failed++))
+            continue
+        fi
+
+        # Spawn AI session
+        log_info "Spawning AI session for $repo_name..."
+        local session_result
+        session_result=$(spawn_ai_session "$repo_path" "$prompt_file" \
+            "--timeout=$timeout_seconds" \
+            "--agent=$agent_type" \
+            "--prefix=dep-update")
+
+        # Clean up prompt file
+        rm -f "$prompt_file" 2>/dev/null
+
+        # Parse result
+        local status
+        status=$(echo "$session_result" | jq -r '.status // "unknown"')
+
+        case "$status" in
+            completed|idle)
+                log_success "Successfully updated dependencies in $repo_name"
+                ((updated++))
+                results+=("{\"repo\":\"$repo_path\",\"status\":\"success\",\"deps_updated\":$total_outdated}")
+
+                # Push if not --no-push
+                if [[ "$no_push" != "true" ]]; then
+                    log_info "Pushing changes for $repo_name..."
+                    if ! git -C "$repo_path" push 2>/dev/null; then
+                        log_warn "Failed to push $repo_name (changes are committed locally)"
+                    fi
+                fi
+                ;;
+            timeout)
+                log_warn "Timeout while updating $repo_name"
+                ((failed++))
+                results+=("{\"repo\":\"$repo_path\",\"status\":\"timeout\"}")
+                ;;
+            error|*)
+                local error_msg
+                error_msg=$(echo "$session_result" | jq -r '.error // "Unknown error"')
+                log_error "Failed to update $repo_name: $error_msg"
+                ((failed++))
+                results+=("{\"repo\":\"$repo_path\",\"status\":\"error\",\"error\":\"$error_msg\"}")
+                ;;
+        esac
+    done
+
+    # Print summary
+    echo ""
+    log_info "=== dep-update Summary ==="
+    log_info "Processed: $processed repos"
+    log_info "Updated:   $updated repos"
+    log_info "Failed:    $failed repos"
+    log_info "Skipped:   $skipped repos (no outdated deps or filtered out)"
+
+    # JSON output if requested
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        local results_json
+        results_json=$(printf '%s\n' "${results[@]}" | jq -s '.')
+        jq -n \
+            --argjson results "$results_json" \
+            --arg processed "$processed" \
+            --arg updated "$updated" \
+            --arg failed "$failed" \
+            --arg skipped "$skipped" \
+            '{processed: ($processed|tonumber), updated: ($updated|tonumber), failed: ($failed|tonumber), skipped: ($skipped|tonumber), results: $results}'
+    fi
+
+    # Exit code based on results
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Filter outdated deps JSON by include/exclude patterns.
+# Usage: _filter_outdated_deps <outdated_json> <include_pattern> <exclude_pattern>
+# Returns: Filtered JSON with recalculated total_outdated
+_filter_outdated_deps() {
+    local json="$1"
+    local include_pat="$2"
+    local exclude_pat="$3"
+
+    # Use jq to filter packages
+    local filtered
+    filtered=$(echo "$json" | jq --arg inc "$include_pat" --arg exc "$exclude_pat" '
+        . as $orig |
+        to_entries | map(
+            if .key == "total_outdated" then
+                empty
+            else
+                .value.packages = (
+                    .value.packages // [] | map(
+                        select(
+                            (if $inc != "" then (.name | test($inc)) else true end) and
+                            (if $exc != "" then (.name | test($exc) | not) else true end)
+                        )
+                    )
+                ) |
+                .value.total_outdated = (.value.packages | length)
+            end
+        ) | from_entries |
+        . + {total_outdated: ([.[] | .total_outdated // 0] | add)}
+    ' 2>/dev/null) || filtered="$json"
+
+    echo "$filtered"
+}
+
+# Filter out major version updates from outdated deps JSON.
+# Usage: _filter_major_updates <outdated_json>
+# Returns: Filtered JSON without major updates
+_filter_major_updates() {
+    local json="$1"
+
+    # Filter out packages where major version differs
+    local filtered
+    filtered=$(echo "$json" | jq '
+        def is_major_update:
+            (.current // "0") as $curr |
+            (.latest // "0") as $lat |
+            ($curr | split(".")[0] // "0") as $curr_major |
+            ($lat | split(".")[0] // "0") as $lat_major |
+            $curr_major != $lat_major;
+
+        . as $orig |
+        to_entries | map(
+            if .key == "total_outdated" then
+                empty
+            else
+                .value.packages = (
+                    .value.packages // [] | map(select(is_major_update | not))
+                ) |
+                .value.total_outdated = (.value.packages | length)
+            end
+        ) | from_entries |
+        . + {total_outdated: ([.[] | .total_outdated // 0] | add)}
+    ' 2>/dev/null) || filtered="$json"
+
+    echo "$filtered"
+}
+
+# Fetch changelogs for all outdated packages.
+# Usage: _fetch_changelogs_for_outdated <outdated_json>
+# Returns: Combined changelog text
+_fetch_changelogs_for_outdated() {
+    local json="$1"
+    local changelog_text=""
+    local max_changelogs=10
+    local count=0
+
+    # Extract package info and fetch changelogs
+    local packages
+    packages=$(echo "$json" | jq -r '
+        to_entries | .[] | select(.key != "total_outdated") |
+        .key as $mgr |
+        .value.packages // [] | .[] |
+        "\($mgr)|\(.name)|\(.current)|\(.latest)"
+    ' 2>/dev/null)
+
+    while IFS='|' read -r manager name current latest; do
+        [[ -z "$name" ]] && continue
+        ((count >= max_changelogs)) && break
+
+        log_debug "Fetching changelog for $name ($current -> $latest)..."
+        local changelog
+        changelog=$(fetch_changelog "$name" "$current" "$latest" "--manager=$manager" 2>/dev/null) || changelog=""
+
+        if [[ -n "$changelog" ]]; then
+            changelog_text+="
+### $name ($current -> $latest)
+$changelog
+"
+            ((count++))
+        fi
+    done <<< "$packages"
+
+    if [[ -z "$changelog_text" ]]; then
+        changelog_text="No changelogs could be fetched. Check package documentation manually."
+    fi
+
+    echo "$changelog_text"
+}
+
+# Print dep-update help
+_dep_update_help() {
+    cat >&2 <<'EOF'
+Usage: ru dep-update [OPTIONS]
+
+Update dependencies across repositories using AI-powered analysis.
+
+Options:
+  --dry-run             Show what would be updated (no changes)
+  --manager=NAME        Only update deps for specific manager (npm, pip, cargo, etc.)
+  --include=PATTERN     Only update deps matching regex pattern
+  --exclude=PATTERN     Skip deps matching regex pattern
+  --major               Include major version updates (default: skip major)
+  --test-cmd=CMD        Custom test command (overrides auto-detection)
+  --max-fix-attempts=N  Max fix iterations per dependency (default: 5)
+  --no-push             Commit changes but don't push to remote
+  --repo=PATH           Process single repo only (default: all repos)
+  --agent=TYPE          Agent type: claude (default), codex, gemini
+  --timeout=SEC         Per-repo timeout in seconds (default: 900)
+
+The AI agent will:
+1. Analyze outdated dependencies and changelogs for breaking changes
+2. Create a migration plan based on risk assessment
+3. Update each dependency one at a time
+4. Run tests after each update and fix failures
+5. Commit each successful update with descriptive message
+6. Roll back and report any dependencies that can't be updated
+
+Examples:
+  ru dep-update                          # Update all deps in all repos
+  ru dep-update --dry-run                # Show what would be updated
+  ru dep-update --repo=./my-project      # Update single repo
+  ru dep-update --manager=npm            # Only npm packages
+  ru dep-update --major                  # Include major version updates
+  ru dep-update --include='react|vue'    # Only update matching packages
+  ru dep-update --exclude='typescript'   # Skip matching packages
+
+Exit Codes:
+  0  All updates successful
+  1  Some dependencies failed to update
+  3  Missing dependencies (ntm, claude-code)
+  4  Invalid arguments
+EOF
+}
+
+#------------------------------------------------------------------------------
 # AGENT-SWEEP PER-REPO CONFIGURATION
 # Load per-repository agent-sweep configuration from .ru-agent.yml/.json
 #------------------------------------------------------------------------------
@@ -5268,7 +7290,7 @@ parse_args() {
                 shift
                 ;;
             --dry-run)
-                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" || "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
                     ARGS+=("$1")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("$1")
@@ -5334,7 +7356,7 @@ parse_args() {
                     log_error "--timeout requires a value in seconds"
                     exit 4
                 fi
-                if [[ "$COMMAND" == "agent-sweep" ]]; then
+                if [[ "$COMMAND" == "agent-sweep" || "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
                     ARGS+=("--timeout=$2")
                 elif [[ -z "$COMMAND" ]]; then
                     pending_global_args+=("--timeout=$2")
@@ -5342,6 +7364,36 @@ parse_args() {
                     GIT_TIMEOUT="$2"
                 fi
                 shift 2
+                ;;
+            --timeout=*)
+                if [[ "$COMMAND" == "agent-sweep" || "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
+                    ARGS+=("$1")
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_global_args+=("$1")
+                else
+                    GIT_TIMEOUT="${1#--timeout=}"
+                fi
+                shift
+                ;;
+            --repo=*|--manager=*|--include=*|--exclude=*|--test-cmd=*|--max-fix-attempts=*|--agent=*)
+                if [[ "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
+                    ARGS+=("$1")
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                shift
+                ;;
+            --major|--no-push|--no-untracked)
+                if [[ "$COMMAND" == "ai-sync" || "$COMMAND" == "dep-update" ]]; then
+                    ARGS+=("$1")
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                shift
                 ;;
             --parallel)
                 if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
@@ -5415,7 +7467,7 @@ parse_args() {
                 INIT_EXAMPLE="true"
                 shift
                 ;;
-            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep)
+            sync|status|init|add|remove|list|doctor|self-update|config|prune|import|review|agent-sweep|ai-sync|dep-update)
                 COMMAND="$1"
                 shift
                 ;;
@@ -7013,6 +9065,24 @@ cmd_doctor() {
         printf '%b\n' "${GREEN}[OK]${RESET} gum: $gum_version" >&2
     else
         printf '%b\n' "${DIM}[  ]${RESET} gum: not installed (optional, for prettier UI)" >&2
+    fi
+
+    # Check ntm (optional, for ai-sync and dep-update)
+    if command -v ntm &>/dev/null; then
+        local ntm_version
+        ntm_version=$(ntm --version 2>/dev/null | head -1 || echo "unknown")
+        printf '%b\n' "${GREEN}[OK]${RESET} ntm: $ntm_version" >&2
+    else
+        printf '%b\n' "${DIM}[  ]${RESET} ntm: not installed (optional, for ai-sync/dep-update)" >&2
+    fi
+
+    # Check claude-code (optional, for ai-sync and dep-update)
+    if command -v claude &>/dev/null; then
+        local claude_ver
+        claude_ver=$(claude --version 2>/dev/null | head -1 || echo "unknown")
+        printf '%b\n' "${GREEN}[OK]${RESET} claude-code: $claude_ver" >&2
+    else
+        printf '%b\n' "${DIM}[  ]${RESET} claude-code: not installed (optional, for ai-sync/dep-update)" >&2
     fi
 
     local run_review_checks="false"
@@ -18695,6 +20765,8 @@ main() {
         import)     cmd_import ;;
         review)     cmd_review ;;
         agent-sweep) cmd_agent_sweep ;;
+        ai-sync)    cmd_ai_sync ;;
+        dep-update) cmd_dep_update ;;
         *)
             log_error "Unknown command: $COMMAND"
             show_help
