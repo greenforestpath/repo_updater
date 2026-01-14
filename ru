@@ -887,7 +887,6 @@ _check_outdated_for_manager() {
     local repo_path="$1"
     local manager="$2"
     local output=""
-    local -a outdated=()
 
     case "$manager" in
         npm|yarn|pnpm)
@@ -960,8 +959,8 @@ _check_outdated_for_manager() {
             output=$(cd "$repo_path" && bundle outdated --parseable 2>/dev/null || true)
             if [[ -n "$output" ]]; then
                 # bundle outdated --parseable returns: pkg (newest x.y.z, installed a.b.c)
-                local json_array="["
-                local first="true"
+                # Build JSON array using jq for proper escaping
+                local json_array="[]"
                 while IFS= read -r line; do
                     [[ -z "$line" ]] && continue
                     local name current latest
@@ -970,11 +969,10 @@ _check_outdated_for_manager() {
                     latest=$(echo "$line" | sed -E 's/.*newest ([^,)]+).*/\1/')
                     current=$(echo "$line" | sed -E 's/.*installed ([^,)]+).*/\1/')
                     if [[ -n "$name" && -n "$current" && -n "$latest" ]]; then
-                        [[ "$first" == "true" ]] && first="false" || json_array+=","
-                        json_array+="{\"name\":\"$name\",\"current\":\"$current\",\"latest\":\"$latest\"}"
+                        json_array=$(echo "$json_array" | jq --arg n "$name" --arg c "$current" --arg l "$latest" \
+                            '. + [{name: $n, current: $c, latest: $l}]')
                     fi
                 done <<< "$output"
-                json_array+="]"
                 printf '{"manager":"%s","outdated":%s}\n' "$manager" "$json_array"
                 return
             fi
@@ -1228,17 +1226,12 @@ _fetch_github_releases() {
         return 1
     fi
 
-    # Filter releases between versions and format as markdown
+    # Get recent releases and format as markdown
+    # Note: Proper semantic version filtering is complex; we fetch recent releases
+    # and let the AI agent determine which are relevant for the upgrade path
     local changelog=""
-    changelog=$(echo "$releases" | jq -r --arg from "$from_version" --arg to "$to_version" '
-        [.[] | select(
-            (.tag_name | gsub("^v"; "")) as $ver |
-            ($from | gsub("^v"; "")) as $f |
-            ($to | gsub("^v"; "")) as $t |
-            # Simple version comparison - include all between from and to
-            true
-        )][:10] |
-        .[] |
+    changelog=$(echo "$releases" | jq -r '
+        .[:10] | .[] |
         "## " + .tag_name + " (" + (.published_at // .created_at | split("T")[0]) + ")\n\n" + (.body // "No release notes") + "\n"
     ' 2>/dev/null)
 
@@ -1442,12 +1435,13 @@ spawn_ai_session() {
     timestamp=$(date +%s)
     local session_name="${session_prefix}-${repo_name}-${timestamp}"
 
-    # Map agent type to ntm flag
-    local agent_flag
+    # Map agent type to ntm flags
+    # agent_flag is for spawn (--cc=1), send_flag is for send (--cc)
+    local agent_flag send_flag
     case "$agent_type" in
-        claude|cc)  agent_flag="--cc=1" ;;
-        codex|cod)  agent_flag="--cod=1" ;;
-        gemini|gmi) agent_flag="--gmi=1" ;;
+        claude|cc)  agent_flag="--cc=1"; send_flag="--cc" ;;
+        codex|cod)  agent_flag="--cod=1"; send_flag="--cod" ;;
+        gemini|gmi) agent_flag="--gmi=1"; send_flag="--gmi" ;;
         *)
             log_error "spawn_ai_session: Unknown agent type: $agent_type"
             echo '{"session":"","status":"failed","error":"unknown agent type"}'
@@ -1475,7 +1469,7 @@ spawn_ai_session() {
     sleep 1
 
     # Send the prompt from file
-    if ! ntm send "$session_name" --cc --file "$prompt_file" 2>/dev/null; then
+    if ! ntm send "$session_name" $send_flag --file "$prompt_file" 2>/dev/null; then
         log_error "spawn_ai_session: Failed to send prompt"
         ntm kill "$session_name" --force 2>/dev/null
         echo '{"session":"'"$session_name"'","status":"failed","error":"send prompt failed"}'
@@ -1890,6 +1884,10 @@ cmd_ai_sync() {
     local arg
     for arg in "${ARGS[@]}"; do
         case "$arg" in
+            -h|--help)
+                _ai_sync_help
+                return 0
+                ;;
             --dry-run)
                 dry_run="true"
                 ;;
@@ -2145,6 +2143,10 @@ cmd_dep_update() {
     local arg
     for arg in "${ARGS[@]}"; do
         case "$arg" in
+            -h|--help)
+                _dep_update_help
+                return 0
+                ;;
             --dry-run)
                 dry_run="true"
                 ;;
@@ -7260,6 +7262,12 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
+                # Pass help to command-specific handlers if a command with its own help is set
+                if [[ "$COMMAND" == "dep-update" || "$COMMAND" == "ai-sync" ]]; then
+                    ARGS+=("$1")
+                    shift
+                    continue
+                fi
                 show_help
                 exit 0
                 ;;
