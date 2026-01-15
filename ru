@@ -7473,7 +7473,7 @@ parse_args() {
                 shift
                 ;;
             --plan|--apply|--push|--analytics|--basic|--status|--mode=*|--repos=*|--skip-days=*|--priority=*|--max-repos=*|--max-runtime=*|--max-questions=*|--invalidate-cache=*|--auto-answer=*)
-                if [[ "$COMMAND" == "review" ]]; then
+                if [[ "$COMMAND" == "review" || "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                     shift
                 elif [[ -z "$COMMAND" ]]; then
@@ -7486,6 +7486,20 @@ parse_args() {
                 fi
                 ;;
             --max-file-mb=*)
+                if [[ "$COMMAND" == "agent-sweep" ]]; then
+                    ARGS+=("$1")
+                    shift
+                elif [[ -z "$COMMAND" ]]; then
+                    pending_review_args+=("$1")
+                    shift
+                else
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 4
+                fi
+                ;;
+            --phase1-timeout=*|--phase2-timeout=*|--phase3-timeout=*|--with-release|--keep-sessions|--keep-sessions-on-fail|--attach-on-fail|--execution-mode=*|--secret-scan=*)
+                # agent-sweep specific options
                 if [[ "$COMMAND" == "agent-sweep" ]]; then
                     ARGS+=("$1")
                     shift
