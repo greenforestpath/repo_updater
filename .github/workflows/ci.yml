@@ -85,18 +85,24 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install bash
-          BASH_5="$(brew --prefix bash 2>/dev/null)/bin/bash"
+          # Link bash to ensure it's available in PATH (may already be linked)
+          brew link --overwrite bash 2>/dev/null || true
+
+          # Find the bash 5 binary
+          BASH_5="$(brew --prefix)/bin/bash"
           if [[ ! -x "$BASH_5" ]]; then
-            BREW_PREFIX="$(brew --prefix)"
-            if [[ -x "$BREW_PREFIX/opt/bash/bin/bash" ]]; then
-              BASH_5="$BREW_PREFIX/opt/bash/bin/bash"
-            else
-              CELLAR="$(brew --cellar bash)"
-              BASH_5="$(ls -1 "$CELLAR"/*/bin/bash 2>/dev/null | tail -1)"
-            fi
+            # Fallback to formula-specific prefix
+            BASH_5="$(brew --prefix bash)/bin/bash"
+          fi
+          if [[ ! -x "$BASH_5" ]]; then
+            # Last resort: search in Cellar
+            CELLAR="$(brew --cellar bash)"
+            BASH_5="$(ls -1 "$CELLAR"/*/bin/bash 2>/dev/null | tail -1)"
           fi
 
           if [[ -x "$BASH_5" ]]; then
+            echo "Found bash at: $BASH_5"
+            "$BASH_5" --version | head -1
             echo "BASH_5=$BASH_5" >> $GITHUB_ENV
             echo "$(dirname "$BASH_5")" >> $GITHUB_PATH
           else
@@ -105,7 +111,10 @@ jobs:
           fi
 
       - name: Show bash version
-        run: bash --version | head -1
+        run: |
+          echo "PATH: $PATH"
+          which bash
+          bash --version | head -1
 
       - name: Create test output directory
         run: mkdir -p test-results
@@ -155,18 +164,24 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install bash
-          BASH_5="$(brew --prefix bash 2>/dev/null)/bin/bash"
+          # Link bash to ensure it's available in PATH (may already be linked)
+          brew link --overwrite bash 2>/dev/null || true
+
+          # Find the bash 5 binary
+          BASH_5="$(brew --prefix)/bin/bash"
           if [[ ! -x "$BASH_5" ]]; then
-            BREW_PREFIX="$(brew --prefix)"
-            if [[ -x "$BREW_PREFIX/opt/bash/bin/bash" ]]; then
-              BASH_5="$BREW_PREFIX/opt/bash/bin/bash"
-            else
-              CELLAR="$(brew --cellar bash)"
-              BASH_5="$(ls -1 "$CELLAR"/*/bin/bash 2>/dev/null | tail -1)"
-            fi
+            # Fallback to formula-specific prefix
+            BASH_5="$(brew --prefix bash)/bin/bash"
+          fi
+          if [[ ! -x "$BASH_5" ]]; then
+            # Last resort: search in Cellar
+            CELLAR="$(brew --cellar bash)"
+            BASH_5="$(ls -1 "$CELLAR"/*/bin/bash 2>/dev/null | tail -1)"
           fi
 
           if [[ -x "$BASH_5" ]]; then
+            echo "Found bash at: $BASH_5"
+            "$BASH_5" --version | head -1
             echo "BASH_5=$BASH_5" >> $GITHUB_ENV
             echo "$(dirname "$BASH_5")" >> $GITHUB_PATH
           else
