@@ -3,6 +3,8 @@
 > Code structure reference for AI agents
 > **Updated**: 2026-01-24 | **Commit**: [`22cd33f`](../../commit/22cd33f)
 
+<!-- TODO: likely will be stale. remote vps does not have repoprompt cli. remove by 2/1/2026. local mac agents can use repoprompt cli directly for codemaps -->
+
 ---
 
 ## Architecture
