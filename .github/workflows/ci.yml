@@ -84,8 +84,13 @@ jobs:
       - name: Install bash 5 (macOS)
         if: runner.os == 'macOS'
         run: |
-          # Reinstall bash and its dependencies to fix broken ncurses links
-          brew reinstall ncurses bash
+          # Update brew and handle any stale cache issues
+          brew update || true
+
+          # Uninstall if present to avoid cache conflicts, then install fresh
+          brew uninstall --ignore-dependencies bash 2>/dev/null || true
+          brew install bash
+
           # Link bash to ensure it's available in PATH (may already be linked)
           brew link --overwrite bash 2>/dev/null || true
 
@@ -176,8 +181,13 @@ jobs:
       - name: Install bash 5 (macOS)
         if: runner.os == 'macOS'
         run: |
-          # Reinstall bash and its dependencies to fix broken ncurses links
-          brew reinstall ncurses bash
+          # Update brew and handle any stale cache issues
+          brew update || true
+
+          # Uninstall if present to avoid cache conflicts, then install fresh
+          brew uninstall --ignore-dependencies bash 2>/dev/null || true
+          brew install bash
+
           # Link bash to ensure it's available in PATH (may already be linked)
           brew link --overwrite bash 2>/dev/null || true
 

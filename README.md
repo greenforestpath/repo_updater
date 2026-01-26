@@ -5,12 +5,8 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="License" />
 </p>
 
-<!-- AGENT-VERSION: 2026-01-24 @ 22cd33f -->
-
 <h1 align="center">ru</h1>
 <h3 align="center">Repo Updater</h3>
-
-> **Codemap**: 2026-01-24 | **Commit**: [`22cd33f`](../../commit/22cd33f)
 
 <div align="center">
   <img src="ru_illustration.webp" alt="ru - Repo Updater: Keep all your GitHub repositories synchronized with a single command">
@@ -48,6 +44,21 @@ brew install dicklesworthstone/tap/ru
 </p>
 
 ---
+
+## 🤖 Agent Quickstart (JSON/TOON)
+
+**Use structured output in agent contexts.** stdout = data, stderr = diagnostics, exit 0 = success.
+
+```bash
+# Sync all repos (machine-readable)
+ru sync --format json
+
+# Preview without changes
+ru sync --dry-run --format json
+
+# Status only (no fetch)
+ru status --no-fetch --format json
+```
 
 ## 🤖 Ready-made Blurb for AI Agents
 
@@ -3660,12 +3671,6 @@ rm -rf ~/.local/state/ru
 # Remove cache
 rm -rf ~/.cache/ru
 ```
-
----
-
-## Codemap
-
-See [CODEMAP.md](CODEMAP.md) for internal function reference and test coverage map.
 
 ---
 
