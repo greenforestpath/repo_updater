@@ -2,7 +2,7 @@
 
 > **MANDATORY**: Read this file AND `CLAUDE.md` at session start. Re-read after any restart, compaction, or tool crash.
 >
-> **Also read**: `../AGENTS.md` for root CFWOS behavioral rules (meta-improvement obligation, tool guides, rehydration protocol).
+> **Also read**: `../AGENTS.md` for root CFOS behavioral rules (meta-improvement obligation, tool guides, rehydration protocol).
 
 ---
 
