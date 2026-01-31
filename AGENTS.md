@@ -270,7 +270,7 @@ This section is a **developer toolbelt** reference.
 3. **ultimate_bug_scanner** (`ubs`) — Bug scanning with guardrails
 4. **beads_viewer** (`bv`) — Task management TUI
 5. **coding_agent_session_search** (`cass`) — Unified agent history search
-6. **cass_memory_system** (`cm`) — Procedural memory for agents
+6. **cfos_cass_memory_system** (`cm`) — Procedural memory for agents
 7. **coding_agent_account_manager** (`caam`) — Agent auth switching
 8. **simultaneous_launch_button** (`slb`) — Two-person rule for dangerous commands
 
